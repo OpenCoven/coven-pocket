@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["ffi", "bindgen"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/OpenCoven/coven-pocket"
+
+[workspace.dependencies]
+# coven-code engine crates, pinned by rev (v0.7.0 line).
+# Bumping the pin is a deliberate act — see AGENTS.md "Engine pinning".
+claurst-core = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
+claurst-api = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
+
+uniffi = "0.32"
+tokio = { version = "1.44", features = ["rt-multi-thread"] }
+futures = "0.3"
+thiserror = "2"
+
+# For local engine development, point the git dep at a sibling checkout:
+# [patch."https://github.com/OpenCoven/coven-code.git"]
+# claurst-core = { path = "../../coven-code/src-rust/crates/core" }
+# claurst-api = { path = "../../coven-code/src-rust/crates/api" }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

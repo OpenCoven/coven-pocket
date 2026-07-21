@@ -1,0 +1,10 @@
+included:
+  - app/Sources
+  - app/Tests
+excluded:
+  - app/Sources/Generated
+disabled_rules:
+  - todo
+line_length:
+  warning: 120
+  error: 160

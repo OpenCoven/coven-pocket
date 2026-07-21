@@ -1,0 +1,19 @@
+[package]
+name = "coven-pocket-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "coven_pocket_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+claurst-core = { workspace = true }
+claurst-api = { workspace = true }
+uniffi = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+serde_json = "1"

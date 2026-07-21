@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (host + iOS targets)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Format
+        run: cd rust && cargo fmt --all --check
+      - name: Clippy
+        run: cd rust && cargo clippy -p coven-pocket-ffi --all-targets -- -D warnings
+      - name: Test (host)
+        run: cd rust && cargo test -p coven-pocket-ffi
+      - name: Check (iOS device)
+        run: cd rust && cargo check -p coven-pocket-ffi --target aarch64-apple-ios
+      - name: Check (iOS simulator)
+        run: cd rust && cargo check -p coven-pocket-ffi --target aarch64-apple-ios-sim
+
+  app:
+    name: iOS app build
+    runs-on: macos-15
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install tools
+        run: brew install xcodegen swiftlint
+      - name: SwiftLint
+        run: swiftlint lint --strict
+      - name: Build XCFramework
+        run: ./scripts/build-xcframework.sh
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build app (simulator)
+        run: |
+          xcodebuild -project CovenPocket.xcodeproj -scheme CovenPocket \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build
