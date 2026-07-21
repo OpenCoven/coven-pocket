@@ -106,6 +106,17 @@ struct SpikeView: View {
             .onChange(of: apiKey) { _, newValue in
                 Keychain.set(newValue, for: "anthropic-api-key")
             }
+        // The engine rejects OAuth tokens minted for other clients (they get
+        // rate limited when replayed), so there is no in-app subscription
+        // sign-in to offer here. Claude subscription access is CLI-owned:
+        // companion mode (M2) delegates to the computer's signed-in `claude`
+        // binary via the engine's ClaudeCliProvider.
+        Text(
+            "On-device requests use this API key. Claude subscription access "
+                + "comes from the `claude` CLI login on your computer via companion mode."
+        )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
         Picker("Model", selection: $anthropicModel) {
             ForEach(client.models, id: \.id) { model in
                 Text(model.name).tag(model.id)

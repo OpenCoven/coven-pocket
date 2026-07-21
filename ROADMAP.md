@@ -46,6 +46,11 @@ full-capability remote sessions.
       authenticated remote listener)
 - [ ] Pairing flow with mandatory `coven.daemon.v1` handshake
 - [ ] Remote session attach: live events, input forwarding, remote approvals
+- [ ] Anthropic subscription access via the companion's `claude` CLI login:
+      the engine's `ClaudeCliProvider` delegates to the signed-in binary and
+      never imports its OAuth tokens (`bearer_auth_is_usable` rejects tokens
+      minted for other clients — replaying them gets rate limited). On-device
+      Anthropic therefore stays API-key only.
 - [ ] Goal handoff between device and desktop
 
 ## M3 — Extended scope
