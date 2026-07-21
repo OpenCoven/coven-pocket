@@ -1,0 +1,52 @@
+# Roadmap
+
+Coven Pocket delivers coven-code's core functionality on iOS as a hybrid app:
+an on-device agent (BYO credentials, sandbox-safe tools) plus a companion mode
+that pairs with the [Coven daemon](https://github.com/OpenCoven/coven) for
+full-capability remote sessions.
+
+## M0 — Foundation (done)
+
+- [x] Licensing decision record — GPL-3.0 posture, distribution channels
+      (`docs/LICENSING.md`)
+- [x] Repo scaffold — SwiftUI app, `rust/ffi` UniFFI crate over pinned
+      coven-code engine crates, XCFramework pipeline, CI
+- [x] iOS spike — `claurst-core` + `claurst-api` compile for
+      `aarch64-apple-ios{,-sim}`; engine runs on-simulator (smoke tests);
+      streaming surface exercised via `StreamDelegate` (live test is
+      env-gated on `ANTHROPIC_API_KEY`)
+- [ ] Upstream `claurst-tools` feature split (`fs-tools` vs `process-tools`)
+      so iOS builds exclude bash/PTY cleanly — PR to coven-code
+
+## M1 — On-device agent core
+
+- [ ] Provider auth: Anthropic key + OAuth, Codex OAuth device flow, Keychain,
+      model picker with effort control
+- [ ] On-device git workspaces (libgit2; HTTPS PAT + SSH keys)
+- [ ] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
+- [ ] Permission modes + approval sheets (default / accept-edits / plan)
+- [ ] Native diff viewer with per-hunk accept/reject
+- [ ] Session browser: resume, fork, delete
+
+## M2 — Companion mode
+
+- [ ] Daemon transport (Tailscale/SSH tunnel MVP; upstream design for an
+      authenticated remote listener)
+- [ ] Pairing flow with mandatory `coven.daemon.v1` handshake
+- [ ] Remote session attach: live events, input forwarding, remote approvals
+- [ ] Goal handoff between device and desktop
+
+## M3 — Extended scope
+
+- [ ] Memory: AGENTS.md injection, memdir browser
+- [ ] Familiar companion (7 archetypes)
+- [ ] On-device `/goal` with Live Activity progress
+- [ ] Remote MCP servers (streamable HTTP/SSE + OAuth)
+- [ ] Session sharing via unlisted Gists
+
+## M4 — Platform polish
+
+- [ ] Live Activities + Dynamic Island; approval notifications
+- [ ] App Intents / Shortcuts / Spotlight
+- [ ] iPad three-pane layout
+- [ ] TestFlight beta (subject to the licensing gate)

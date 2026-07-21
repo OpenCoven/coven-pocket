@@ -6,10 +6,11 @@
 
 use std::sync::Arc;
 
+use claurst_api::client::ClientConfig;
 use claurst_api::provider::LlmProvider;
 use claurst_api::provider_types::{ProviderRequest, StreamEvent};
 use claurst_api::providers::AnthropicProvider;
-use claurst_api::{AnthropicClient, ClientConfig};
+use claurst_api::AnthropicClient;
 use claurst_core::types::Message;
 use futures::StreamExt;
 
@@ -87,10 +88,7 @@ impl PocketEngine {
     /// List models available through the Anthropic provider.
     pub async fn list_models(&self, api_key: String) -> Result<Vec<PocketModel>, PocketError> {
         let provider = anthropic_provider(&api_key)?;
-        let models = provider
-            .list_models()
-            .await
-            .map_err(PocketError::engine)?;
+        let models = provider.list_models().await.map_err(PocketError::engine)?;
         Ok(models
             .into_iter()
             .map(|m| PocketModel {
@@ -142,9 +140,7 @@ impl PocketEngine {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(StreamEvent::TextDelta { text, .. }) => delegate.on_text(text),
-                Ok(StreamEvent::ThinkingDelta { thinking, .. }) => {
-                    delegate.on_thinking(thinking)
-                }
+                Ok(StreamEvent::ThinkingDelta { thinking, .. }) => delegate.on_thinking(thinking),
                 Ok(StreamEvent::MessageDelta {
                     stop_reason: reason,
                     ..
@@ -176,5 +172,53 @@ mod tests {
         let engine = PocketEngine::new();
         assert!(!engine.engine_version().is_empty());
         assert!(!engine.default_model().is_empty());
+    }
+
+    struct Collector {
+        text: std::sync::Mutex<String>,
+        done: std::sync::atomic::AtomicBool,
+    }
+
+    impl StreamDelegate for Collector {
+        fn on_text(&self, text: String) {
+            if let Ok(mut buf) = self.text.lock() {
+                buf.push_str(&text);
+            }
+        }
+        fn on_thinking(&self, _text: String) {}
+        fn on_done(&self, _stop_reason: String) {
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_error(&self, message: String) {
+            panic!("stream error: {message}");
+        }
+    }
+
+    /// Live smoke test — requires a real key:
+    /// `ANTHROPIC_API_KEY=… cargo test -p coven-pocket-ffi -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY and network"]
+    async fn streams_a_live_completion() {
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(key) if !key.is_empty() => key,
+            _ => panic!("set ANTHROPIC_API_KEY to run this test"),
+        };
+        let engine = PocketEngine::new();
+        let delegate = Arc::new(Collector {
+            text: std::sync::Mutex::new(String::new()),
+            done: std::sync::atomic::AtomicBool::new(false),
+        });
+        engine
+            .stream_prompt(
+                api_key,
+                claurst_core::constants::HAIKU_MODEL.to_string(),
+                "Reply with the single word: pocket".to_string(),
+                delegate.clone(),
+            )
+            .await
+            .expect("stream completes");
+        assert!(delegate.done.load(std::sync::atomic::Ordering::SeqCst));
+        let text = delegate.text.lock().expect("lock").to_lowercase();
+        assert!(text.contains("pocket"), "unexpected reply: {text}");
     }
 }

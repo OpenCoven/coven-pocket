@@ -11,6 +11,9 @@ PROFILE="${PROFILE:-release}"
 CARGO_FLAG=""
 [ "$PROFILE" = "release" ] && CARGO_FLAG="--release"
 
+# Keep C deps (bundled sqlite3, ring, …) aligned with the app's minimum OS.
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
+
 LIB_NAME=libcoven_pocket_ffi
 TARGET_DIR=rust/target
 OUT=build

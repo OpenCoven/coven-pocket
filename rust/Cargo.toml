@@ -14,7 +14,7 @@ repository = "https://github.com/OpenCoven/coven-pocket"
 claurst-core = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
 claurst-api = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
 
-uniffi = "0.32"
+uniffi = { version = "0.32", features = ["tokio"] }
 tokio = { version = "1.44", features = ["rt-multi-thread"] }
 futures = "0.3"
 thiserror = "2"

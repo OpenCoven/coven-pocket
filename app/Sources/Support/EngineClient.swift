@@ -43,7 +43,9 @@ final class EngineClient: ObservableObject {
 }
 
 /// Callbacks arrive on Rust worker threads; hop to the main actor.
-private final class StreamBridge: StreamDelegate {
+/// The only mutable state is the ARC-managed weak reference, which is
+/// thread-safe to read, so `@unchecked Sendable` holds.
+private final class StreamBridge: StreamDelegate, @unchecked Sendable {
     weak var client: EngineClient?
 
     init(client: EngineClient) {

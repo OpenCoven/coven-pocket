@@ -9,6 +9,8 @@ settings:
     SWIFT_VERSION: "5.10"
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
+    # Rust core ships arm64 slices only (device + Apple Silicon simulator).
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
 targets:
   CovenPocket:
     type: application
