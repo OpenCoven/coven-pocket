@@ -17,6 +17,10 @@ struct CovenPocketApp: App {
                     .tabItem {
                         Label("Companion", systemImage: "antenna.radiowaves.left.and.right")
                     }
+                DiffDemoView()
+                    .tabItem {
+                        Label("Diff", systemImage: "plus.forwardslash.minus")
+                    }
                 SpikeView()
                     .tabItem {
                         Label("Playground", systemImage: "testtube.2")
