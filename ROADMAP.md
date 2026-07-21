@@ -15,8 +15,14 @@ full-capability remote sessions.
       `aarch64-apple-ios{,-sim}`; engine runs on-simulator (smoke tests);
       streaming surface exercised via `StreamDelegate` (live test is
       env-gated on `ANTHROPIC_API_KEY`)
-- [ ] Upstream `claurst-tools` feature split (`fs-tools` vs `process-tools`)
-      so iOS builds exclude bash/PTY cleanly — PR to coven-code
+- [x] Tool sandbox profile — resolved without an upstream split:
+      `claurst-tools` compiles for iOS as-is, and coven-code already ships a
+      security-reviewed file-tools allowlist pattern
+      (`filter_tools_for_hosted_review` over `all_tools()`, guarded by the
+      exhaustive `hosted_repair_allows_only_repository_file_tools` test).
+      M1 wires the same allowlist (Read/Grep/Glob/Edit/Write/ApplyPatch/
+      BatchEdit/NotebookEdit) into the on-device loop; process tools are
+      excluded at registry build time, not compile time.
 
 ## M1 — On-device agent core
 
