@@ -122,12 +122,19 @@ struct SpikeView: View {
                 Text(model.name).tag(model.id)
             }
         }
-        .task {
-            guard client.models.isEmpty, !apiKey.isEmpty else { return }
-            await client.loadModels(apiKey: apiKey)
+        // Keyed to the API key so entering or pasting a key (re)loads the
+        // catalog; the sleep debounces keystrokes since a changed id cancels
+        // the previous task. In-flight engine calls outlive cancellation, so
+        // EngineClient discards their stale results. The default model is set
+        // eagerly — streaming works without a fetched catalog.
+        .task(id: apiKey) {
             if anthropicModel.isEmpty {
                 anthropicModel = client.defaultModel
             }
+            guard !apiKey.isEmpty, client.models.isEmpty else { return }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            await client.loadModels(apiKey: apiKey)
         }
     }
 
@@ -140,11 +147,11 @@ struct SpikeView: View {
                 }
             }
             .task {
-                guard client.codexModels.isEmpty else { return }
-                await client.loadCodexModels()
                 if codexModel.isEmpty {
                     codexModel = client.defaultCodexModel
                 }
+                guard client.codexModels.isEmpty else { return }
+                await client.loadCodexModels()
             }
             Button("Sign out", role: .destructive) {
                 client.codexLogout()

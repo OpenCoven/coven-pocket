@@ -23,8 +23,14 @@ use tokio::net::TcpListener;
 
 use crate::PocketError;
 
-/// How long to wait for the user to finish the browser flow.
+/// How long to wait for the user to finish the browser flow, including the
+/// final token exchange.
 const LOGIN_TIMEOUT_SECS: u64 = 300;
+
+/// Bound on the token-exchange HTTP request so a stalled connection (Wi-Fi ↔
+/// cellular handoff, captive portal) fails instead of wedging the login
+/// future — on iOS there is no Ctrl-C to escape a hung sign-in.
+const EXCHANGE_TIMEOUT_SECS: u64 = 30;
 
 /// A signed-in Codex (ChatGPT) account.
 #[derive(uniffi::Record)]
@@ -64,6 +70,10 @@ pub(crate) fn build_codex_auth_url(code_challenge: &str, state: &str) -> String 
 /// Run the interactive login: bind the callback listener, surface the auth
 /// URL through `delegate`, wait for the redirect, exchange the code, and
 /// persist tokens through the engine's profile registry.
+///
+/// The whole interactive portion (callback wait + token exchange) is bounded
+/// by [`LOGIN_TIMEOUT_SECS`] so the future — and the Swift UI state awaiting
+/// it — always resolves.
 pub(crate) async fn login(
     delegate: Arc<dyn CodexAuthDelegate>,
 ) -> Result<CodexAccount, PocketError> {
@@ -79,22 +89,20 @@ pub(crate) async fn login(
 
     delegate.on_auth_url(build_codex_auth_url(&challenge, &state));
 
-    let (code, callback_state) = tokio::time::timeout(
-        std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS),
-        wait_for_callback(listener),
-    )
+    let tokens = tokio::time::timeout(std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS), async {
+        let (code, callback_state) = wait_for_callback(listener).await?;
+        if callback_state != state {
+            return Err(PocketError::Provider {
+                message: "OAuth state mismatch — aborting login".to_string(),
+            });
+        }
+        exchange_code_for_tokens(&code, &verifier).await
+    })
     .await
     .map_err(|_| PocketError::Provider {
         message: "login timed out waiting for the browser callback".to_string(),
     })??;
 
-    if callback_state != state {
-        return Err(PocketError::Provider {
-            message: "OAuth state mismatch — aborting login".to_string(),
-        });
-    }
-
-    let tokens = exchange_code_for_tokens(&code, &verifier).await?;
     let profile_id =
         save_codex_tokens_and_register(&tokens, None).map_err(|e| PocketError::Engine {
             message: format!("failed to persist Codex tokens: {e}"),
@@ -232,7 +240,12 @@ fn parse_callback_request(request_line: &str) -> CallbackRequest {
 /// absolute `expires_at` computed from `expires_in` so the engine's
 /// `CodexProvider` can refresh mid-session.
 async fn exchange_code_for_tokens(code: &str, verifier: &str) -> Result<CodexTokens, PocketError> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(EXCHANGE_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| PocketError::Engine {
+            message: format!("failed to build HTTP client: {e}"),
+        })?;
     let params = [
         ("client_id", CODEX_CLIENT_ID),
         ("code", code),

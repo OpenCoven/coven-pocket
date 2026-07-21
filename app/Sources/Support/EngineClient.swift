@@ -24,10 +24,19 @@ final class EngineClient: ObservableObject {
         codexAccount = engine.codexAccount()
     }
 
+    // Engine calls run to completion even when the surrounding Swift task is
+    // cancelled (the bindings can't cancel in-flight Rust futures), so both
+    // loaders re-check cancellation after the await and drop stale outcomes.
+    // A successful load also clears any error left by a superseded attempt
+    // (e.g. a 401 from a partially-typed key).
     func loadModels(apiKey: String) async {
         do {
-            models = try await engine.listModels(apiKey: apiKey)
+            let loaded = try await engine.listModels(apiKey: apiKey)
+            guard !Task.isCancelled else { return }
+            models = loaded
+            errorMessage = nil
         } catch {
+            guard !Task.isCancelled else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -35,8 +44,12 @@ final class EngineClient: ObservableObject {
     func loadCodexModels() async {
         guard codexAccount != nil else { return }
         do {
-            codexModels = try await engine.listCodexModels()
+            let loaded = try await engine.listCodexModels()
+            guard !Task.isCancelled else { return }
+            codexModels = loaded
+            errorMessage = nil
         } catch {
+            guard !Task.isCancelled else { return }
             errorMessage = error.localizedDescription
         }
     }
