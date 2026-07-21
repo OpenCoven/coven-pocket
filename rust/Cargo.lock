@@ -398,10 +398,12 @@ dependencies = [
  "claurst-api",
  "claurst-core",
  "futures",
+ "reqwest",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "uniffi",
+ "urlencoding",
 ]
 
 [[package]]

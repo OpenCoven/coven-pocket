@@ -46,6 +46,9 @@ targets:
       - path: app/Tests
     dependencies:
       - target: CovenPocket
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   CovenPocket:
     build:

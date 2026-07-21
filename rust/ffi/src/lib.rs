@@ -8,11 +8,16 @@ use std::sync::Arc;
 
 use claurst_api::client::ClientConfig;
 use claurst_api::provider::LlmProvider;
-use claurst_api::provider_types::{ProviderRequest, StreamEvent};
-use claurst_api::providers::AnthropicProvider;
+use claurst_api::provider_types::{ProviderRequest, StreamEvent, ThinkingConfig};
+use claurst_api::providers::{AnthropicProvider, CodexProvider};
 use claurst_api::AnthropicClient;
+use claurst_core::effort::{model_uses_adaptive_thinking, EffortLevel};
 use claurst_core::types::Message;
 use futures::StreamExt;
+
+mod codex_auth;
+
+pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 
 uniffi::setup_scaffolding!();
 
@@ -43,6 +48,15 @@ pub struct PocketModel {
     pub max_output_tokens: u32,
 }
 
+/// Inference providers Coven Pocket can talk to.
+#[derive(uniffi::Enum)]
+pub enum PocketProvider {
+    /// Anthropic Messages API, authenticated with an API key.
+    Anthropic,
+    /// OpenAI Codex (ChatGPT subscription), authenticated via OAuth.
+    Codex,
+}
+
 /// Streaming callbacks implemented on the Swift side.
 ///
 /// Callbacks arrive on Rust worker threads; the Swift implementation is
@@ -62,6 +76,57 @@ fn anthropic_provider(api_key: &str) -> Result<AnthropicProvider, PocketError> {
     };
     let client = AnthropicClient::new(config).map_err(PocketError::engine)?;
     Ok(AnthropicProvider::new(Arc::new(client)))
+}
+
+fn codex_provider() -> Result<CodexProvider, PocketError> {
+    CodexProvider::from_stored().ok_or_else(|| PocketError::Provider {
+        message: "not signed in to Codex — connect a ChatGPT account first".to_string(),
+    })
+}
+
+/// Request knobs derived from a named effort level.
+struct EffortParams {
+    thinking: Option<ThinkingConfig>,
+    temperature: Option<f64>,
+    max_tokens: u32,
+}
+
+/// Map an effort level onto Anthropic request parameters.
+///
+/// Mirrors coven-code's `EffortLevel` semantics: Medium/High/Max enable
+/// extended thinking with the engine's budget table, Low pins temperature
+/// to 0.0 with no thinking. Models with adaptive thinking (Opus 4.7+,
+/// Fable 5) reject manual budgets, so they get `thinking: adaptive` and the
+/// model decides its own depth. `max_tokens` grows above the thinking
+/// budget so visible output is never squeezed out by reasoning tokens.
+fn effort_params(model: &str, effort: Option<&str>, base_max_tokens: u32) -> EffortParams {
+    let mut params = EffortParams {
+        thinking: None,
+        temperature: None,
+        max_tokens: base_max_tokens,
+    };
+    let Some(level) = effort.and_then(EffortLevel::parse) else {
+        return params;
+    };
+
+    if model_uses_adaptive_thinking(model) {
+        params.thinking = Some(ThinkingConfig::adaptive());
+    } else if let Some(budget) = level.thinking_budget_tokens() {
+        params.thinking = Some(ThinkingConfig::enabled(budget));
+        params.max_tokens = budget + base_max_tokens;
+    }
+    params.temperature = level.temperature().map(f64::from);
+    params
+}
+
+fn pocket_model(m: claurst_api::provider::ModelInfo) -> PocketModel {
+    PocketModel {
+        id: m.id.to_string(),
+        provider_id: m.provider_id.to_string(),
+        name: m.name,
+        context_window: m.context_window,
+        max_output_tokens: m.max_output_tokens,
+    }
 }
 
 /// The engine handle held by the app for its whole lifetime.
@@ -89,41 +154,81 @@ impl PocketEngine {
     pub async fn list_models(&self, api_key: String) -> Result<Vec<PocketModel>, PocketError> {
         let provider = anthropic_provider(&api_key)?;
         let models = provider.list_models().await.map_err(PocketError::engine)?;
-        Ok(models
-            .into_iter()
-            .map(|m| PocketModel {
-                id: m.id.to_string(),
-                provider_id: m.provider_id.to_string(),
-                name: m.name,
-                context_window: m.context_window,
-                max_output_tokens: m.max_output_tokens,
-            })
-            .collect())
+        Ok(models.into_iter().map(pocket_model).collect())
+    }
+
+    /// List models available through the Codex provider.
+    ///
+    /// Requires a signed-in Codex account; the catalog itself is static.
+    pub async fn list_codex_models(&self) -> Result<Vec<PocketModel>, PocketError> {
+        let provider = codex_provider()?;
+        let models = provider.list_models().await.map_err(PocketError::engine)?;
+        Ok(models.into_iter().map(pocket_model).collect())
+    }
+
+    /// The engine's default Codex model id.
+    pub fn default_codex_model(&self) -> String {
+        claurst_core::codex_oauth::DEFAULT_CODEX_MODEL.to_string()
+    }
+
+    /// Interactive Codex (ChatGPT) sign-in.
+    ///
+    /// Binds the localhost callback listener, hands the auth URL to
+    /// `delegate` for browser presentation, and resolves once the user
+    /// completes the flow. Tokens persist in the app sandbox through the
+    /// engine's profile registry.
+    pub async fn codex_login(
+        &self,
+        delegate: Arc<dyn CodexAuthDelegate>,
+    ) -> Result<CodexAccount, PocketError> {
+        codex_auth::login(delegate).await
+    }
+
+    /// The signed-in Codex account, if any.
+    pub fn codex_account(&self) -> Option<CodexAccount> {
+        codex_auth::current_account()
+    }
+
+    /// Sign out of Codex, clearing stored tokens.
+    pub fn codex_logout(&self) -> Result<(), PocketError> {
+        codex_auth::logout()
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.
+    ///
+    /// `effort` accepts `"low" | "medium" | "high" | "max"` and maps onto
+    /// Anthropic extended thinking (see [`effort_params`]). The Codex
+    /// Responses adapter does not encode a reasoning-effort control at the
+    /// current engine pin, so effort is a no-op there. `api_key` is only
+    /// used for Anthropic; Codex authenticates from stored OAuth tokens.
     ///
     /// Resolves once the stream finishes; terminal state is reported through
     /// `on_done` / `on_error` as well so fire-and-forget callers stay correct.
     pub async fn stream_prompt(
         &self,
+        provider: PocketProvider,
         api_key: String,
         model: String,
         prompt: String,
+        effort: Option<String>,
         delegate: Arc<dyn StreamDelegate>,
     ) -> Result<(), PocketError> {
-        let provider = anthropic_provider(&api_key)?;
+        let effort = effort_params(&model, effort.as_deref(), 4096);
+        let provider: Box<dyn LlmProvider> = match provider {
+            PocketProvider::Anthropic => Box::new(anthropic_provider(&api_key)?),
+            PocketProvider::Codex => Box::new(codex_provider()?),
+        };
         let request = ProviderRequest {
             model,
             messages: vec![Message::user(prompt)],
             system_prompt: None,
             tools: Vec::new(),
-            max_tokens: 4096,
-            temperature: None,
+            max_tokens: effort.max_tokens,
+            temperature: effort.temperature,
             top_p: None,
             top_k: None,
             stop_sequences: Vec::new(),
-            thinking: None,
+            thinking: effort.thinking,
             provider_options: serde_json::json!({}),
         };
 
@@ -172,6 +277,54 @@ mod tests {
         let engine = PocketEngine::new();
         assert!(!engine.engine_version().is_empty());
         assert!(!engine.default_model().is_empty());
+        assert!(!engine.default_codex_model().is_empty());
+    }
+
+    #[test]
+    fn effort_maps_to_thinking_budgets() {
+        let p = effort_params("claude-sonnet-4-5", Some("medium"), 4096);
+        let thinking = p.thinking.expect("medium enables thinking");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, Some(5_000));
+        assert_eq!(
+            p.max_tokens,
+            5_000 + 4096,
+            "budget must fit under max_tokens"
+        );
+        assert_eq!(p.temperature, None);
+
+        let p = effort_params("claude-sonnet-4-5", Some("max"), 4096);
+        assert_eq!(
+            p.thinking.expect("max enables thinking").budget_tokens,
+            Some(20_000)
+        );
+    }
+
+    #[test]
+    fn low_effort_disables_thinking_and_pins_temperature() {
+        let p = effort_params("claude-sonnet-4-5", Some("low"), 4096);
+        assert!(p.thinking.is_none());
+        assert_eq!(p.temperature, Some(0.0));
+        assert_eq!(p.max_tokens, 4096);
+    }
+
+    #[test]
+    fn adaptive_models_get_adaptive_thinking_without_budget() {
+        let p = effort_params("claude-fable-5", Some("high"), 4096);
+        let thinking = p.thinking.expect("adaptive thinking set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, None);
+        assert_eq!(p.max_tokens, 4096);
+    }
+
+    #[test]
+    fn absent_or_unknown_effort_leaves_request_untouched() {
+        for effort in [None, Some("bogus")] {
+            let p = effort_params("claude-sonnet-4-5", effort, 4096);
+            assert!(p.thinking.is_none());
+            assert_eq!(p.temperature, None);
+            assert_eq!(p.max_tokens, 4096);
+        }
     }
 
     struct Collector {
@@ -210,9 +363,11 @@ mod tests {
         });
         engine
             .stream_prompt(
+                PocketProvider::Anthropic,
                 api_key,
                 claurst_core::constants::HAIKU_MODEL.to_string(),
                 "Reply with the single word: pocket".to_string(),
+                None,
                 delegate.clone(),
             )
             .await

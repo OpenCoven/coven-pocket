@@ -26,8 +26,14 @@ full-capability remote sessions.
 
 ## M1 — On-device agent core
 
-- [ ] Provider auth: Anthropic key + OAuth, Codex OAuth device flow, Keychain,
-      model picker with effort control
+- [x] Provider auth: Anthropic API key (Keychain) and Codex OAuth (PKCE +
+      in-app localhost callback, tokens in the engine's profile registry
+      inside the app sandbox), per-provider model picker with effort control.
+      Known limits at the current engine pin: Anthropic OAuth login is
+      unavailable (the OSS engine ships an intentionally empty OAuth
+      `client_id`), and the Codex Responses adapter does not yet encode a
+      reasoning-effort control, so effort maps to Anthropic extended
+      thinking only.
 - [ ] On-device git workspaces (libgit2; HTTPS PAT + SSH keys)
 - [ ] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
 - [ ] Permission modes + approval sheets (default / accept-edits / plan)
