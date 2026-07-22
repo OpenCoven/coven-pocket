@@ -113,20 +113,27 @@ pub(crate) async fn handshake(host: &str, port: u16, timeout: Duration) -> Daemo
     }
 }
 
-/// One GET over a fresh TCP connection, under a single timeout budget.
+/// One GET over a fresh TCP connection, under a single timeout budget
+/// spanning DNS resolution, connect, and the exchange.
 async fn fetch(host: &str, port: u16, path: &str, timeout: Duration) -> Exchange {
     let started = Instant::now();
 
-    // Resolve explicitly so DNS problems are distinguishable from dead hosts.
-    let addrs = match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(_) => return Exchange::Unresolvable,
+    // Resolve explicitly so DNS problems are distinguishable from dead
+    // hosts — and inside the budget, since a slow resolver hangs too.
+    let addrs = match tokio::time::timeout(timeout, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
+        Ok(Err(_)) => return Exchange::Unresolvable,
+        Err(_) => return Exchange::TimedOut,
     };
     if addrs.is_empty() {
         return Exchange::Unresolvable;
     }
 
-    let stream = match tokio::time::timeout(timeout, TcpStream::connect(addrs.as_slice())).await {
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Exchange::TimedOut;
+    }
+    let stream = match tokio::time::timeout(remaining, TcpStream::connect(addrs.as_slice())).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             return Exchange::Refused;
@@ -135,7 +142,7 @@ async fn fetch(host: &str, port: u16, path: &str, timeout: Duration) -> Exchange
         Err(_) => return Exchange::TimedOut,
     };
 
-    // One overall budget: the exchange only gets what the connect left over.
+    // The exchange only gets whatever the earlier phases left over.
     let remaining = timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return Exchange::TimedOut;
@@ -150,17 +157,17 @@ async fn fetch(host: &str, port: u16, path: &str, timeout: Duration) -> Exchange
     }
 }
 
-/// Cap on the buffered health response. A real one is a few hundred bytes;
-/// the address is user-supplied, so an arbitrary service must not be able
-/// to balloon memory.
-const MAX_HEALTH_RESPONSE_BYTES: u64 = 64 * 1024;
+/// Cap on any buffered response. A real health payload is a few hundred
+/// bytes; the address is user-supplied, so an arbitrary service must not
+/// be able to balloon memory.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Send the same minimal request the CLI uses and return the raw response.
 async fn http_get(mut stream: TcpStream, path: &str) -> std::io::Result<String> {
     let request = format!("GET {path} HTTP/1.1\r\nHost: coven\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
-    let mut limited = stream.take(MAX_HEALTH_RESPONSE_BYTES);
+    let mut limited = stream.take(MAX_RESPONSE_BYTES);
     limited.read_to_end(&mut response).await?;
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
@@ -250,11 +257,17 @@ fn classify_handshake(response: &str, latency_ms: u32) -> DaemonHandshake {
             detail: "the daemon answered without identifying itself".to_string(),
         };
     };
-    let pid = daemon
+    // Refuse to pair on an incomplete identity: a health payload without a
+    // usable pid is not something we can show the user or persist.
+    let Some(pid) = daemon
         .get("pid")
         .and_then(|v| v.as_u64())
         .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or_default();
+    else {
+        return DaemonHandshake::NotADaemon {
+            detail: "the daemon answered without identifying itself".to_string(),
+        };
+    };
     let started_at = daemon
         .get("startedAt")
         .and_then(|v| v.as_str())
@@ -498,6 +511,19 @@ mod tests {
         ));
         let port =
             serve_once("HTTP/1.1 404 Not Found\r\n\r\n{\"error\":{\"code\":\"nope\"}}").await;
+        assert!(matches!(
+            handshake("127.0.0.1", port, TIMEOUT).await,
+            DaemonHandshake::NotADaemon { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_identity_without_a_pid() {
+        let port = serve_once(
+            "HTTP/1.1 200 OK\r\n\r\n\
+             {\"ok\":true,\"apiVersion\":\"coven.daemon.v1\",\"daemon\":{\"startedAt\":\"x\"}}",
+        )
+        .await;
         assert!(matches!(
             handshake("127.0.0.1", port, TIMEOUT).await,
             DaemonHandshake::NotADaemon { .. }

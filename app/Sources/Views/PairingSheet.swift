@@ -10,7 +10,7 @@ struct PairingSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    row("Address", "\(model.trimmedHost):\(model.portText)")
+                    row("Address", "\(model.trimmedHost):\(displayPort)")
                     row("Protocol", identity.apiVersion)
                     row("Coven version", identity.covenVersion)
                     row("Process", "pid \(identity.pid)")
@@ -46,6 +46,11 @@ struct PairingSheet: View {
             }
         }
         .presentationDetents([.medium])
+    }
+
+    /// The normalized port the pairing will actually use, not raw field text.
+    private var displayPort: String {
+        model.port.map(String.init) ?? model.portText
     }
 
     private func row(_ label: String, _ value: String) -> some View {
