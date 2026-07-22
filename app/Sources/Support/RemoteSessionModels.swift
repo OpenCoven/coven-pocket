@@ -53,6 +53,9 @@ final class RemoteSessionsModel: ObservableObject {
 
 /// Live attachment to one remote session: polls the event ledger, renders
 /// a transcript, forwards input, and surfaces approval prompts.
+///
+/// Attach and every user-initiated action re-run the pairing gate; the
+/// poll loop reuses the pairing from the most recent successful gate.
 @MainActor
 final class RemoteAttachModel: ObservableObject {
     @Published private(set) var items: [RemoteTranscriptItem] = []
@@ -63,26 +66,26 @@ final class RemoteAttachModel: ObservableObject {
 
     let session: RemoteSession
 
-    private let engine: PocketEngine
-    private let host: String
-    private let port: UInt16
+    private let companion: CompanionModel
+    private var pairing: DaemonPairing?
     private var events: [RemoteEvent] = []
     private var cursor: Int64 = 0
+
+    private var engine: PocketEngine { companion.engine }
 
     static let pollInterval: Duration = .seconds(2)
     static let pageLimit: UInt32 = 200
     static let requestTimeoutMs: UInt32 = 6000
 
-    init(session: RemoteSession, pairing: DaemonPairing, engine: PocketEngine) {
+    init(session: RemoteSession, companion: CompanionModel) {
         self.session = session
-        self.host = pairing.host
-        self.port = pairing.port
-        self.engine = engine
+        self.companion = companion
     }
 
     /// Poll until the owning view disappears (task cancellation) or the
     /// session finishes and the ledger has drained.
     func attach() async {
+        guard await gate() != nil else { return }
         while !Task.isCancelled {
             await refreshOnce()
             if finished { break }
@@ -92,11 +95,12 @@ final class RemoteAttachModel: ObservableObject {
 
     /// One poll: drain available pages, then re-derive the view state.
     func refreshOnce() async {
+        guard let pairing else { return }
         do {
             var hasMore = true
             while hasMore && !Task.isCancelled {
                 let page = try await engine.remoteEvents(
-                    host: host, port: port, sessionId: session.id,
+                    host: pairing.host, port: pairing.port, sessionId: session.id,
                     afterSeq: cursor, limit: Self.pageLimit,
                     timeoutMs: Self.requestTimeoutMs
                 )
@@ -129,9 +133,10 @@ final class RemoteAttachModel: ObservableObject {
     func deny() async { await forward("n\n") }
 
     func kill() async {
+        guard let pairing = await gate() else { return }
         do {
             try await engine.remoteKill(
-                host: host, port: port, sessionId: session.id,
+                host: pairing.host, port: pairing.port, sessionId: session.id,
                 timeoutMs: Self.requestTimeoutMs
             )
             errorText = nil
@@ -140,10 +145,29 @@ final class RemoteAttachModel: ObservableObject {
         }
     }
 
+    /// Re-run the mandatory pairing gate; publish the failure reason and
+    /// return nil when session traffic must not proceed.
+    private func gate() async -> DaemonPairing? {
+        switch await companion.gateForSessionTraffic() {
+        case let .ready(fresh):
+            pairing = fresh
+            return fresh
+        case .notPaired:
+            pairing = nil
+            errorText = "Not paired — pair with a daemon in the Companion tab first."
+            return nil
+        case let .blocked(reason, hint):
+            pairing = nil
+            errorText = "\(reason). \(hint)"
+            return nil
+        }
+    }
+
     private func forward(_ data: String) async {
+        guard let pairing = await gate() else { return }
         do {
             try await engine.remoteSendInput(
-                host: host, port: port, sessionId: session.id, data: data,
+                host: pairing.host, port: pairing.port, sessionId: session.id, data: data,
                 timeoutMs: Self.requestTimeoutMs
             )
             errorText = nil

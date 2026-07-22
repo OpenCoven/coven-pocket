@@ -40,15 +40,10 @@ struct RemoteSessionsView: View {
                 .foregroundStyle(.secondary)
         case .loaded:
             ForEach(model.sessions, id: \.id) { session in
-                if let pairing = model.companion.pairing {
-                    NavigationLink {
-                        RemoteSessionView(
-                            session: session, pairing: pairing,
-                            engine: model.companion.engine
-                        )
-                    } label: {
-                        row(session)
-                    }
+                NavigationLink {
+                    RemoteSessionView(session: session, companion: model.companion)
+                } label: {
+                    row(session)
                 }
             }
         }

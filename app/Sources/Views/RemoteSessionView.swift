@@ -5,9 +5,9 @@ import SwiftUI
 struct RemoteSessionView: View {
     @StateObject private var model: RemoteAttachModel
 
-    init(session: RemoteSession, pairing: DaemonPairing, engine: PocketEngine) {
+    init(session: RemoteSession, companion: CompanionModel) {
         _model = StateObject(
-            wrappedValue: RemoteAttachModel(session: session, pairing: pairing, engine: engine)
+            wrappedValue: RemoteAttachModel(session: session, companion: companion)
         )
     }
 

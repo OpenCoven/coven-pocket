@@ -216,8 +216,15 @@ async fn write_request(
     );
     stream.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
-    let mut limited = stream.take(MAX_RESPONSE_BYTES);
+    // Read one byte past the cap so truncation is detected, not silent.
+    let mut limited = stream.take(MAX_RESPONSE_BYTES + 1);
     limited.read_to_end(&mut response).await?;
+    if response.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("daemon response exceeded the {MAX_RESPONSE_BYTES}-byte cap"),
+        ));
+    }
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
@@ -402,5 +409,28 @@ mod tests {
         assert_eq!(encode_path_segment("s-1"), "s-1");
         assert_eq!(encode_path_segment("../events?x=1"), "..%2Fevents%3Fx%3D1");
         assert_eq!(encode_path_segment("a b"), "a%20b");
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_fail_loudly_instead_of_truncating() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = "x".repeat(MAX_RESPONSE_BYTES as usize + 1);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let err = sessions("127.0.0.1", port, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("byte cap"), "unexpected error: {text}");
     }
 }

@@ -11,6 +11,20 @@ private func messagePayload(_ role: String, _ text: String) -> String {
         + #"[{"type":"text","text":"\#(text)"}]}}"#
 }
 
+private final class InMemoryPairingStore: PairingStore {
+    var stored: DaemonPairing?
+
+    func load() -> DaemonPairing? { stored }
+    func save(_ pairing: DaemonPairing) { stored = pairing }
+    func clear() { stored = nil }
+}
+
+@MainActor
+private func makeCompanion() -> CompanionModel {
+    let defaults = UserDefaults(suiteName: "attach-tests-\(UUID().uuidString)")!
+    return CompanionModel(defaults: defaults, store: InMemoryPairingStore())
+}
+
 final class RemoteAttachTests: XCTestCase {
     // MARK: - Transcript mapping
 
@@ -114,18 +128,11 @@ final class RemoteAttachTests: XCTestCase {
 
     @MainActor
     func testAttachModelDerivesApprovalAndCompletion() {
-        let pairing = DaemonPairing(
-            host: "127.0.0.1", port: 7777,
-            apiVersion: "coven.daemon.v1", covenVersion: "0.3.0",
-            pid: 1, startedAt: "x", pairedAt: Date()
-        )
         let session = RemoteSession(
             id: "s-1", harness: "codex", title: "T", status: "running",
             projectRoot: "/w", createdAt: "c", updatedAt: "u"
         )
-        let model = RemoteAttachModel(
-            session: session, pairing: pairing, engine: PocketEngine()
-        )
+        let model = RemoteAttachModel(session: session, companion: makeCompanion())
 
         model.apply(events: [
             event(seq: 1, kind: "output", payload: #"{"type":"output","text":"Approve edit? [y/n]"}"#)
@@ -139,5 +146,22 @@ final class RemoteAttachTests: XCTestCase {
         ])
         XCTAssertNil(model.approvalPrompt)
         XCTAssertTrue(model.finished)
+    }
+
+    @MainActor
+    func testAttachRefusesTrafficWhenNotPaired() async {
+        let session = RemoteSession(
+            id: "s-1", harness: "codex", title: "T", status: "running",
+            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+        )
+        let model = RemoteAttachModel(session: session, companion: makeCompanion())
+
+        await model.attach()
+        XCTAssertNotNil(model.errorText)
+        XCTAssertTrue(model.items.isEmpty)
+
+        model.draft = "hello"
+        await model.send()
+        XCTAssertNotNil(model.errorText)
     }
 }
