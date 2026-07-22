@@ -151,9 +151,10 @@ final class ChatModel: ObservableObject {
 
     // MARK: - Session browser
 
-    /// Stored sessions, newest first.
-    func storedSessions() -> [ChatSessionSummary] {
-        (try? engine.listChatSessions(storageDir: Self.sessionStoreURL.path)) ?? []
+    /// Stored sessions, newest first. The engine call is async, keeping the
+    /// SQLite read off the main thread.
+    func storedSessions() async -> [ChatSessionSummary] {
+        (try? await engine.listChatSessions(storageDir: Self.sessionStoreURL.path)) ?? []
     }
 
     /// Swap the live conversation for a stored one, restoring its transcript.
@@ -183,8 +184,8 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    func deleteSession(_ summary: ChatSessionSummary) {
-        try? engine.deleteChatSession(
+    func deleteSession(_ summary: ChatSessionSummary) async {
+        try? await engine.deleteChatSession(
             storageDir: Self.sessionStoreURL.path,
             sessionId: summary.sessionId
         )

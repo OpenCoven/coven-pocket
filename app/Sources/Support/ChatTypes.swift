@@ -27,6 +27,10 @@ struct PendingApproval: Identifiable {
 }
 
 extension ChatSessionSummary: Identifiable {
+    /// Shared: `ISO8601DateFormatter` is thread-safe and costly to build
+    /// per row.
+    private static let rfc3339 = ISO8601DateFormatter()
+
     public var id: String { sessionId }
 
     /// Row title with a fallback for sessions that never got one.
@@ -42,7 +46,7 @@ extension ChatSessionSummary: Identifiable {
             with: "",
             options: .regularExpression
         )
-        return ISO8601DateFormatter().date(from: stripped)
+        return Self.rfc3339.date(from: stripped)
     }
 }
 

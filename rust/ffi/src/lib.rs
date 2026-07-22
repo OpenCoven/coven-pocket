@@ -265,8 +265,9 @@ impl PocketEngine {
         .await
     }
 
-    /// Stored sessions, newest first.
-    pub fn list_chat_sessions(
+    /// Stored sessions, newest first. Async so the SQLite read stays off the
+    /// caller's thread (UI thread on iOS).
+    pub async fn list_chat_sessions(
         &self,
         storage_dir: String,
     ) -> Result<Vec<ChatSessionSummary>, PocketError> {
@@ -274,7 +275,7 @@ impl PocketEngine {
     }
 
     /// Delete a stored session and its transcript.
-    pub fn delete_chat_session(
+    pub async fn delete_chat_session(
         &self,
         storage_dir: String,
         session_id: String,

@@ -30,7 +30,7 @@ struct SessionsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .onAppear { sessions = model.storedSessions() }
+            .task { sessions = await model.storedSessions() }
             .confirmationDialog(
                 "Delete this session?",
                 isPresented: Binding(
@@ -41,8 +41,10 @@ struct SessionsView: View {
                 presenting: pendingDelete
             ) { summary in
                 Button("Delete \"\(summary.displayTitle)\"", role: .destructive) {
-                    model.deleteSession(summary)
-                    sessions = model.storedSessions()
+                    Task {
+                        await model.deleteSession(summary)
+                        sessions = await model.storedSessions()
+                    }
                 }
             } message: { _ in
                 Text("The transcript is removed from this device.")
@@ -67,7 +69,7 @@ struct SessionsView: View {
                     Button {
                         Task {
                             if await model.forkSession(summary) {
-                                sessions = model.storedSessions()
+                                sessions = await model.storedSessions()
                             }
                         }
                     } label: {
