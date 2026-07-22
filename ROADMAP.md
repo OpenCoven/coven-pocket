@@ -44,7 +44,7 @@ full-capability remote sessions.
 
 - [x] Daemon transport (Tailscale/SSH tunnel MVP; upstream design for an
       authenticated remote listener)
-- [ ] Pairing flow with mandatory `coven.daemon.v1` handshake
+- [x] Pairing flow with mandatory `coven.daemon.v1` handshake
 - [ ] Remote session attach: live events, input forwarding, remote approvals
 - [ ] Anthropic subscription access via the companion's `claude` CLI login:
       the engine's `ClaudeCliProvider` delegates to the signed-in binary and
