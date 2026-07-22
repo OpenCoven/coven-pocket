@@ -35,7 +35,7 @@ full-capability remote sessions.
       reasoning-effort control, so effort maps to Anthropic extended
       thinking only.
 - [ ] On-device git workspaces (libgit2; HTTPS PAT + SSH keys)
-- [ ] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
+- [x] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
 - [ ] Permission modes + approval sheets (default / accept-edits / plan)
 - [ ] Native diff viewer with per-hunk accept/reject
 - [ ] Session browser: resume, fork, delete
