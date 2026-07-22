@@ -158,13 +158,20 @@ impl ChatSession {
         delegate: Arc<dyn ChatDelegate>,
     ) -> Result<(), PocketError> {
         if self.busy.swap(true, Ordering::SeqCst) {
-            let message = "a turn is already running — stop it or wait".to_string();
-            delegate.on_error(message.clone());
-            return Err(PocketError::Engine { message });
+            let err = PocketError::Engine {
+                message: "a turn is already running — stop it or wait".to_string(),
+            };
+            delegate.on_error(err.to_string());
+            return Err(err);
         }
         // Hold the message lock for the whole turn; `busy` already serializes
         // callers, the lock just hands the loop `&mut Vec<Message>` safely.
-        let result = async {
+        //
+        // The inner block never touches the terminal callbacks: it resolves to
+        // a stop reason or an error, and the single dispatch below guarantees
+        // exactly one `on_done`/`on_error` per turn — including setup
+        // failures before the loop starts.
+        let outcome = async {
             let mut messages = self.messages.lock().await;
             if let Some(prompt) = prompt {
                 messages.push(Message::user(prompt));
@@ -209,37 +216,32 @@ impl ChatSession {
             let _ = forwarder.await;
 
             match outcome {
-                QueryOutcome::EndTurn { .. } => {
-                    delegate.on_done("end_turn".to_string());
-                    Ok(())
-                }
-                QueryOutcome::MaxTokens { .. } => {
-                    delegate.on_done("max_tokens".to_string());
-                    Ok(())
-                }
-                QueryOutcome::Cancelled => {
-                    delegate.on_done("cancelled".to_string());
-                    Ok(())
-                }
+                QueryOutcome::EndTurn { .. } => Ok("end_turn"),
+                QueryOutcome::MaxTokens { .. } => Ok("max_tokens"),
+                QueryOutcome::Cancelled => Ok("cancelled"),
                 QueryOutcome::BudgetExceeded {
                     cost_usd,
                     limit_usd,
-                } => {
-                    let message =
-                        format!("budget exceeded: ${cost_usd:.2} of ${limit_usd:.2} limit");
-                    delegate.on_error(message.clone());
-                    Err(PocketError::Provider { message })
-                }
-                QueryOutcome::Error(err) => {
-                    let message = err.to_string();
-                    delegate.on_error(message.clone());
-                    Err(PocketError::Provider { message })
-                }
+                } => Err(PocketError::Provider {
+                    message: format!("budget exceeded: ${cost_usd:.2} of ${limit_usd:.2} limit"),
+                }),
+                QueryOutcome::Error(err) => Err(PocketError::Provider {
+                    message: err.to_string(),
+                }),
             }
         }
         .await;
         self.busy.store(false, Ordering::SeqCst);
-        result
+        match outcome {
+            Ok(stop_reason) => {
+                delegate.on_done(stop_reason.to_string());
+                Ok(())
+            }
+            Err(err) => {
+                delegate.on_error(err.to_string());
+                Err(err)
+            }
+        }
     }
 
     /// Build the client, query config, and tool context for one turn.
@@ -761,5 +763,61 @@ mod tests {
             "relative/dir".to_string(),
         );
         assert!(err.is_err());
+    }
+
+    /// Records terminal callbacks so tests can assert the exactly-once
+    /// contract on paths that fail before the query loop starts.
+    #[derive(Default)]
+    struct RecordingDelegate {
+        done: parking_lot::Mutex<Vec<String>>,
+        errors: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl ChatDelegate for RecordingDelegate {
+        fn on_text(&self, _text: String) {}
+        fn on_thinking(&self, _text: String) {}
+        fn on_tool_start(&self, _tool_id: String, _tool_name: String, _input_json: String) {}
+        fn on_tool_end(
+            &self,
+            _tool_id: String,
+            _tool_name: String,
+            _result: String,
+            _is_error: bool,
+        ) {
+        }
+        fn on_status(&self, _message: String) {}
+        fn on_done(&self, stop_reason: String) {
+            self.done.lock().push(stop_reason);
+        }
+        fn on_error(&self, message: String) {
+            self.errors.lock().push(message);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_without_pending_message_emits_exactly_one_terminal_callback() {
+        let workspace = std::env::temp_dir().join(format!("pocket-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+        )
+        .unwrap();
+
+        let delegate = Arc::new(RecordingDelegate::default());
+        let result = session.retry(delegate.clone()).await;
+
+        assert!(result.is_err());
+        assert_eq!(delegate.done.lock().len(), 0);
+        assert_eq!(
+            delegate.errors.lock().len(),
+            1,
+            "setup failures must surface through exactly one on_error"
+        );
+        assert!(!session.is_busy());
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }
