@@ -26,7 +26,7 @@ pub use chat::{
     ChatPermissionResponder, ChatSession,
 };
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
-pub use daemon::DaemonProbeState;
+pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
 pub use sessions::ChatSessionSummary;
 
@@ -410,6 +410,24 @@ impl PocketEngine {
     /// [`DaemonProbeState`] the UI can render directly.
     pub async fn probe_daemon(&self, host: String, port: u16, timeout_ms: u32) -> DaemonProbeState {
         daemon::probe(
+            &host,
+            port,
+            std::time::Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .await
+    }
+
+    /// Perform the mandatory `coven.daemon.v1` handshake against
+    /// `host:port`: fetch `/api/v1/health` and accept only a daemon that
+    /// speaks the required contract. Pairing and all session traffic gate
+    /// on a [`DaemonHandshake::Compatible`] result. Never throws.
+    pub async fn handshake_daemon(
+        &self,
+        host: String,
+        port: u16,
+        timeout_ms: u32,
+    ) -> DaemonHandshake {
+        daemon::handshake(
             &host,
             port,
             std::time::Duration::from_millis(u64::from(timeout_ms)),
