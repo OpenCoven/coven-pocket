@@ -42,6 +42,60 @@ struct ChatSettings: Equatable {
     var effort: String = "medium"
 }
 
+/// Answer sink for one approval request. `ChatPermissionResponder` conforms;
+/// tests substitute a fake.
+protocol ApprovalResponding {
+    func respond(decision: ChatPermissionDecision)
+}
+
+extension ChatPermissionResponder: ApprovalResponding {}
+
+/// An engine approval request awaiting the user's decision. Dropping it
+/// without responding denies the tool call on the Rust side.
+struct PendingApproval: Identifiable {
+    let request: ChatPermissionRequest
+    let responder: any ApprovalResponding
+
+    var id: UInt64 { request.requestId }
+}
+
+extension ChatPermissionMode {
+    static let all: [ChatPermissionMode] = [.default, .acceptEdits, .plan]
+
+    /// Stable string for UserDefaults persistence.
+    var storageValue: String {
+        switch self {
+        case .default: return "default"
+        case .acceptEdits: return "accept-edits"
+        case .plan: return "plan"
+        }
+    }
+
+    init(storageValue: String?) {
+        switch storageValue {
+        case ChatPermissionMode.acceptEdits.storageValue: self = .acceptEdits
+        case ChatPermissionMode.plan.storageValue: self = .plan
+        default: self = .default
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .default: return "Ask to edit"
+        case .acceptEdits: return "Accept edits"
+        case .plan: return "Plan (read-only)"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .default: return "shield.lefthalf.filled"
+        case .acceptEdits: return "checkmark.shield"
+        case .plan: return "lock.shield"
+        }
+    }
+}
+
 /// Drives the agentic chat surface: owns the engine session, the rendered
 /// transcript, and the delegate bridge from Rust callback threads.
 @MainActor
@@ -49,11 +103,32 @@ final class ChatModel: ObservableObject {
     @Published var items: [ChatItem] = []
     @Published var isBusy = false
     @Published var canRetry = false
+    /// The approval sheet currently on screen, if any.
+    @Published var pendingApproval: PendingApproval?
+    /// Applies to the live session immediately; changing it never restarts
+    /// the conversation.
+    @Published var permissionMode: ChatPermissionMode {
+        didSet {
+            session?.setPermissionMode(mode: permissionMode)
+            defaults.set(permissionMode.storageValue, forKey: Self.permissionModeKey)
+        }
+    }
 
     let engine = PocketEngine()
 
     private var session: ChatSession?
     private var sessionSettings: ChatSettings?
+    private var approvalQueue: [PendingApproval] = []
+    private let defaults: UserDefaults
+
+    static let permissionModeKey = "chat-permission-mode"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        permissionMode = ChatPermissionMode(
+            storageValue: defaults.string(forKey: Self.permissionModeKey)
+        )
+    }
 
     /// The on-device directory the agent is allowed to touch. Files created
     /// here are visible in the Files app via the app's Documents folder.
@@ -102,6 +177,9 @@ final class ChatModel: ObservableObject {
         sessionSettings = nil
         items = []
         canRetry = false
+        // Dropping unanswered responders denies their tool calls.
+        pendingApproval = nil
+        approvalQueue = []
     }
 
     /// Reuse the live session when settings are unchanged; otherwise start a
@@ -118,7 +196,8 @@ final class ChatModel: ObservableObject {
             apiKey: settings.apiKey,
             model: settings.model,
             effort: settings.effort,
-            workspaceDir: workspace.path
+            workspaceDir: workspace.path,
+            permissionMode: permissionMode
         )
         session = fresh
         sessionSettings = settings
@@ -172,6 +251,32 @@ final class ChatModel: ObservableObject {
     func appendError(_ message: String) {
         items.append(ChatItem(kind: .error, text: message))
         canRetry = true
+    }
+
+    // MARK: - Approvals
+
+    /// Show the request, or queue it behind the one already on screen.
+    func receiveApproval(_ approval: PendingApproval) {
+        if pendingApproval == nil {
+            pendingApproval = approval
+        } else {
+            approvalQueue.append(approval)
+        }
+    }
+
+    /// Deliver the user's decision and dismiss the sheet.
+    func respond(to approval: PendingApproval, decision: ChatPermissionDecision) {
+        approval.responder.respond(decision: decision)
+        if pendingApproval?.id == approval.id {
+            pendingApproval = nil
+        }
+    }
+
+    /// Sheet dismissed (answered or swiped away — an unanswered responder
+    /// denies on release). Surface the next queued request, if any.
+    func approvalDismissed() {
+        guard pendingApproval == nil, !approvalQueue.isEmpty else { return }
+        pendingApproval = approvalQueue.removeFirst()
     }
 
     /// Compact, human-readable summary of a tool call's input.
@@ -237,6 +342,13 @@ private final class ChatBridge: ChatDelegate, @unchecked Sendable {
 
     func onStatus(message: String) {
         Task { @MainActor [model] in model?.appendStatus(message) }
+    }
+
+    func onPermissionRequest(request: ChatPermissionRequest, responder: ChatPermissionResponder) {
+        Task { @MainActor [model] in
+            // If the model is gone the approval drops here, which denies.
+            model?.receiveApproval(PendingApproval(request: request, responder: responder))
+        }
     }
 
     func onDone(stopReason: String) {

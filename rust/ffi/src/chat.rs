@@ -14,8 +14,9 @@
 //!    model cannot read or write app-container files (for example stored
 //!    provider credentials) through the file tools.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use claurst_api::client::ClientConfig;
@@ -28,9 +29,9 @@ use claurst_core::file_history::FileHistory;
 use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
 use claurst_core::types::Message;
 use claurst_query::{run_query_loop, QueryConfig, QueryEvent, QueryOutcome};
-use claurst_tools::{Tool, ToolContext, ToolResult};
+use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{PocketError, PocketProvider};
 
@@ -67,6 +68,14 @@ pub trait ChatDelegate: Send + Sync {
     fn on_tool_end(&self, tool_id: String, tool_name: String, result: String, is_error: bool);
     /// Informational status from the loop (retries, model fallback, …).
     fn on_status(&self, message: String);
+    /// A write tool wants to run in `Default` mode. Show an approval sheet
+    /// and deliver the answer through `responder`; releasing the responder
+    /// without answering denies the call.
+    fn on_permission_request(
+        &self,
+        request: ChatPermissionRequest,
+        responder: Arc<ChatPermissionResponder>,
+    );
     /// The turn finished. `stop_reason` is `end_turn`, `max_tokens`, or
     /// `cancelled`.
     fn on_done(&self, stop_reason: String);
@@ -82,6 +91,102 @@ pub struct ChatMessage {
     pub role: String,
     /// Concatenated text content (tool blocks are omitted).
     pub text: String,
+}
+
+/// How write tools are gated. Read-only tools always run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatPermissionMode {
+    /// Every write asks for approval (unless allowed for the session).
+    Default,
+    /// File edits run without asking; the workspace sandbox still applies.
+    AcceptEdits,
+    /// Read-only: write tools are refused outright.
+    Plan,
+}
+
+/// The user's answer to an approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatPermissionDecision {
+    /// Run this call.
+    Allow,
+    /// Run this call and stop asking for this tool for the session.
+    AllowSession,
+    /// Refuse this call; the model sees the refusal and can continue.
+    Deny,
+}
+
+/// A pending approval shown to the user.
+#[derive(uniffi::Record)]
+pub struct ChatPermissionRequest {
+    /// Unique per session, for correlating UI state.
+    pub request_id: u64,
+    /// Engine tool name (`Edit`, `Write`, …).
+    pub tool_name: String,
+    /// Workspace-relative target paths, comma-separated for multi-file calls.
+    pub paths: String,
+    /// Proposed-change preview (truncated diff/content), empty when the tool
+    /// input has nothing meaningful to show.
+    pub preview: String,
+}
+
+/// One-shot answer channel handed to the UI with each approval request.
+///
+/// Dropping it without responding counts as a denial, so a dismissed sheet
+/// can never hang the turn.
+#[derive(uniffi::Object)]
+pub struct ChatPermissionResponder {
+    tx: parking_lot::Mutex<Option<oneshot::Sender<ChatPermissionDecision>>>,
+}
+
+#[uniffi::export]
+impl ChatPermissionResponder {
+    /// Deliver the user's decision. Only the first call has an effect.
+    pub fn respond(&self, decision: ChatPermissionDecision) {
+        if let Some(tx) = self.tx.lock().take() {
+            let _ = tx.send(decision);
+        }
+    }
+}
+
+/// Mutable permission state shared by a session and its sandboxed tools.
+pub(crate) struct PermissionState {
+    mode: AtomicU8,
+    request_counter: AtomicU64,
+    session_allowed: parking_lot::Mutex<HashSet<String>>,
+}
+
+impl PermissionState {
+    fn new(mode: ChatPermissionMode) -> Self {
+        Self {
+            mode: AtomicU8::new(mode_to_u8(mode)),
+            request_counter: AtomicU64::new(0),
+            session_allowed: parking_lot::Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn mode(&self) -> ChatPermissionMode {
+        mode_from_u8(self.mode.load(Ordering::SeqCst))
+    }
+
+    fn set_mode(&self, mode: ChatPermissionMode) {
+        self.mode.store(mode_to_u8(mode), Ordering::SeqCst);
+    }
+}
+
+fn mode_to_u8(mode: ChatPermissionMode) -> u8 {
+    match mode {
+        ChatPermissionMode::Default => 0,
+        ChatPermissionMode::AcceptEdits => 1,
+        ChatPermissionMode::Plan => 2,
+    }
+}
+
+fn mode_from_u8(raw: u8) -> ChatPermissionMode {
+    match raw {
+        1 => ChatPermissionMode::AcceptEdits,
+        2 => ChatPermissionMode::Plan,
+        _ => ChatPermissionMode::Default,
+    }
 }
 
 /// Provider-independent settings captured at session start.
@@ -100,6 +205,7 @@ pub struct ChatSession {
     messages: tokio::sync::Mutex<Vec<Message>>,
     cancel: parking_lot::Mutex<tokio_util::sync::CancellationToken>,
     busy: AtomicBool,
+    perms: Arc<PermissionState>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -129,6 +235,18 @@ impl ChatSession {
     /// Whether a turn is currently running.
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// The active permission mode.
+    pub fn permission_mode(&self) -> ChatPermissionMode {
+        self.perms.mode()
+    }
+
+    /// Switch permission modes. Applies to the next tool call, including
+    /// calls later in an in-flight turn. Session-scoped approvals persist
+    /// across mode changes.
+    pub fn set_permission_mode(&self, mode: ChatPermissionMode) {
+        self.perms.set_mode(mode);
     }
 
     /// The persisted transcript (text content only).
@@ -193,7 +311,11 @@ impl ChatSession {
             };
 
             let (client, query_config, tool_ctx) = self.build_loop_inputs()?;
-            let tools = sandbox_tools(&self.config.workspace_dir);
+            let tools = sandbox_tools(
+                &self.config.workspace_dir,
+                self.perms.clone(),
+                Some(delegate.clone()),
+            );
 
             let (event_tx, event_rx) = mpsc::unbounded_channel();
             let forwarder = spawn_event_forwarder(event_rx, delegate.clone());
@@ -378,6 +500,7 @@ pub(crate) fn start_session(
     model: String,
     effort: Option<String>,
     workspace_dir: String,
+    permission_mode: ChatPermissionMode,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = PathBuf::from(&workspace_dir);
     if !workspace.is_absolute() {
@@ -403,6 +526,7 @@ pub(crate) fn start_session(
         messages: tokio::sync::Mutex::new(Vec::new()),
         cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
         busy: AtomicBool::new(false),
+        perms: Arc::new(PermissionState::new(permission_mode)),
     }))
 }
 
@@ -411,8 +535,15 @@ pub(crate) fn start_session(
 // ---------------------------------------------------------------------------
 
 /// Build the sandboxed tool registry: allowlisted file tools, each wrapped in
-/// workspace path containment.
-pub(crate) fn sandbox_tools(workspace: &Path) -> Vec<Box<dyn Tool>> {
+/// workspace path containment and (for write tools) the permission gate.
+///
+/// `delegate` receives approval requests in `Default` mode; passing `None`
+/// (tests, headless callers) makes `Default` behave like deny-on-write.
+pub(crate) fn sandbox_tools(
+    workspace: &Path,
+    perms: Arc<PermissionState>,
+    delegate: Option<Arc<dyn ChatDelegate>>,
+) -> Vec<Box<dyn Tool>> {
     claurst_tools::all_tools()
         .into_iter()
         .filter(|tool| FILE_TOOLS.contains(&tool.name()))
@@ -420,6 +551,8 @@ pub(crate) fn sandbox_tools(workspace: &Path) -> Vec<Box<dyn Tool>> {
             Box::new(SandboxedTool {
                 inner: tool,
                 root: workspace.to_path_buf(),
+                perms: perms.clone(),
+                delegate: delegate.clone(),
             }) as Box<dyn Tool>
         })
         .collect()
@@ -432,9 +565,80 @@ pub(crate) fn sandbox_tools(workspace: &Path) -> Vec<Box<dyn Tool>> {
 /// would expose the whole app container (including stored credentials) to a
 /// prompt-injected model. This wrapper validates every path-carrying input
 /// field before delegating.
+///
+/// It is also the permission gate: write-level tools are refused in `Plan`
+/// mode and routed through the approval delegate in `Default` mode. Doing
+/// this here (instead of the engine's sync `PermissionHandler`) keeps the
+/// user wait fully async — no runtime threads are blocked while a sheet is
+/// on screen.
 struct SandboxedTool {
     inner: Box<dyn Tool>,
     root: PathBuf,
+    perms: Arc<PermissionState>,
+    delegate: Option<Arc<dyn ChatDelegate>>,
+}
+
+impl SandboxedTool {
+    /// Gate a write-level call according to the active mode. `Ok(())` means
+    /// run it; `Err(result)` is returned to the model verbatim.
+    async fn authorize_write(&self, input: &Value) -> Result<(), ToolResult> {
+        match self.perms.mode() {
+            ChatPermissionMode::AcceptEdits => Ok(()),
+            ChatPermissionMode::Plan => Err(ToolResult::error(format!(
+                "{} is not available in plan mode (read-only) — present a plan \
+                 instead, and ask the user to switch modes to apply changes",
+                self.inner.name()
+            ))),
+            ChatPermissionMode::Default => {
+                if self
+                    .perms
+                    .session_allowed
+                    .lock()
+                    .contains(self.inner.name())
+                {
+                    return Ok(());
+                }
+                let Some(delegate) = &self.delegate else {
+                    return Err(ToolResult::error(format!(
+                        "{} requires approval but no approver is attached",
+                        self.inner.name()
+                    )));
+                };
+
+                let (tx, rx) = oneshot::channel();
+                let request = ChatPermissionRequest {
+                    request_id: self.perms.request_counter.fetch_add(1, Ordering::Relaxed),
+                    tool_name: self.inner.name().to_string(),
+                    paths: tool_paths_summary(self.inner.name(), input, &self.root),
+                    preview: tool_input_preview(self.inner.name(), input),
+                };
+                delegate.on_permission_request(
+                    request,
+                    Arc::new(ChatPermissionResponder {
+                        tx: parking_lot::Mutex::new(Some(tx)),
+                    }),
+                );
+
+                // A dropped responder (dismissed sheet, released bridge)
+                // resolves to RecvError, which denies.
+                match rx.await {
+                    Ok(ChatPermissionDecision::Allow) => Ok(()),
+                    Ok(ChatPermissionDecision::AllowSession) => {
+                        self.perms
+                            .session_allowed
+                            .lock()
+                            .insert(self.inner.name().to_string());
+                        Ok(())
+                    }
+                    Ok(ChatPermissionDecision::Deny) | Err(_) => Err(ToolResult::error(format!(
+                        "the user denied this {} call — ask before retrying \
+                         or adjust the approach",
+                        self.inner.name()
+                    ))),
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -463,6 +667,11 @@ impl Tool for SandboxedTool {
                 self.root.display()
             ));
         }
+        if self.inner.permission_level() == PermissionLevel::Write {
+            if let Err(refusal) = self.authorize_write(&input).await {
+                return refusal;
+            }
+        }
         self.inner.execute(input, ctx).await
     }
 }
@@ -470,6 +679,16 @@ impl Tool for SandboxedTool {
 /// Check every path-carrying field of `input` for tool `name` against `root`.
 /// Returns the offending path on failure.
 fn validate_tool_paths(name: &str, input: &Value, root: &Path) -> Result<(), String> {
+    for candidate in collect_tool_paths(name, input) {
+        if !path_is_contained(&candidate, root) {
+            return Err(candidate);
+        }
+    }
+    Ok(())
+}
+
+/// Extract the path-carrying fields of a tool input.
+fn collect_tool_paths(name: &str, input: &Value) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     let mut collect = |value: Option<&Value>| {
         if let Some(s) = value.and_then(Value::as_str) {
@@ -498,13 +717,73 @@ fn validate_tool_paths(name: &str, input: &Value, root: &Path) -> Result<(), Str
         // registry is a bug caught by the exhaustive profile test.
         _ => {}
     }
+    candidates
+}
 
-    for candidate in candidates {
-        if !path_is_contained(&candidate, root) {
-            return Err(candidate);
+/// Deduplicated, workspace-relative target paths for the approval sheet.
+fn tool_paths_summary(name: &str, input: &Value, root: &Path) -> String {
+    let mut seen = HashSet::new();
+    let mut parts: Vec<String> = Vec::new();
+    for path in collect_tool_paths(name, input) {
+        let display = Path::new(&path)
+            .strip_prefix(root)
+            .map(|p| p.display().to_string())
+            .unwrap_or(path);
+        let display = if display.is_empty() {
+            ".".to_string()
+        } else {
+            display
+        };
+        if seen.insert(display.clone()) {
+            parts.push(display);
         }
     }
-    Ok(())
+    parts.join(", ")
+}
+
+const PREVIEW_LIMIT: usize = 600;
+
+/// Truncate to `PREVIEW_LIMIT` characters on a char boundary.
+fn truncate_preview(text: &str) -> String {
+    if text.chars().count() <= PREVIEW_LIMIT {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(PREVIEW_LIMIT).collect();
+    format!("{cut}\n…")
+}
+
+/// A proposed-change preview for the approval sheet, per tool input shape.
+fn tool_input_preview(name: &str, input: &Value) -> String {
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match name {
+        "Edit" => {
+            let old = text("old_string");
+            let new = text("new_string");
+            if old.is_empty() && new.is_empty() {
+                String::new()
+            } else {
+                truncate_preview(&format!("- {old}\n+ {new}"))
+            }
+        }
+        "Write" => truncate_preview(&text("content")),
+        "NotebookEdit" => truncate_preview(&text("new_source")),
+        "ApplyPatch" => truncate_preview(&text("patch")),
+        "BatchEdit" => {
+            let count = input
+                .get("edits")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            format!("{count} edit(s)")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Extract target paths from a unified diff (`+++ b/<path>` / `+++ <path>`
@@ -633,7 +912,11 @@ mod tests {
             "computer",
         ];
 
-        let sandbox = sandbox_tools(Path::new("/tmp/pocket-test"));
+        let sandbox = sandbox_tools(
+            Path::new("/tmp/pocket-test"),
+            Arc::new(PermissionState::new(ChatPermissionMode::Default)),
+            None,
+        );
         let sandbox_names: Vec<&str> = sandbox.iter().map(|t| t.name()).collect();
 
         for tool in claurst_tools::all_tools() {
@@ -761,16 +1044,30 @@ mod tests {
             "model".to_string(),
             None,
             "relative/dir".to_string(),
+            ChatPermissionMode::Default,
         );
         assert!(err.is_err());
     }
 
     /// Records terminal callbacks so tests can assert the exactly-once
-    /// contract on paths that fail before the query loop starts.
+    /// contract on paths that fail before the query loop starts. Approval
+    /// requests are answered with the configured decision (or dropped when
+    /// `None`, exercising the deny-on-release path).
     #[derive(Default)]
     struct RecordingDelegate {
         done: parking_lot::Mutex<Vec<String>>,
         errors: parking_lot::Mutex<Vec<String>>,
+        prompts: parking_lot::Mutex<Vec<ChatPermissionRequest>>,
+        answer: Option<ChatPermissionDecision>,
+    }
+
+    impl RecordingDelegate {
+        fn answering(decision: ChatPermissionDecision) -> Self {
+            Self {
+                answer: Some(decision),
+                ..Self::default()
+            }
+        }
     }
 
     impl ChatDelegate for RecordingDelegate {
@@ -786,6 +1083,16 @@ mod tests {
         ) {
         }
         fn on_status(&self, _message: String) {}
+        fn on_permission_request(
+            &self,
+            request: ChatPermissionRequest,
+            responder: Arc<ChatPermissionResponder>,
+        ) {
+            self.prompts.lock().push(request);
+            if let Some(decision) = self.answer {
+                responder.respond(decision);
+            }
+        }
         fn on_done(&self, stop_reason: String) {
             self.done.lock().push(stop_reason);
         }
@@ -804,6 +1111,7 @@ mod tests {
             "model".to_string(),
             None,
             workspace.display().to_string(),
+            ChatPermissionMode::Default,
         )
         .unwrap();
 
@@ -819,5 +1127,200 @@ mod tests {
         );
         assert!(!session.is_busy());
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -- permission gate ----------------------------------------------------
+
+    /// Write-level stub that records whether it ran.
+    struct StubWriteTool {
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubWriteTool {
+        fn name(&self) -> &str {
+            "Write"
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Write
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            self.ran.store(true, Ordering::SeqCst);
+            ToolResult::success("written")
+        }
+    }
+
+    fn gated_stub(
+        mode: ChatPermissionMode,
+        delegate: Option<Arc<dyn ChatDelegate>>,
+    ) -> (SandboxedTool, Arc<AtomicBool>, Arc<PermissionState>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let perms = Arc::new(PermissionState::new(mode));
+        let tool = SandboxedTool {
+            inner: Box::new(StubWriteTool { ran: ran.clone() }),
+            root: std::env::temp_dir(),
+            perms: perms.clone(),
+            delegate,
+        };
+        (tool, ran, perms)
+    }
+
+    fn write_input() -> Value {
+        let path = std::env::temp_dir().join("gate-test.txt");
+        serde_json::json!({ "file_path": path, "content": "hello" })
+    }
+
+    fn test_ctx() -> ToolContext {
+        // Only fields the stub path touches matter; reuse the session builder
+        // for a fully-populated context.
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            std::env::temp_dir().display().to_string(),
+            ChatPermissionMode::Default,
+        )
+        .unwrap();
+        let (_client, _config, ctx) = session.build_loop_inputs().unwrap();
+        ctx
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_mode_refuses_writes_without_prompting() {
+        let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Allow));
+        let (tool, ran, _) = gated_stub(ChatPermissionMode::Plan, Some(delegate.clone()));
+
+        let result = tool.execute(write_input(), &test_ctx()).await;
+
+        assert!(result.is_error);
+        assert!(!ran.load(Ordering::SeqCst), "plan mode must not execute");
+        assert!(delegate.prompts.lock().is_empty(), "plan mode never asks");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_edits_runs_writes_without_prompting() {
+        let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
+        let (tool, ran, _) = gated_stub(ChatPermissionMode::AcceptEdits, Some(delegate.clone()));
+
+        let result = tool.execute(write_input(), &test_ctx()).await;
+
+        assert!(!result.is_error);
+        assert!(ran.load(Ordering::SeqCst));
+        assert!(delegate.prompts.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_mode_denial_blocks_execution() {
+        let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
+        let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
+
+        let result = tool.execute(write_input(), &test_ctx()).await;
+
+        assert!(result.is_error);
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(delegate.prompts.lock().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_mode_approval_executes() {
+        let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Allow));
+        let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
+
+        let result = tool.execute(write_input(), &test_ctx()).await;
+
+        assert!(!result.is_error);
+        assert!(ran.load(Ordering::SeqCst));
+        let prompts = delegate.prompts.lock();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].tool_name, "Write");
+        assert!(prompts[0].preview.contains("hello"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allow_session_skips_subsequent_prompts() {
+        let delegate = Arc::new(RecordingDelegate::answering(
+            ChatPermissionDecision::AllowSession,
+        ));
+        let (tool, ran, perms) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
+        let ctx = test_ctx();
+
+        assert!(!tool.execute(write_input(), &ctx).await.is_error);
+        ran.store(false, Ordering::SeqCst);
+        assert!(!tool.execute(write_input(), &ctx).await.is_error);
+
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(
+            delegate.prompts.lock().len(),
+            1,
+            "allow-for-session must suppress the second prompt"
+        );
+        assert!(perms.session_allowed.lock().contains("Write"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_responder_denies() {
+        // answer: None → the responder is dropped unanswered.
+        let delegate = Arc::new(RecordingDelegate::default());
+        let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
+
+        let result = tool.execute(write_input(), &test_ctx()).await;
+
+        assert!(result.is_error);
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(delegate.prompts.lock().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_tools_bypass_the_gate() {
+        let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
+        let perms = Arc::new(PermissionState::new(ChatPermissionMode::Default));
+        let workspace = std::env::temp_dir().canonicalize().unwrap();
+        let tools = sandbox_tools(&workspace, perms, Some(delegate.clone()));
+        let read = tools
+            .iter()
+            .find(|t| t.name() == "Read")
+            .expect("Read tool in sandbox");
+        let target = workspace.join("gate-read-test.txt");
+        std::fs::write(&target, "content").unwrap();
+
+        let result = read
+            .execute(serde_json::json!({ "file_path": target }), &test_ctx())
+            .await;
+
+        assert!(!result.is_error);
+        assert!(delegate.prompts.lock().is_empty());
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn mode_roundtrip_and_paths_summary() {
+        for mode in [
+            ChatPermissionMode::Default,
+            ChatPermissionMode::AcceptEdits,
+            ChatPermissionMode::Plan,
+        ] {
+            assert_eq!(mode_from_u8(mode_to_u8(mode)), mode);
+        }
+
+        let root = Path::new("/ws");
+        let summary = tool_paths_summary(
+            "BatchEdit",
+            &serde_json::json!({
+                "edits": [
+                    { "file_path": "/ws/a.txt" },
+                    { "file_path": "/ws/b.txt" },
+                    { "file_path": "/ws/a.txt" },
+                ]
+            }),
+            root,
+        );
+        assert_eq!(summary, "a.txt, b.txt");
     }
 }
