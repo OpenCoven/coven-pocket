@@ -5,6 +5,12 @@ private func event(seq: Int64, kind: String, payload: String) -> RemoteEvent {
     RemoteEvent(seq: seq, kind: kind, payloadJson: payload, createdAt: "t")
 }
 
+/// Build a stream-json `user`/`assistant` frame with one text block.
+private func messagePayload(_ role: String, _ text: String) -> String {
+    #"{"type":"\#(role)","message":{"role":"\#(role)","content":"#
+        + #"[{"type":"text","text":"\#(text)"}]}}"#
+}
+
 final class RemoteAttachTests: XCTestCase {
     // MARK: - Transcript mapping
 
@@ -16,15 +22,16 @@ final class RemoteAttachTests: XCTestCase {
             ),
             event(
                 seq: 2, kind: "user",
-                payload: #"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the bug"}]}}"#
+                payload: messagePayload("user", "fix the bug")
             ),
             event(
                 seq: 3, kind: "assistant",
-                payload: #"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#
+                payload: messagePayload("assistant", "On it.")
             ),
             event(
                 seq: 4, kind: "tool_result",
-                payload: #"{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"3 files changed"}],"is_error":false}"#
+                payload: #"{"type":"tool_result","tool_use_id":"t1","content":"#
+                    + #"[{"type":"text","text":"3 files changed"}],"is_error":false}"#
             ),
             event(
                 seq: 5, kind: "result",
@@ -49,7 +56,7 @@ final class RemoteAttachTests: XCTestCase {
             event(seq: 2, kind: "output", payload: #"{"type":"output","text":"st\nrunning 5 tests\n"}"#),
             event(
                 seq: 3, kind: "assistant",
-                payload: #"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#
+                payload: messagePayload("assistant", "done")
             )
         ]
         let items = RemoteTranscript.items(from: events)

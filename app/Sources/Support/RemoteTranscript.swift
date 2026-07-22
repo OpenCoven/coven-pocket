@@ -37,35 +37,51 @@ enum RemoteTranscript {
                     text: contentText(payload["content"])
                 )
             case "output":
-                let text = cleanTerminalText(payload["text"] as? String ?? "")
-                guard !text.isEmpty else { continue }
-                if let last = items.last, last.role == .terminal {
-                    items[items.count - 1] = RemoteTranscriptItem(
-                        id: last.id, role: .terminal,
-                        text: mergeTerminal(last.text, text)
-                    )
-                } else {
-                    items.append(RemoteTranscriptItem(id: event.seq, role: .terminal, text: text))
-                }
-            case "system":
-                if payload["subtype"] as? String == "init" {
-                    let cwd = payload["cwd"] as? String ?? ""
-                    append(
-                        &items, id: event.seq, role: .status,
-                        text: cwd.isEmpty ? "Session started" : "Session started in \(cwd)"
-                    )
-                }
-            case "result":
-                let isError = payload["is_error"] as? Bool ?? false
-                append(
-                    &items, id: event.seq, role: .status,
-                    text: isError ? "Session finished with an error" : "Session finished"
-                )
+                appendTerminal(&items, id: event.seq, payload: payload)
+            case "system", "result":
+                appendStatus(&items, id: event.seq, payload: payload)
             default:
                 continue
             }
         }
         return items
+    }
+
+    private static func appendTerminal(
+        _ items: inout [RemoteTranscriptItem], id: Int64, payload: [String: Any]
+    ) {
+        let text = cleanTerminalText(payload["text"] as? String ?? "")
+        guard !text.isEmpty else { return }
+        if let last = items.last, last.role == .terminal {
+            items[items.count - 1] = RemoteTranscriptItem(
+                id: last.id, role: .terminal,
+                text: mergeTerminal(last.text, text)
+            )
+        } else {
+            items.append(RemoteTranscriptItem(id: id, role: .terminal, text: text))
+        }
+    }
+
+    private static func appendStatus(
+        _ items: inout [RemoteTranscriptItem], id: Int64, payload: [String: Any]
+    ) {
+        switch payload["type"] as? String {
+        case "system":
+            guard payload["subtype"] as? String == "init" else { return }
+            let cwd = payload["cwd"] as? String ?? ""
+            append(
+                &items, id: id, role: .status,
+                text: cwd.isEmpty ? "Session started" : "Session started in \(cwd)"
+            )
+        case "result":
+            let isError = payload["is_error"] as? Bool ?? false
+            append(
+                &items, id: id, role: .status,
+                text: isError ? "Session finished with an error" : "Session finished"
+            )
+        default:
+            return
+        }
     }
 
     /// Detect a pending approval prompt in the tail of terminal output.
