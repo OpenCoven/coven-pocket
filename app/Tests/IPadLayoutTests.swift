@@ -22,6 +22,19 @@ final class IPadLayoutTests: XCTestCase {
         }
     }
 
+    func testSidebarSubtitleOmitsEmptyModel() {
+        let with = ChatSessionSummary(
+            sessionId: "a", title: "t", model: "claude-test",
+            createdAt: "", updatedAt: "", messageCount: 4
+        )
+        let without = ChatSessionSummary(
+            sessionId: "b", title: "t", model: "",
+            createdAt: "", updatedAt: "", messageCount: 2
+        )
+        XCTAssertEqual(with.sidebarSubtitle, "claude-test · 4 messages")
+        XCTAssertEqual(without.sidebarSubtitle, "2 messages")
+    }
+
     // MARK: - Context status line
 
     private func summary(

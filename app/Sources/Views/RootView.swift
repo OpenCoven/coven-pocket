@@ -63,6 +63,7 @@ struct RootView: View {
 private struct SidebarView: View {
     @ObservedObject var router: AppRouter
     @StateObject private var sessions = SidebarSessionsModel()
+    @State private var pendingDelete: IndexSet?
 
     var body: some View {
         List(selection: sectionSelection) {
@@ -83,9 +84,9 @@ private struct SidebarView: View {
                         router.openSession(id: summary.sessionId)
                     } label: {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(summary.title.isEmpty ? "Untitled session" : summary.title)
+                            Text(summary.displayTitle)
                                 .lineLimit(1)
-                            Text("\(summary.model) · \(summary.messageCount) messages")
+                            Text(summary.sidebarSubtitle)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -94,7 +95,7 @@ private struct SidebarView: View {
                     .hoverEffect(.highlight)
                 }
                 .onDelete { offsets in
-                    Task { await sessions.delete(at: offsets) }
+                    pendingDelete = offsets
                 }
             }
         }
@@ -112,6 +113,21 @@ private struct SidebarView: View {
         }
         .task { await sessions.refresh() }
         .refreshable { await sessions.refresh() }
+        .confirmationDialog(
+            "Delete this session?",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDelete
+        ) { offsets in
+            Button("Delete", role: .destructive) {
+                Task { await sessions.delete(at: offsets) }
+            }
+        } message: { _ in
+            Text("The transcript is removed from this device.")
+        }
     }
 
     /// Section rows select; session rows act as buttons instead.
@@ -120,6 +136,14 @@ private struct SidebarView: View {
             get: { router.selectedTab },
             set: { if let tab = $0 { router.selectedTab = tab } }
         )
+    }
+}
+
+extension ChatSessionSummary {
+    /// "model · N messages", omitting the model when the summary lacks one.
+    var sidebarSubtitle: String {
+        let messages = "\(messageCount) messages"
+        return model.isEmpty ? messages : "\(model) · \(messages)"
     }
 }
 

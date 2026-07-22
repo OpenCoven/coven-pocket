@@ -115,7 +115,12 @@ final class ContextPaneModel: ObservableObject {
         } else {
             activeWorkspace = nil
         }
-        let effectivePath = workspacePath ?? ChatModel.workspaceURL.path
+        // Prefer the resolved workspace's own path so status, context, and
+        // notes always describe the same directory even if the persisted
+        // path key has drifted.
+        let effectivePath = activeWorkspace?.path
+            ?? workspacePath
+            ?? ChatModel.workspaceURL.path
         context = try? await engine.projectContext(workspaceDir: effectivePath)
         notes = (try? await engine.listMemoryNotes(workspaceDir: effectivePath)) ?? []
     }
