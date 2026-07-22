@@ -21,6 +21,7 @@ mod daemon;
 mod git;
 mod remote;
 mod sessions;
+mod share;
 
 pub use chat::{
     ChatDelegate, ChatMessage, ChatPermissionDecision, ChatPermissionMode, ChatPermissionRequest,
@@ -31,6 +32,7 @@ pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
 pub use remote::{RemoteEvent, RemoteEventBatch, RemoteSession};
 pub use sessions::ChatSessionSummary;
+pub use share::{RedactionFinding, RedactionResult};
 
 uniffi::setup_scaffolding!();
 
@@ -496,6 +498,13 @@ impl PocketEngine {
         timeout_ms: u32,
     ) -> Result<(), PocketError> {
         remote::kill(&host, port, &session_id, millis(timeout_ms)).await
+    }
+
+    /// Scrub credential-shaped content from a transcript before sharing.
+    /// Runs on the blocking pool: transcripts can be large and the pass is
+    /// regex-heavy.
+    pub async fn redact_secrets(&self, text: String) -> Result<RedactionResult, PocketError> {
+        run_blocking(move || Ok(share::redact_secrets(&text))).await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.

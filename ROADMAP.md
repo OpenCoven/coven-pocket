@@ -59,7 +59,7 @@ full-capability remote sessions.
 - [ ] Familiar companion (7 archetypes)
 - [ ] On-device `/goal` with Live Activity progress
 - [ ] Remote MCP servers (streamable HTTP/SSE + OAuth)
-- [ ] Session sharing via unlisted Gists
+- [x] Session sharing via unlisted Gists
 
 ## M4 — Platform polish
 
