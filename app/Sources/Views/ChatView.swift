@@ -105,23 +105,29 @@ struct ChatView: View {
 
     /// Run a prompt queued by `AskCovenIntent`: send it when the provider is
     /// configured, otherwise leave it in the input bar for the user.
+    /// Consuming clears the published value (changing the task id), so the
+    /// actual work runs in a detached-lifetime `Task` that survives the
+    /// resulting cancellation.
     private func consumeRouterPrompt() async {
         guard let queued = router.consumePrompt() else { return }
         prompt = queued
-        if canSend {
-            prompt = ""
-            await model.send(prompt: queued, settings: settings)
-        }
+        guard canSend else { return }
+        prompt = ""
+        let settings = settings
+        Task { await model.send(prompt: queued, settings: settings) }
     }
 
     /// Resume a stored session picked from a Spotlight result.
     private func consumeRouterSession() async {
         guard let sessionID = router.consumeSessionID() else { return }
-        guard
-            let summary = await model.storedSessions()
-                .first(where: { $0.sessionId == sessionID })
-        else { return }
-        await model.resume(summary, settings: settings)
+        let settings = settings
+        Task {
+            guard
+                let summary = await model.storedSessions()
+                    .first(where: { $0.sessionId == sessionID })
+            else { return }
+            await model.resume(summary, settings: settings)
+        }
     }
 
     private var transcript: some View {

@@ -1,5 +1,6 @@
 import Foundation
 import CoreSpotlight
+import os
 
 /// Mirrors stored chat sessions into the on-device Spotlight index so they
 /// can be found from system search and resumed via deep link.
@@ -33,11 +34,21 @@ enum SessionSpotlight {
     }
 
     /// Replace the domain's entries with the current summaries. Failures are
-    /// ignored: search is an accelerator, never a source of truth.
+    /// ignored: search is an accelerator, never a source of truth. Calls can
+    /// overlap (list load racing a delete), so each carries a generation and
+    /// only the newest one is allowed to write the final index.
+    private static let generation = OSAllocatedUnfairLock(initialState: 0)
+
     static func reindex(_ summaries: [ChatSessionSummary]) {
+        let mine = generation.withLock { state in
+            state += 1
+            return state
+        }
+        let items = searchableItems(for: summaries)
         let index = CSSearchableIndex.default()
         index.deleteSearchableItems(withDomainIdentifiers: [domain]) { _ in
-            index.indexSearchableItems(searchableItems(for: summaries), completionHandler: nil)
+            guard generation.withLock({ $0 }) == mine else { return }
+            index.indexSearchableItems(items, completionHandler: nil)
         }
     }
 }
