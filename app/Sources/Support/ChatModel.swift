@@ -86,11 +86,15 @@ final class ChatModel: ObservableObject {
     }
 
     /// The directory the next session binds to: the active git workspace
-    /// when one is selected and still on disk, else the scratch workspace.
+    /// when one is selected and still a directory on disk, else the scratch
+    /// workspace.
     var effectiveWorkspaceURL: URL {
-        if let path = defaults.string(forKey: Self.activeWorkspacePathKey),
-           FileManager.default.fileExists(atPath: path) {
-            return URL(fileURLWithPath: path, isDirectory: true)
+        if let path = defaults.string(forKey: Self.activeWorkspacePathKey) {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            }
         }
         return Self.workspaceURL
     }

@@ -287,5 +287,13 @@ final class ChatSurfaceTests: XCTestCase {
         // Stale selections fall back to the scratch workspace.
         try FileManager.default.removeItem(at: dir)
         XCTAssertEqual(model.effectiveWorkspaceURL, ChatModel.workspaceURL)
+
+        // A path pointing at a plain file is not a workspace either.
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pocket-file-\(UUID().uuidString)")
+        try Data("x".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        defaults.set(file.path, forKey: ChatModel.activeWorkspacePathKey)
+        XCTAssertEqual(model.effectiveWorkspaceURL, ChatModel.workspaceURL)
     }
 }

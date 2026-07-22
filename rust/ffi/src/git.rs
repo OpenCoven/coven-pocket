@@ -236,8 +236,12 @@ pub(crate) fn list(root: &str) -> Result<Vec<GitWorkspaceSummary>, PocketError> 
         if validate_workspace_name(&name).is_err() {
             continue;
         }
+        // Only working trees count as workspaces; a stray bare repo has no
+        // files for the agent to operate on and cannot be deleted here.
         if let Ok(repo) = Repository::open(entry.path()) {
-            out.push(summarize(&repo, &name));
+            if repo.workdir().is_some() {
+                out.push(summarize(&repo, &name));
+            }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -252,6 +256,19 @@ pub(crate) fn delete(root: &str, name: &str) -> Result<(), PocketError> {
     std::fs::remove_dir_all(&path).map_err(git_err)
 }
 
+/// The checked-out branch name. Remote operations build refspecs from it,
+/// so a detached HEAD is an explicit error rather than a confusing one
+/// downstream.
+fn require_branch(repo: &Repository) -> Result<String, PocketError> {
+    let head = repo.head().map_err(git_err)?;
+    if !head.is_branch() {
+        return Err(git_err(
+            "HEAD is detached; switch to a branch before syncing",
+        ));
+    }
+    head.shorthand().map(str::to_string).map_err(git_err)
+}
+
 /// Fetch origin and fast-forward the current branch. Diverged histories are
 /// an error — merge resolution is out of scope on the phone.
 pub(crate) fn pull(
@@ -260,7 +277,7 @@ pub(crate) fn pull(
     creds: &GitCredentials,
 ) -> Result<GitWorkspaceSummary, PocketError> {
     let repo = open_workspace(root, name)?;
-    let branch_name = current_branch(&repo);
+    let branch_name = require_branch(&repo)?;
 
     let mut remote = repo.find_remote("origin").map_err(git_err)?;
     remote
@@ -351,7 +368,7 @@ pub(crate) fn push(
     creds: &GitCredentials,
 ) -> Result<GitWorkspaceSummary, PocketError> {
     let repo = open_workspace(root, name)?;
-    let branch_name = current_branch(&repo);
+    let branch_name = require_branch(&repo)?;
     let mut remote = repo.find_remote("origin").map_err(git_err)?;
     let mut options = PushOptions::new();
     options.remote_callbacks(remote_callbacks(creds));
@@ -365,7 +382,9 @@ pub(crate) fn push(
         .map_err(git_err)?;
     if branch.upstream().is_err() {
         // First push: track origin/<branch> so ahead/behind and pull work.
-        let _ = branch.set_upstream(Some(&format!("origin/{branch_name}")));
+        branch
+            .set_upstream(Some(&format!("origin/{branch_name}")))
+            .map_err(git_err)?;
     }
     Ok(summarize(&repo, name))
 }
@@ -420,7 +439,9 @@ pub(crate) fn checkout(
             .map_err(|_| git_err(format!("no local or origin branch named {branch:?}")))?;
         let commit = remote.get().peel_to_commit().map_err(git_err)?;
         let mut local = repo.branch(branch, &commit, false).map_err(git_err)?;
-        let _ = local.set_upstream(Some(&format!("origin/{branch}")));
+        local
+            .set_upstream(Some(&format!("origin/{branch}")))
+            .map_err(git_err)?;
     }
 
     let refname = format!("refs/heads/{branch}");
@@ -571,6 +592,41 @@ mod tests {
         assert_eq!(back.branch, "main");
 
         assert!(checkout(&workspaces, "ws", "missing", false).is_err());
+    }
+
+    #[test]
+    fn remote_operations_reject_detached_head() {
+        let root = temp_root("detached");
+        let origin = seeded_origin(&root);
+        let workspaces = format!("{root}/workspaces");
+        let summary = clone(&workspaces, &origin, Some("ws".into()), &no_creds()).unwrap();
+
+        let repo = Repository::open(&summary.path).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head).unwrap();
+
+        for err in [
+            pull(&workspaces, "ws", &no_creds()).unwrap_err(),
+            push(&workspaces, "ws", &no_creds()).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("detached"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn list_skips_bare_repositories() {
+        let root = temp_root("bare");
+        let origin = seeded_origin(&root);
+        let workspaces = format!("{root}/workspaces");
+        clone(&workspaces, &origin, Some("ws".into()), &no_creds()).unwrap();
+        Repository::init_bare(Path::new(&workspaces).join("stray")).unwrap();
+
+        let names: Vec<_> = list(&workspaces)
+            .unwrap()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        assert_eq!(names, vec!["ws".to_string()]);
     }
 
     #[test]
