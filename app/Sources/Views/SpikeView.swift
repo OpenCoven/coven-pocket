@@ -111,10 +111,10 @@ struct SpikeView: View {
         // sign-in to offer here. Claude subscription access is CLI-owned:
         // companion mode (M2) delegates to the computer's signed-in `claude`
         // binary via the engine's ClaudeCliProvider.
-        Text(
-            "On-device requests use this API key. Claude subscription access "
-                + "comes from the `claude` CLI login on your computer via companion mode."
-        )
+        Text("""
+        On-device requests use this API key. Claude subscription access \
+        comes from the `claude` CLI login on your computer via companion mode.
+        """)
             .font(.footnote)
             .foregroundStyle(.secondary)
         Picker("Model", selection: $anthropicModel) {
