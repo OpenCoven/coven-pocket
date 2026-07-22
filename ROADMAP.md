@@ -38,7 +38,7 @@ full-capability remote sessions.
 - [x] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
 - [x] Permission modes + approval sheets (default / accept-edits / plan)
 - [ ] Native diff viewer with per-hunk accept/reject
-- [ ] Session browser: resume, fork, delete
+- [x] Session browser: resume, fork, delete
 
 ## M2 — Companion mode
 
