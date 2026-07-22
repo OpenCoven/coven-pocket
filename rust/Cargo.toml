@@ -13,6 +13,8 @@ repository = "https://github.com/OpenCoven/coven-pocket"
 # Bumping the pin is a deliberate act — see AGENTS.md "Engine pinning".
 claurst-core = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
 claurst-api = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
+claurst-query = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
+claurst-tools = { git = "https://github.com/OpenCoven/coven-code.git", rev = "5c7791e306c79fddfe21354ed97faa851b73be43" }
 
 uniffi = { version = "0.32", features = ["tokio"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "net", "io-util", "time"] }

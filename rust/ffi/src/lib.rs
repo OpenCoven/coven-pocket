@@ -15,8 +15,10 @@ use claurst_core::effort::{model_uses_adaptive_thinking, EffortLevel};
 use claurst_core::types::Message;
 use futures::StreamExt;
 
+mod chat;
 mod codex_auth;
 
+pub use chat::{ChatDelegate, ChatMessage, ChatSession};
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 
 uniffi::setup_scaffolding!();
@@ -192,6 +194,25 @@ impl PocketEngine {
     /// Sign out of Codex, clearing stored tokens.
     pub fn codex_logout(&self) -> Result<(), PocketError> {
         codex_auth::logout()
+    }
+
+    /// Start a multi-turn agentic chat session bound to `workspace_dir`.
+    ///
+    /// The session runs the engine's query loop with the sandbox-safe
+    /// file-tool profile (Read/Grep/Glob/Edit/Write/ApplyPatch/BatchEdit/
+    /// NotebookEdit); process, network, and task tools are excluded at
+    /// registry build time, and every tool call is contained to the
+    /// workspace directory. `workspace_dir` must be an absolute path inside
+    /// the app sandbox; it is created if missing.
+    pub fn start_chat(
+        &self,
+        provider: PocketProvider,
+        api_key: String,
+        model: String,
+        effort: Option<String>,
+        workspace_dir: String,
+    ) -> Result<Arc<ChatSession>, PocketError> {
+        chat::start_session(provider, api_key, model, effort, workspace_dir)
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.
