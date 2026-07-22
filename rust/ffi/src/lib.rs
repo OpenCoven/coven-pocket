@@ -19,6 +19,7 @@ mod chat;
 mod codex_auth;
 mod daemon;
 mod git;
+mod remote;
 mod sessions;
 
 pub use chat::{
@@ -28,6 +29,7 @@ pub use chat::{
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
+pub use remote::{RemoteEvent, RemoteEventBatch, RemoteSession};
 pub use sessions::ChatSessionSummary;
 
 uniffi::setup_scaffolding!();
@@ -47,6 +49,11 @@ impl PocketError {
             message: err.to_string(),
         }
     }
+}
+
+/// Convert an FFI timeout in milliseconds into a [`std::time::Duration`].
+fn millis(timeout_ms: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(timeout_ms))
 }
 
 /// Run blocking work (libgit2, filesystem) on the tokio blocking pool so
@@ -433,6 +440,62 @@ impl PocketEngine {
             std::time::Duration::from_millis(u64::from(timeout_ms)),
         )
         .await
+    }
+
+    /// List sessions on the paired daemon. Callers gate on a verified
+    /// pairing first; this is plain transport.
+    pub async fn remote_sessions(
+        &self,
+        host: String,
+        port: u16,
+        timeout_ms: u32,
+    ) -> Result<Vec<RemoteSession>, PocketError> {
+        remote::sessions(&host, port, millis(timeout_ms)).await
+    }
+
+    /// Read one page of a remote session's events after `after_seq`.
+    pub async fn remote_events(
+        &self,
+        host: String,
+        port: u16,
+        session_id: String,
+        after_seq: i64,
+        limit: u32,
+        timeout_ms: u32,
+    ) -> Result<RemoteEventBatch, PocketError> {
+        remote::events(
+            &host,
+            port,
+            &session_id,
+            after_seq,
+            limit,
+            millis(timeout_ms),
+        )
+        .await
+    }
+
+    /// Forward input (a chat turn or an approval keystroke) to a live
+    /// remote session.
+    pub async fn remote_send_input(
+        &self,
+        host: String,
+        port: u16,
+        session_id: String,
+        data: String,
+        timeout_ms: u32,
+    ) -> Result<(), PocketError> {
+        remote::send_input(&host, port, &session_id, &data, millis(timeout_ms)).await
+    }
+
+    /// Kill a live remote session.
+    pub async fn remote_kill(
+        &self,
+        host: String,
+        port: u16,
+        session_id: String,
+        timeout_ms: u32,
+    ) -> Result<(), PocketError> {
+        remote::kill(&host, port, &session_id, millis(timeout_ms)).await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.
