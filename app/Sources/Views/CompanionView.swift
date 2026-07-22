@@ -107,6 +107,16 @@ struct CompanionView: View {
         }
 
         Section {
+            NavigationLink {
+                RemoteSessionsView(companion: model)
+            } label: {
+                Label("Remote sessions", systemImage: "rectangle.connected.to.line.below")
+            }
+        } footer: {
+            Text("Attach to sessions running on the paired daemon.")
+        }
+
+        Section {
             Button {
                 Task { await model.verifyPairing() }
             } label: {
