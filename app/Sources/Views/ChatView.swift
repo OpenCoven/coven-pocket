@@ -33,6 +33,19 @@ struct ChatView: View {
             .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Picker("Permission mode", selection: $model.permissionMode) {
+                            ForEach(ChatPermissionMode.all, id: \.self) { mode in
+                                Label(mode.label, systemImage: mode.symbolName)
+                                    .tag(mode)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: model.permissionMode.symbolName)
+                    }
+                    .accessibilityLabel("Permission mode")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true
@@ -44,6 +57,10 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showSettings) {
                 ChatSettingsView(settings: $settings, client: client, model: model)
+            }
+            .sheet(item: $model.pendingApproval, onDismiss: model.approvalDismissed) { approval in
+                ApprovalSheet(approval: approval, model: model)
+                    .presentationDetents([.medium, .large])
             }
             .task {
                 if settings.model.isEmpty {
@@ -278,7 +295,8 @@ private struct ChatSettingsView: View {
                 } footer: {
                     Text(
                         "The agent works inside Documents/workspace. "
-                            + "Changing settings starts a new conversation."
+                            + "Changing settings starts a new conversation; "
+                            + "the permission mode (shield menu) applies live."
                     )
                 }
             }

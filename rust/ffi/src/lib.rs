@@ -18,7 +18,10 @@ use futures::StreamExt;
 mod chat;
 mod codex_auth;
 
-pub use chat::{ChatDelegate, ChatMessage, ChatSession};
+pub use chat::{
+    ChatDelegate, ChatMessage, ChatPermissionDecision, ChatPermissionMode, ChatPermissionRequest,
+    ChatPermissionResponder, ChatSession,
+};
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 
 uniffi::setup_scaffolding!();
@@ -203,7 +206,9 @@ impl PocketEngine {
     /// NotebookEdit); process, network, and task tools are excluded at
     /// registry build time, and every tool call is contained to the
     /// workspace directory. `workspace_dir` must be an absolute path inside
-    /// the app sandbox; it is created if missing.
+    /// the app sandbox; it is created if missing. `permission_mode` gates
+    /// write tools (see [`ChatPermissionMode`]) and can be changed later via
+    /// [`ChatSession::set_permission_mode`].
     pub fn start_chat(
         &self,
         provider: PocketProvider,
@@ -211,8 +216,16 @@ impl PocketEngine {
         model: String,
         effort: Option<String>,
         workspace_dir: String,
+        permission_mode: ChatPermissionMode,
     ) -> Result<Arc<ChatSession>, PocketError> {
-        chat::start_session(provider, api_key, model, effort, workspace_dir)
+        chat::start_session(
+            provider,
+            api_key,
+            model,
+            effort,
+            workspace_dir,
+            permission_mode,
+        )
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.
