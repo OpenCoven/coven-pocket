@@ -544,6 +544,7 @@ dependencies = [
  "futures",
  "git2",
  "parking_lot",
+ "regex",
  "reqwest",
  "serde_json",
  "thiserror 2.0.19",
