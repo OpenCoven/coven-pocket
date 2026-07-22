@@ -31,9 +31,11 @@ final class MemoryModel: ObservableObject {
 
     func read(filename: String) async -> String? {
         do {
-            return try await engine.readMemoryNote(
+            let content = try await engine.readMemoryNote(
                 workspaceDir: workspacePath, filename: filename
             )
+            errorText = nil
+            return content
         } catch {
             errorText = error.localizedDescription
             return nil

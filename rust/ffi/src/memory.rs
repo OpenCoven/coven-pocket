@@ -86,7 +86,7 @@ fn scope_label(scope: &MemoryScope) -> &'static str {
 }
 
 pub(crate) fn list_notes(workspace_dir: &str) -> Vec<MemoryNote> {
-    scan_memory_dir(&memdir_path(workspace_dir))
+    let mut notes: Vec<MemoryNote> = scan_memory_dir(&memdir_path(workspace_dir))
         .into_iter()
         .map(|meta| MemoryNote {
             filename: meta.filename,
@@ -98,7 +98,15 @@ pub(crate) fn list_notes(workspace_dir: &str) -> Vec<MemoryNote> {
                 .unwrap_or_default(),
             modified_secs: meta.modified_secs,
         })
-        .collect()
+        .collect();
+    // The scan's order is filesystem-dependent; the API contract is newest
+    // first, with the filename as a stable tie-break.
+    notes.sort_by(|a, b| {
+        b.modified_secs
+            .cmp(&a.modified_secs)
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
+    notes
 }
 
 pub(crate) fn read_note(workspace_dir: &str, filename: &str) -> Result<String, PocketError> {
@@ -145,6 +153,10 @@ pub(crate) fn project_context(workspace_dir: &str) -> ProjectContext {
 
     let memdir = memdir_path(workspace_dir);
     for meta in scan_memory_dir(&memdir) {
+        // Past the budget every push is a no-op; skip the disk reads too.
+        if builder.truncated {
+            break;
+        }
         if let Ok(content) = std::fs::read_to_string(&meta.path) {
             let label = meta
                 .name

@@ -41,7 +41,7 @@ struct MemoryView: View {
 
     private func contextSection(_ context: ProjectContext) -> some View {
         Section {
-            if context.sources.isEmpty {
+            if context.sources.isEmpty && !context.truncated {
                 Text(
                     "No project context yet. AGENTS.md files in the workspace "
                         + "and notes below are injected when the Memory toggle is on."
@@ -53,12 +53,12 @@ struct MemoryView: View {
                     Label(source, systemImage: "doc.text")
                         .font(.footnote)
                 }
-                if context.truncated {
-                    Label("Context exceeds the size budget and was truncated.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.footnote)
-                        .foregroundStyle(.orange)
-                }
+            }
+            if context.truncated {
+                Label("Context exceeds the size budget and was truncated.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
             }
         } header: {
             Text("Injected context")

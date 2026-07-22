@@ -196,9 +196,11 @@ struct SessionConfig {
     model: String,
     effort: Option<String>,
     workspace_dir: PathBuf,
-    /// Inject the workspace AGENTS.md chain + memdir notes into the system
-    /// prompt (the per-workspace "Memory" toggle).
-    inject_context: bool,
+    /// The workspace AGENTS.md chain + memdir notes, composed once at
+    /// session creation (the per-workspace "Memory" toggle). `None` when the
+    /// toggle is off or nothing is configured; turns reuse the snapshot so
+    /// no per-turn filesystem scans happen on the runtime thread.
+    injected_context: Option<String>,
 }
 
 /// A multi-turn agentic conversation bound to a workspace directory.
@@ -398,20 +400,16 @@ impl ChatSession {
 
     /// Build the client, query config, and tool context for one turn.
     /// The Pocket platform note, plus the workspace's project context when
-    /// the memory toggle is on. Injection failures degrade to the bare note
-    /// — a missing AGENTS.md must never block a chat turn.
+    /// the memory toggle is on. The context is a session-creation snapshot;
+    /// an empty or missing AGENTS.md never blocks a chat turn.
     fn append_system_prompt(&self) -> String {
         let mut appended = "You are running inside Coven Pocket on iOS. Only repository file \
              tools are available (no shell, no network tools); every path must \
              stay inside the current workspace."
             .to_string();
-        if self.config.inject_context {
-            let context =
-                crate::memory::project_context(&self.config.workspace_dir.to_string_lossy());
-            if !context.text.is_empty() {
-                appended.push_str("\n\n");
-                appended.push_str(&context.text);
-            }
+        if let Some(context) = &self.config.injected_context {
+            appended.push_str("\n\n");
+            appended.push_str(context);
         }
         appended
     }
@@ -562,8 +560,8 @@ pub(crate) fn start_session(
             api_key,
             model,
             effort,
+            injected_context: snapshot_context(inject_context, &workspace),
             workspace_dir: workspace,
-            inject_context,
         },
         messages: tokio::sync::Mutex::new(Vec::new()),
         cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
@@ -605,8 +603,8 @@ pub(crate) async fn resume_session(
             api_key,
             model,
             effort,
+            injected_context: snapshot_context(inject_context, &workspace),
             workspace_dir: workspace,
-            inject_context,
         },
         messages: tokio::sync::Mutex::new(messages),
         cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
@@ -615,6 +613,16 @@ pub(crate) async fn resume_session(
         session_id,
         persistence: Some(persistence),
     }))
+}
+
+/// Compose the memory snapshot for a new/resumed session. Empty context
+/// (or the toggle being off) means nothing is appended.
+fn snapshot_context(inject_context: bool, workspace: &Path) -> Option<String> {
+    if !inject_context {
+        return None;
+    }
+    let context = crate::memory::project_context(&workspace.to_string_lossy());
+    (!context.text.is_empty()).then_some(context.text)
 }
 
 fn resolve_workspace(workspace_dir: &str) -> Result<PathBuf, PocketError> {
