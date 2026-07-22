@@ -49,6 +49,7 @@ struct GistClient: GistAPI {
         var request = URLRequest(url: URL(string: "https://api.github.com/gists")!)
         request.httpMethod = "POST"
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         apply(token: token, to: &request)
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -103,7 +104,14 @@ final class GistShareModel: ObservableObject {
     @Published private(set) var findings: [RedactionFinding] = []
     @Published private(set) var pastShares: [GistShare] = []
     @Published var token: String {
-        didSet { Keychain.set(token, for: Self.tokenKey) }
+        didSet {
+            let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                Keychain.delete(Self.tokenKey)
+            } else {
+                Keychain.set(trimmed, for: Self.tokenKey)
+            }
+        }
     }
 
     private var title = ""
@@ -146,6 +154,7 @@ final class GistShareModel: ObservableObject {
 
     func upload() async {
         guard phase == .ready else { return }
+        let token = effectiveToken
         guard !token.isEmpty else {
             phase = .failed("Add a GitHub token with the gist scope first.")
             return
@@ -172,6 +181,7 @@ final class GistShareModel: ObservableObject {
     }
 
     func revoke(_ share: GistShare) async {
+        let token = effectiveToken
         guard !token.isEmpty else {
             phase = .failed("Add a GitHub token with the gist scope first.")
             return
@@ -186,6 +196,10 @@ final class GistShareModel: ObservableObject {
         } catch {
             phase = .failed(error.localizedDescription)
         }
+    }
+
+    private var effectiveToken: String {
+        token.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func persistShares() {

@@ -504,7 +504,7 @@ impl PocketEngine {
     /// Runs on the blocking pool: transcripts can be large and the pass is
     /// regex-heavy.
     pub async fn redact_secrets(&self, text: String) -> Result<RedactionResult, PocketError> {
-        run_blocking(move || Ok(share::redact_secrets(&text))).await
+        run_blocking(move || share::redact_secrets(&text).map_err(PocketError::engine)).await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.

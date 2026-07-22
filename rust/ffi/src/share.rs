@@ -74,14 +74,13 @@ const RULES: &[Rule] = &[
     },
 ];
 
-static COMPILED: LazyLock<Vec<(&'static Rule, Regex)>> = LazyLock::new(|| {
+static COMPILED: LazyLock<Result<Vec<(&'static Rule, Regex)>, String>> = LazyLock::new(|| {
     RULES
         .iter()
         .map(|rule| {
-            (
-                rule,
-                Regex::new(rule.pattern).expect("rule pattern compiles"),
-            )
+            Regex::new(rule.pattern)
+                .map(|regex| (rule, regex))
+                .map_err(|err| format!("redaction rule '{}' failed to compile: {err}", rule.label))
         })
         .collect()
 });
@@ -102,21 +101,32 @@ pub struct RedactionResult {
 
 /// Scrub `text` of credential-shaped content. Every finding is replaced
 /// with a visible `[REDACTED…]` marker so readers know something was cut.
-pub fn redact_secrets(text: &str) -> RedactionResult {
+///
+/// Errs only if a redaction rule fails to compile — callers must treat
+/// that as "do not share", never as "share unredacted".
+pub fn redact_secrets(text: &str) -> Result<RedactionResult, String> {
+    let rules = COMPILED.as_ref().map_err(Clone::clone)?;
     let mut redacted = text.to_string();
     let mut findings = Vec::new();
-    for (rule, regex) in COMPILED.iter() {
-        let count = regex.find_iter(&redacted).count();
-        if count == 0 {
-            continue;
+    for (rule, regex) in rules {
+        // Count within the replacement pass: one scan per rule.
+        let mut count: u32 = 0;
+        redacted = regex
+            .replace_all(&redacted, |caps: &regex::Captures<'_>| {
+                count = count.saturating_add(1);
+                let mut expanded = String::new();
+                caps.expand(rule.replacement, &mut expanded);
+                expanded
+            })
+            .into_owned();
+        if count > 0 {
+            findings.push(RedactionFinding {
+                label: rule.label.to_string(),
+                count,
+            });
         }
-        redacted = regex.replace_all(&redacted, rule.replacement).into_owned();
-        findings.push(RedactionFinding {
-            label: rule.label.to_string(),
-            count: u32::try_from(count).unwrap_or(u32::MAX),
-        });
     }
-    RedactionResult { redacted, findings }
+    Ok(RedactionResult { redacted, findings })
 }
 
 #[cfg(test)]
@@ -124,7 +134,7 @@ mod tests {
     use super::*;
 
     fn redact(text: &str) -> String {
-        redact_secrets(text).redacted
+        redact_secrets(text).unwrap().redacted
     }
 
     #[test]
@@ -190,7 +200,7 @@ mod tests {
         let text = "The tokenizer splits text; call parse_token(input) and \
                     check `let token = next_token(lexer);` for details. \
                     Passwords should rotate every 90 days.";
-        let out = redact_secrets(text);
+        let out = redact_secrets(text).unwrap();
         assert_eq!(out.redacted, text);
         assert!(out.findings.is_empty());
     }
@@ -199,7 +209,8 @@ mod tests {
     fn findings_carry_labels_and_counts() {
         let result = redact_secrets(
             "ghp_abcdefghijklmnopqrstuvwxyz012345 and ghp_zyxwvutsrqponmlkjihgfedcba543210",
-        );
+        )
+        .unwrap();
         assert_eq!(
             result.findings,
             vec![RedactionFinding {
@@ -207,5 +218,10 @@ mod tests {
                 count: 2
             }]
         );
+    }
+
+    #[test]
+    fn every_rule_compiles() {
+        assert!(COMPILED.as_ref().is_ok(), "{:?}", COMPILED.as_ref().err());
     }
 }

@@ -34,7 +34,7 @@ enum SessionExport {
             case .status:
                 parts.append("> \(item.text)")
             case .error:
-                parts.append("> ⚠️ \(item.text)")
+                parts.append("> WARNING: \(item.text)")
             }
         }
         return parts.joined(separator: "\n\n") + "\n"

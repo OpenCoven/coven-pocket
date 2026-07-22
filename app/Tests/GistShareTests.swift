@@ -63,7 +63,7 @@ final class GistShareTests: XCTestCase {
         XCTAssertTrue(markdown.contains("## Assistant\n\nDone."))
         XCTAssertTrue(markdown.contains("### Tool: Edit — main.swift"))
         XCTAssertTrue(markdown.contains("```diff\n@@ -1,2 +1,2 @@"))
-        XCTAssertTrue(markdown.contains("> ⚠️ network blip"))
+        XCTAssertTrue(markdown.contains("> WARNING: network blip"))
     }
 
     func testFencingEscalatesPastEmbeddedBackticks() {
