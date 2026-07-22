@@ -68,6 +68,8 @@ full-capability remote sessions.
 ## M4 — Platform polish
 
 - [ ] Live Activities + Dynamic Island; approval notifications
-- [ ] App Intents / Shortcuts / Spotlight
+- [x] App Intents / Shortcuts / Spotlight: "Ask the Agent" (prompt + optional
+      workspace) and "Start New Session" intents with Siri/Shortcuts phrases;
+      stored sessions mirrored into the Spotlight index with tap-to-resume
 - [ ] iPad three-pane layout
 - [ ] TestFlight beta (subject to the licensing gate)

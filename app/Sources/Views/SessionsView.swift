@@ -30,7 +30,10 @@ struct SessionsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .task { sessions = await model.storedSessions() }
+            .task {
+                sessions = await model.storedSessions()
+                SessionSpotlight.reindex(sessions)
+            }
             .confirmationDialog(
                 "Delete this session?",
                 isPresented: Binding(
@@ -44,6 +47,7 @@ struct SessionsView: View {
                     Task {
                         await model.deleteSession(summary)
                         sessions = await model.storedSessions()
+                        SessionSpotlight.reindex(sessions)
                     }
                 }
             } message: { _ in

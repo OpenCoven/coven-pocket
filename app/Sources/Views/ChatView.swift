@@ -6,6 +6,7 @@ import SwiftUI
 struct ChatView: View {
     @StateObject private var model = ChatModel()
     @StateObject private var client = EngineClient()
+    @ObservedObject private var router = AppRouter.shared
 
     @State private var settings = ChatSettings(
         apiKey: Keychain.get("anthropic-api-key") ?? ""
@@ -92,7 +93,35 @@ struct ChatView: View {
                     settings.model = client.defaultModel
                 }
             }
+            .task(id: router.pendingPrompt) { await consumeRouterPrompt() }
+            .task(id: router.pendingSessionID) { await consumeRouterSession() }
+            .task(id: router.pendingReset) {
+                if router.consumeReset() { model.reset() }
+            }
         }
+    }
+
+    // MARK: - Intent / Spotlight handoff
+
+    /// Run a prompt queued by `AskCovenIntent`: send it when the provider is
+    /// configured, otherwise leave it in the input bar for the user.
+    private func consumeRouterPrompt() async {
+        guard let queued = router.consumePrompt() else { return }
+        prompt = queued
+        if canSend {
+            prompt = ""
+            await model.send(prompt: queued, settings: settings)
+        }
+    }
+
+    /// Resume a stored session picked from a Spotlight result.
+    private func consumeRouterSession() async {
+        guard let sessionID = router.consumeSessionID() else { return }
+        guard
+            let summary = await model.storedSessions()
+                .first(where: { $0.sessionId == sessionID })
+        else { return }
+        await model.resume(summary, settings: settings)
     }
 
     private var transcript: some View {
