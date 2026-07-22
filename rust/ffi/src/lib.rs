@@ -17,6 +17,7 @@ use futures::StreamExt;
 
 mod chat;
 mod codex_auth;
+mod daemon;
 mod git;
 mod sessions;
 
@@ -25,6 +26,7 @@ pub use chat::{
     ChatPermissionResponder, ChatSession,
 };
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
+pub use daemon::DaemonProbeState;
 pub use git::{GitCredentials, GitWorkspaceSummary};
 pub use sessions::ChatSessionSummary;
 
@@ -400,6 +402,19 @@ impl PocketEngine {
         create: bool,
     ) -> Result<GitWorkspaceSummary, PocketError> {
         run_blocking(move || git::checkout(&workspaces_dir, &name, &branch, create)).await
+    }
+
+    /// Probe a Coven daemon's `/health` endpoint at `host:port` (reached via
+    /// the user's Tailscale network or SSH tunnel; the daemon's TCP listener
+    /// itself stays loopback on its host). Never throws — every outcome is a
+    /// [`DaemonProbeState`] the UI can render directly.
+    pub async fn probe_daemon(&self, host: String, port: u16, timeout_ms: u32) -> DaemonProbeState {
+        daemon::probe(
+            &host,
+            port,
+            std::time::Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.

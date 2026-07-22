@@ -13,6 +13,10 @@ struct CovenPocketApp: App {
                     .tabItem {
                         Label("Repos", systemImage: "arrow.triangle.branch")
                     }
+                CompanionView()
+                    .tabItem {
+                        Label("Companion", systemImage: "antenna.radiowaves.left.and.right")
+                    }
                 SpikeView()
                     .tabItem {
                         Label("Playground", systemImage: "testtube.2")

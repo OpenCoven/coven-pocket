@@ -42,7 +42,7 @@ full-capability remote sessions.
 
 ## M2 — Companion mode
 
-- [ ] Daemon transport (Tailscale/SSH tunnel MVP; upstream design for an
+- [x] Daemon transport (Tailscale/SSH tunnel MVP; upstream design for an
       authenticated remote listener)
 - [ ] Pairing flow with mandatory `coven.daemon.v1` handshake
 - [ ] Remote session attach: live events, input forwarding, remote approvals
