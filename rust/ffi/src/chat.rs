@@ -196,6 +196,9 @@ struct SessionConfig {
     model: String,
     effort: Option<String>,
     workspace_dir: PathBuf,
+    /// Inject the workspace AGENTS.md chain + memdir notes into the system
+    /// prompt (the per-workspace "Memory" toggle).
+    inject_context: bool,
 }
 
 /// A multi-turn agentic conversation bound to a workspace directory.
@@ -394,6 +397,25 @@ impl ChatSession {
     }
 
     /// Build the client, query config, and tool context for one turn.
+    /// The Pocket platform note, plus the workspace's project context when
+    /// the memory toggle is on. Injection failures degrade to the bare note
+    /// — a missing AGENTS.md must never block a chat turn.
+    fn append_system_prompt(&self) -> String {
+        let mut appended = "You are running inside Coven Pocket on iOS. Only repository file \
+             tools are available (no shell, no network tools); every path must \
+             stay inside the current workspace."
+            .to_string();
+        if self.config.inject_context {
+            let context =
+                crate::memory::project_context(&self.config.workspace_dir.to_string_lossy());
+            if !context.text.is_empty() {
+                appended.push_str("\n\n");
+                appended.push_str(&context.text);
+            }
+        }
+        appended
+    }
+
     fn build_loop_inputs(
         &self,
     ) -> Result<(AnthropicClient, QueryConfig, ToolContext), PocketError> {
@@ -433,12 +455,7 @@ impl ChatSession {
             model: self.config.model.clone(),
             working_directory: Some(workspace.display().to_string()),
             effort_level: self.config.effort.as_deref().and_then(EffortLevel::parse),
-            append_system_prompt: Some(
-                "You are running inside Coven Pocket on iOS. Only repository file \
-                 tools are available (no shell, no network tools); every path must \
-                 stay inside the current workspace."
-                    .to_string(),
-            ),
+            append_system_prompt: Some(self.append_system_prompt()),
             provider_registry: Some(Arc::new(registry)),
             ..QueryConfig::default()
         };
@@ -521,6 +538,7 @@ fn uuid_like_suffix() -> String {
 
 /// Create a new chat session. Exposed as a free function so `PocketEngine`
 /// stays the single app-facing entry point (see `PocketEngine::start_chat`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_session(
     provider: PocketProvider,
     api_key: String,
@@ -529,6 +547,7 @@ pub(crate) fn start_session(
     workspace_dir: String,
     permission_mode: ChatPermissionMode,
     storage_dir: Option<String>,
+    inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = resolve_workspace(&workspace_dir)?;
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -544,6 +563,7 @@ pub(crate) fn start_session(
             model,
             effort,
             workspace_dir: workspace,
+            inject_context,
         },
         messages: tokio::sync::Mutex::new(Vec::new()),
         cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
@@ -567,6 +587,7 @@ pub(crate) async fn resume_session(
     permission_mode: ChatPermissionMode,
     storage_dir: String,
     session_id: String,
+    inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = resolve_workspace(&workspace_dir)?;
     let (messages, last_uuid) =
@@ -585,6 +606,7 @@ pub(crate) async fn resume_session(
             model,
             effort,
             workspace_dir: workspace,
+            inject_context,
         },
         messages: tokio::sync::Mutex::new(messages),
         cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
@@ -1127,6 +1149,7 @@ mod tests {
             "relative/dir".to_string(),
             ChatPermissionMode::Default,
             None,
+            false,
         );
         assert!(err.is_err());
     }
@@ -1195,6 +1218,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            false,
         )
         .unwrap();
 
@@ -1210,6 +1234,56 @@ mod tests {
         );
         assert!(!session.is_busy());
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -- memory injection ---------------------------------------------------
+
+    /// The workspace AGENTS.md must reach the model iff the toggle is on.
+    #[test]
+    fn inject_context_gates_agents_md_in_system_prompt() {
+        let guard = crate::memory::tests::setup("chat-inject");
+        let workspace = guard.workspace.clone();
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "Pocket rule: always answer in haiku.",
+        )
+        .unwrap();
+
+        let with_context = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(
+            with_context
+                .append_system_prompt()
+                .contains("always answer in haiku"),
+            "inject_context=true must append workspace AGENTS.md"
+        );
+
+        let without_context = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !without_context
+                .append_system_prompt()
+                .contains("always answer in haiku"),
+            "inject_context=false must leave the system prompt untouched"
+        );
     }
 
     // -- permission gate ----------------------------------------------------
@@ -1270,6 +1344,7 @@ mod tests {
             std::env::temp_dir().display().to_string(),
             ChatPermissionMode::Default,
             None,
+            false,
         )
         .unwrap();
         let (_client, _config, ctx) = session.build_loop_inputs().unwrap();
@@ -1427,6 +1502,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             Some(storage.display().to_string()),
+            false,
         )
         .unwrap();
         let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
@@ -1475,6 +1551,7 @@ mod tests {
             ChatPermissionMode::Default,
             storage_str.clone(),
             original.session_id(),
+            false,
         )
         .await
         .unwrap();
@@ -1515,6 +1592,7 @@ mod tests {
             ChatPermissionMode::Default,
             storage.display().to_string(),
             uuid::Uuid::new_v4().to_string(),
+            false,
         )
         .await;
         assert!(err.is_err());
@@ -1556,6 +1634,7 @@ mod tests {
             ChatPermissionMode::Default,
             storage_str.clone(),
             fork_id,
+            false,
         )
         .await
         .unwrap();
@@ -1585,6 +1664,7 @@ mod tests {
             ChatPermissionMode::Default,
             storage_str,
             session.session_id(),
+            false,
         )
         .await;
         assert!(err.is_err());
@@ -1606,6 +1686,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            false,
         )
         .unwrap();
         assert!(uuid::Uuid::parse_str(&session.session_id()).is_ok());

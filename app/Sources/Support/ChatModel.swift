@@ -64,6 +64,22 @@ final class ChatModel: ObservableObject {
     /// the Repos tab. Missing or stale paths fall back to the scratch dir.
     static let activeWorkspacePathKey = "active-workspace-path"
 
+    /// Project memory is a per-workspace choice: rules written for one repo
+    /// shouldn't leak into another.
+    static func injectContextKey(forWorkspace path: String) -> String {
+        "inject-context:\(path)"
+    }
+
+    /// Whether new sessions prepend the workspace's AGENTS.md chain and
+    /// memory notes to the system prompt. Applies from the next session.
+    var injectContext: Bool {
+        get { defaults.bool(forKey: Self.injectContextKey(forWorkspace: effectiveWorkspaceURL.path)) }
+        set {
+            objectWillChange.send()
+            defaults.set(newValue, forKey: Self.injectContextKey(forWorkspace: effectiveWorkspaceURL.path))
+        }
+    }
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         permissionMode = ChatPermissionMode(
@@ -160,7 +176,8 @@ final class ChatModel: ObservableObject {
             effort: settings.effort,
             workspaceDir: workspace.path,
             permissionMode: permissionMode,
-            storageDir: Self.sessionStoreURL.path
+            storageDir: Self.sessionStoreURL.path,
+            injectContext: injectContext
         )
         session = fresh
         sessionSettings = settings
@@ -192,7 +209,8 @@ final class ChatModel: ObservableObject {
                 workspaceDir: workspace.path,
                 permissionMode: permissionMode,
                 storageDir: Self.sessionStoreURL.path,
-                sessionId: summary.sessionId
+                sessionId: summary.sessionId,
+                injectContext: injectContext
             )
             reset()
             session = resumed
@@ -337,55 +355,5 @@ final class ChatModel: ObservableObject {
             return trimmed.isEmpty ? "workspace" : String(trimmed)
         }
         return path
-    }
-}
-
-/// Chat callbacks arrive on Rust worker threads; hop to the main actor.
-/// The only mutable state is the ARC-managed weak reference, which is
-/// thread-safe to read, so `@unchecked Sendable` holds.
-private final class ChatBridge: ChatDelegate, @unchecked Sendable {
-    weak var model: ChatModel?
-
-    init(model: ChatModel) {
-        self.model = model
-    }
-
-    func onText(text: String) {
-        Task { @MainActor [model] in model?.appendAssistantText(text) }
-    }
-
-    func onThinking(text: String) {
-        Task { @MainActor [model] in model?.appendThinking(text) }
-    }
-
-    func onToolStart(toolId: String, toolName: String, inputJson: String) {
-        Task { @MainActor [model] in
-            model?.beginTool(id: toolId, name: toolName, inputJson: inputJson)
-        }
-    }
-
-    func onToolEnd(toolId: String, toolName: String, result: String, isError: Bool) {
-        Task { @MainActor [model] in
-            model?.endTool(id: toolId, result: result, isError: isError)
-        }
-    }
-
-    func onStatus(message: String) {
-        Task { @MainActor [model] in model?.appendStatus(message) }
-    }
-
-    func onPermissionRequest(request: ChatPermissionRequest, responder: ChatPermissionResponder) {
-        Task { @MainActor [model] in
-            // If the model is gone the approval drops here, which denies.
-            model?.receiveApproval(PendingApproval(request: request, responder: responder))
-        }
-    }
-
-    func onDone(stopReason: String) {
-        Task { @MainActor [model] in model?.finishTurn(stopReason: stopReason) }
-    }
-
-    func onError(message: String) {
-        Task { @MainActor [model] in model?.appendError(message) }
     }
 }
