@@ -1,17 +1,13 @@
 import Foundation
 
 /// One row of a side-by-side diff: an optional old-side line paired with an
-/// optional new-side line.
+/// optional new-side line. Identity is the row's position within its hunk,
+/// which is stable across re-renders (`rows(for:)` is a pure function of the
+/// hunk).
 struct SideBySideRow: Identifiable, Equatable {
-    let id: UUID
+    let id: Int
     let old: DiffLine?
     let new: DiffLine?
-
-    init(id: UUID = UUID(), old: DiffLine?, new: DiffLine?) {
-        self.id = id
-        self.old = old
-        self.new = new
-    }
 }
 
 enum SideBySidePairing {
@@ -26,13 +22,17 @@ enum SideBySidePairing {
         var removals: [DiffLine] = []
         var additions: [DiffLine] = []
 
+        func append(old: DiffLine?, new: DiffLine?) {
+            rows.append(SideBySideRow(id: rows.count, old: old, new: new))
+        }
+
         func flushRun() {
             let count = max(removals.count, additions.count)
             for index in 0 ..< count {
-                rows.append(SideBySideRow(
+                append(
                     old: index < removals.count ? removals[index] : nil,
                     new: index < additions.count ? additions[index] : nil
-                ))
+                )
             }
             removals.removeAll()
             additions.removeAll()
@@ -46,7 +46,7 @@ enum SideBySidePairing {
                 additions.append(line)
             case .context:
                 flushRun()
-                rows.append(SideBySideRow(old: line, new: line))
+                append(old: line, new: line)
             case .noNewline:
                 // Attach to whichever side received the previous line.
                 if !additions.isEmpty {
@@ -55,7 +55,7 @@ enum SideBySidePairing {
                     removals.append(line)
                 } else {
                     flushRun()
-                    rows.append(SideBySideRow(old: line, new: line))
+                    append(old: line, new: line)
                 }
             }
         }

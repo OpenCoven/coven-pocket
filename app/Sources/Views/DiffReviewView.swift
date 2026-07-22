@@ -83,15 +83,17 @@ struct DiffReviewView: View {
     }
 
     private func applyBar(_ apply: @escaping (String) -> Void) -> some View {
-        HStack {
+        // Rebuilding the patch walks every hunk; do it once per render.
+        let patch = model.acceptedPatch
+        return HStack {
             Button {
-                if let patch = model.acceptedPatch { apply(patch) }
+                if let patch { apply(patch) }
             } label: {
                 Text("Apply Accepted Changes")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.acceptedPatch == nil)
+            .disabled(patch == nil)
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
