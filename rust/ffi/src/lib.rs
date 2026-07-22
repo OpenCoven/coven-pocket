@@ -17,6 +17,7 @@ use futures::StreamExt;
 
 mod chat;
 mod codex_auth;
+mod git;
 mod sessions;
 
 pub use chat::{
@@ -24,6 +25,7 @@ pub use chat::{
     ChatPermissionResponder, ChatSession,
 };
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
+pub use git::{GitCredentials, GitWorkspaceSummary};
 pub use sessions::ChatSessionSummary;
 
 uniffi::setup_scaffolding!();
@@ -43,6 +45,16 @@ impl PocketError {
             message: err.to_string(),
         }
     }
+}
+
+/// Run blocking work (libgit2, filesystem) on the tokio blocking pool so
+/// async FFI methods never stall an executor thread.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, PocketError> + Send + 'static,
+) -> Result<T, PocketError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(PocketError::engine)?
 }
 
 /// A model available to the active provider.
@@ -290,6 +302,104 @@ impl PocketEngine {
         session_id: String,
     ) -> Result<String, PocketError> {
         sessions::fork_session(&storage_dir, &session_id).await
+    }
+
+    // MARK: git workspaces
+    //
+    // libgit2 calls are blocking (disk and network), so every method here
+    // hops to the tokio blocking pool. `workspaces_dir` is an app-sandbox
+    // directory holding one folder per cloned repository; summaries carry
+    // the absolute workspace path to hand to `start_chat`.
+
+    /// Clone a repository. `name` defaults to the repo name in the URL.
+    pub async fn git_clone(
+        &self,
+        workspaces_dir: String,
+        url: String,
+        name: Option<String>,
+        credentials: GitCredentials,
+    ) -> Result<GitWorkspaceSummary, PocketError> {
+        run_blocking(move || git::clone(&workspaces_dir, &url, name, &credentials)).await
+    }
+
+    /// All cloned workspaces, sorted by name.
+    pub async fn git_list_workspaces(
+        &self,
+        workspaces_dir: String,
+    ) -> Result<Vec<GitWorkspaceSummary>, PocketError> {
+        run_blocking(move || git::list(&workspaces_dir)).await
+    }
+
+    /// Remove a workspace and everything in it.
+    pub async fn git_delete_workspace(
+        &self,
+        workspaces_dir: String,
+        name: String,
+    ) -> Result<(), PocketError> {
+        run_blocking(move || git::delete(&workspaces_dir, &name)).await
+    }
+
+    /// Fetch origin and fast-forward the current branch. Errors when the
+    /// histories have diverged instead of attempting a merge.
+    pub async fn git_pull(
+        &self,
+        workspaces_dir: String,
+        name: String,
+        credentials: GitCredentials,
+    ) -> Result<GitWorkspaceSummary, PocketError> {
+        run_blocking(move || git::pull(&workspaces_dir, &name, &credentials)).await
+    }
+
+    /// Stage all changes and commit them, returning the short commit id.
+    pub async fn git_commit_all(
+        &self,
+        workspaces_dir: String,
+        name: String,
+        message: String,
+        author_name: String,
+        author_email: String,
+    ) -> Result<String, PocketError> {
+        run_blocking(move || {
+            git::commit_all(
+                &workspaces_dir,
+                &name,
+                &message,
+                &author_name,
+                &author_email,
+            )
+        })
+        .await
+    }
+
+    /// Push the current branch to origin (sets upstream on first push).
+    pub async fn git_push(
+        &self,
+        workspaces_dir: String,
+        name: String,
+        credentials: GitCredentials,
+    ) -> Result<GitWorkspaceSummary, PocketError> {
+        run_blocking(move || git::push(&workspaces_dir, &name, &credentials)).await
+    }
+
+    /// Local branch names, current branch first.
+    pub async fn git_branches(
+        &self,
+        workspaces_dir: String,
+        name: String,
+    ) -> Result<Vec<String>, PocketError> {
+        run_blocking(move || git::branches(&workspaces_dir, &name)).await
+    }
+
+    /// Switch branches (optionally creating one off HEAD). Existing remote
+    /// branches get a local tracking branch. Dirty worktrees are refused.
+    pub async fn git_checkout(
+        &self,
+        workspaces_dir: String,
+        name: String,
+        branch: String,
+        create: bool,
+    ) -> Result<GitWorkspaceSummary, PocketError> {
+        run_blocking(move || git::checkout(&workspaces_dir, &name, &branch, create)).await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.

@@ -33,6 +33,8 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         SWIFT_STRICT_CONCURRENCY: minimal
+        # libgit2 (vendored in the Rust core) expects system zlib and iconv.
+        OTHER_LDFLAGS: "$(inherited) -lz -liconv"
     preBuildScripts:
       - name: Guard generated bindings
         script: |

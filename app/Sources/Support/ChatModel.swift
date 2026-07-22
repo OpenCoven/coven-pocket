@@ -55,10 +55,14 @@ final class ChatModel: ObservableObject {
 
     private var session: ChatSession?
     private var sessionSettings: ChatSettings?
+    private var sessionWorkspace: String?
     private var approvalQueue: [PendingApproval] = []
     private let defaults: UserDefaults
 
     static let permissionModeKey = "chat-permission-mode"
+    /// Absolute path of the git workspace chat should operate in, written by
+    /// the Repos tab. Missing or stale paths fall back to the scratch dir.
+    static let activeWorkspacePathKey = "active-workspace-path"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -79,6 +83,20 @@ final class ChatModel: ObservableObject {
     static var sessionStoreURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("chat-sessions", isDirectory: true)
+    }
+
+    /// The directory the next session binds to: the active git workspace
+    /// when one is selected and still a directory on disk, else the scratch
+    /// workspace.
+    var effectiveWorkspaceURL: URL {
+        if let path = defaults.string(forKey: Self.activeWorkspacePathKey) {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            }
+        }
+        return Self.workspaceURL
     }
 
     func send(prompt: String, settings: ChatSettings) async {
@@ -126,13 +144,13 @@ final class ChatModel: ObservableObject {
         approvalQueue = []
     }
 
-    /// Reuse the live session when settings are unchanged; otherwise start a
-    /// fresh one bound to the app workspace directory.
+    /// Reuse the live session when settings and workspace are unchanged;
+    /// otherwise start a fresh one bound to the effective workspace.
     private func activeSession(for settings: ChatSettings) throws -> ChatSession {
-        if let session, sessionSettings == settings {
+        let workspace = effectiveWorkspaceURL
+        if let session, sessionSettings == settings, sessionWorkspace == workspace.path {
             return session
         }
-        let workspace = Self.workspaceURL
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         items = []
         let fresh = try engine.startChat(
@@ -146,6 +164,7 @@ final class ChatModel: ObservableObject {
         )
         session = fresh
         sessionSettings = settings
+        sessionWorkspace = workspace.path
         return fresh
     }
 
@@ -161,7 +180,7 @@ final class ChatModel: ObservableObject {
     func resume(_ summary: ChatSessionSummary, settings: ChatSettings) async {
         guard !isBusy else { return }
         do {
-            let workspace = Self.workspaceURL
+            let workspace = effectiveWorkspaceURL
             try FileManager.default.createDirectory(
                 at: workspace, withIntermediateDirectories: true
             )
@@ -178,6 +197,7 @@ final class ChatModel: ObservableObject {
             reset()
             session = resumed
             sessionSettings = settings
+            sessionWorkspace = workspace.path
             items = Self.items(fromTranscript: await resumed.transcript())
         } catch {
             appendError(error.localizedDescription)
@@ -309,10 +329,10 @@ final class ChatModel: ObservableObject {
         return ""
     }
 
-    /// Trim the sandbox prefix so cards show workspace-relative paths.
+    /// Trim sandbox prefixes so cards show workspace-relative paths.
     private static func shortenWorkspacePath(_ path: String) -> String {
-        let prefix = workspaceURL.path
-        if path.hasPrefix(prefix) {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        for prefix in [workspaceURL.path, documents.path] where path.hasPrefix(prefix) {
             let trimmed = path.dropFirst(prefix.count).drop(while: { $0 == "/" })
             return trimmed.isEmpty ? "workspace" : String(trimmed)
         }

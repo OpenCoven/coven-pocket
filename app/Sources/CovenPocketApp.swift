@@ -9,6 +9,10 @@ struct CovenPocketApp: App {
                     .tabItem {
                         Label("Chat", systemImage: "bubble.left.and.bubble.right")
                     }
+                ReposView()
+                    .tabItem {
+                        Label("Repos", systemImage: "arrow.triangle.branch")
+                    }
                 SpikeView()
                     .tabItem {
                         Label("Playground", systemImage: "testtube.2")
