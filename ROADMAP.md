@@ -71,5 +71,7 @@ full-capability remote sessions.
 - [x] App Intents / Shortcuts / Spotlight: "Ask the Agent" (prompt + optional
       workspace) and "Start New Session" intents with Siri/Shortcuts phrases;
       stored sessions mirrored into the Spotlight index with tap-to-resume
-- [ ] iPad three-pane layout
+- [x] iPad three-pane layout: regular-width split of sections + sessions | chat |
+      context (workspace status, injected sources, memory notes); Cmd+N /
+      Cmd+1…5 / Cmd+Return keyboard shortcuts; phone keeps the tab bar
 - [ ] TestFlight beta (subject to the licensing gate)
