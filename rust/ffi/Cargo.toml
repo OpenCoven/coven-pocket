@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 # so cargo unifies on one copy.
 reqwest = { version = "0.13", features = ["json", "form"], default-features = false }
 urlencoding = "2"
+git2 = "0.21.0"
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros"] }

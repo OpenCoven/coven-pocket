@@ -34,7 +34,7 @@ full-capability remote sessions.
       `client_id`), and the Codex Responses adapter does not yet encode a
       reasoning-effort control, so effort maps to Anthropic extended
       thinking only.
-- [ ] On-device git workspaces (libgit2; HTTPS PAT + SSH keys)
+- [x] On-device git workspaces (libgit2; HTTPS PAT + SSH keys)
 - [x] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
 - [x] Permission modes + approval sheets (default / accept-edits / plan)
 - [ ] Native diff viewer with per-hunk accept/reject

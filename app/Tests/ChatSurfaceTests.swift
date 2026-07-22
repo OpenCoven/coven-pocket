@@ -222,4 +222,70 @@ final class ChatSurfaceTests: XCTestCase {
         let summary = makeSummary()
         XCTAssertEqual(summary.id, summary.sessionId)
     }
+
+    // MARK: - Git workspaces
+
+    private func makeRepoSummary(
+        name: String = "widget",
+        dirty: UInt32 = 0,
+        ahead: UInt32 = 0,
+        behind: UInt32 = 0
+    ) -> GitWorkspaceSummary {
+        GitWorkspaceSummary(
+            name: name,
+            path: "/tmp/repos/\(name)",
+            branch: "main",
+            remoteUrl: nil,
+            dirtyCount: dirty,
+            ahead: ahead,
+            behind: behind
+        )
+    }
+
+    func testWorkspaceStatusLine() {
+        XCTAssertEqual(makeRepoSummary().statusLine, "main")
+        XCTAssertEqual(
+            makeRepoSummary(dirty: 2, ahead: 1, behind: 3).statusLine,
+            "main · 2 changed · ↑1 · ↓3"
+        )
+        XCTAssertEqual(makeRepoSummary().id, "widget")
+    }
+
+    @MainActor
+    func testActiveRepoSelectionPersistsForChat() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "repo-tests-\(UUID().uuidString)"))
+        let repos = RepoModel(defaults: defaults)
+        let workspace = makeRepoSummary()
+
+        repos.setActive(workspace)
+        XCTAssertEqual(repos.activeRepoName, "widget")
+        XCTAssertEqual(
+            defaults.string(forKey: ChatModel.activeWorkspacePathKey),
+            workspace.path
+        )
+
+        repos.setActive(nil)
+        XCTAssertNil(repos.activeRepoName)
+        XCTAssertNil(defaults.string(forKey: ChatModel.activeWorkspacePathKey))
+    }
+
+    @MainActor
+    func testEffectiveWorkspaceFollowsActiveRepoPath() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "chat-ws-\(UUID().uuidString)"))
+        let model = ChatModel(defaults: defaults)
+
+        // No selection: scratch workspace.
+        XCTAssertEqual(model.effectiveWorkspaceURL, ChatModel.workspaceURL)
+
+        // A selection pointing at a real directory wins.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pocket-ws-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defaults.set(dir.path, forKey: ChatModel.activeWorkspacePathKey)
+        XCTAssertEqual(model.effectiveWorkspaceURL.path, dir.path)
+
+        // Stale selections fall back to the scratch workspace.
+        try FileManager.default.removeItem(at: dir)
+        XCTAssertEqual(model.effectiveWorkspaceURL, ChatModel.workspaceURL)
+    }
 }
