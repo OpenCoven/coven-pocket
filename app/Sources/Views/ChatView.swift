@@ -199,6 +199,8 @@ struct ChatView: View {
                 }
                 .disabled(!canSend)
                 .accessibilityLabel("Send")
+                // Hardware keyboards (iPad) send with Cmd+Return.
+                .keyboardShortcut(.return, modifiers: .command)
             }
         }
         .padding(.horizontal)

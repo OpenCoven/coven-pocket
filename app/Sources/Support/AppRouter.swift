@@ -8,8 +8,35 @@ import Foundation
 final class AppRouter: ObservableObject {
     static let shared = AppRouter()
 
-    enum Tab: String, Hashable {
+    enum Tab: String, Hashable, CaseIterable {
         case chat, repos, companion, diff, playground
+
+        var label: String {
+            switch self {
+            case .chat: return "Chat"
+            case .repos: return "Repos"
+            case .companion: return "Companion"
+            case .diff: return "Diff"
+            case .playground: return "Playground"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .chat: return "bubble.left.and.bubble.right"
+            case .repos: return "arrow.triangle.branch"
+            case .companion: return "antenna.radiowaves.left.and.right"
+            case .diff: return "plus.forwardslash.minus"
+            case .playground: return "testtube.2"
+            }
+        }
+
+        /// Cmd+1…Cmd+5 section switching; nil for out-of-range digits.
+        static func forShortcut(_ digit: Int) -> Tab? {
+            let all = Tab.allCases
+            guard digit >= 1, digit <= all.count else { return nil }
+            return all[digit - 1]
+        }
     }
 
     @Published var selectedTab: Tab = .chat
