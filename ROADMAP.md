@@ -37,7 +37,11 @@ full-capability remote sessions.
 - [x] On-device git workspaces (libgit2; HTTPS PAT + SSH keys)
 - [x] Chat surface wired to the agentic query loop (tool-call cards, stop/retry)
 - [x] Permission modes + approval sheets (default / accept-edits / plan)
-- [ ] Native diff viewer with per-hunk accept/reject
+- [x] Native diff viewer with per-hunk accept/reject: tolerant unified-diff
+      parser (rename/binary/mode metadata, no-newline markers), inline and
+      side-by-side layouts, and patch rebuilding that rebases accepted hunks
+      into a valid patch. Syntax highlighting and wiring into the agent's
+      apply-patch flow land with the chat surface.
 - [x] Session browser: resume, fork, delete
 
 ## M2 — Companion mode
