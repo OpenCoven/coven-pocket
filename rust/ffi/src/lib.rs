@@ -19,6 +19,7 @@ mod chat;
 mod codex_auth;
 mod daemon;
 mod git;
+mod memory;
 mod remote;
 mod sessions;
 mod share;
@@ -30,6 +31,7 @@ pub use chat::{
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
+pub use memory::{MemoryNote, ProjectContext};
 pub use remote::{RemoteEvent, RemoteEventBatch, RemoteSession};
 pub use sessions::ChatSessionSummary;
 pub use share::{RedactionFinding, RedactionResult};
@@ -248,6 +250,7 @@ impl PocketEngine {
         workspace_dir: String,
         permission_mode: ChatPermissionMode,
         storage_dir: Option<String>,
+        inject_context: bool,
     ) -> Result<Arc<ChatSession>, PocketError> {
         chat::start_session(
             provider,
@@ -257,6 +260,7 @@ impl PocketEngine {
             workspace_dir,
             permission_mode,
             storage_dir,
+            inject_context,
         )
     }
 
@@ -274,6 +278,7 @@ impl PocketEngine {
         permission_mode: ChatPermissionMode,
         storage_dir: String,
         session_id: String,
+        inject_context: bool,
     ) -> Result<Arc<ChatSession>, PocketError> {
         chat::resume_session(
             provider,
@@ -284,6 +289,7 @@ impl PocketEngine {
             permission_mode,
             storage_dir,
             session_id,
+            inject_context,
         )
         .await
     }
@@ -505,6 +511,53 @@ impl PocketEngine {
     /// regex-heavy.
     pub async fn redact_secrets(&self, text: String) -> Result<RedactionResult, PocketError> {
         run_blocking(move || share::redact_secrets(&text).map_err(PocketError::engine)).await
+    }
+
+    /// Notes in the workspace's memory directory, newest first.
+    pub async fn list_memory_notes(
+        &self,
+        workspace_dir: String,
+    ) -> Result<Vec<MemoryNote>, PocketError> {
+        run_blocking(move || Ok(memory::list_notes(&workspace_dir))).await
+    }
+
+    /// Full contents of one memory note.
+    pub async fn read_memory_note(
+        &self,
+        workspace_dir: String,
+        filename: String,
+    ) -> Result<String, PocketError> {
+        run_blocking(move || memory::read_note(&workspace_dir, &filename)).await
+    }
+
+    /// Create or overwrite a memory note. Filenames must be plain `*.md`
+    /// names — the memdir lives outside the workspace sandbox and this is
+    /// its only writer.
+    pub async fn write_memory_note(
+        &self,
+        workspace_dir: String,
+        filename: String,
+        content: String,
+    ) -> Result<(), PocketError> {
+        run_blocking(move || memory::write_note(&workspace_dir, &filename, &content)).await
+    }
+
+    /// Delete a memory note.
+    pub async fn delete_memory_note(
+        &self,
+        workspace_dir: String,
+        filename: String,
+    ) -> Result<(), PocketError> {
+        run_blocking(move || memory::delete_note(&workspace_dir, &filename)).await
+    }
+
+    /// The composed AGENTS.md + memdir context a session would inject for
+    /// this workspace (the memory toggle's preview).
+    pub async fn project_context(
+        &self,
+        workspace_dir: String,
+    ) -> Result<ProjectContext, PocketError> {
+        run_blocking(move || Ok(memory::project_context(&workspace_dir))).await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.

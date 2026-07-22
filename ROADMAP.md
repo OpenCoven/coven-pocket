@@ -55,7 +55,7 @@ full-capability remote sessions.
 
 ## M3 — Extended scope
 
-- [ ] Memory: AGENTS.md injection, memdir browser
+- [x] Memory: AGENTS.md injection, memdir browser
 - [ ] Familiar companion (7 archetypes)
 - [ ] On-device `/goal` with Live Activity progress
 - [ ] Remote MCP servers (streamable HTTP/SSE + OAuth)

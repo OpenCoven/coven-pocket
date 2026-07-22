@@ -21,7 +21,8 @@ final class ChatSurfaceTests: XCTestCase {
             effort: "medium",
             workspaceDir: workspace.path,
             permissionMode: .default,
-            storageDir: nil
+            storageDir: nil,
+            injectContext: false
         )
         XCTAssertFalse(session.isBusy())
     }
@@ -38,7 +39,8 @@ final class ChatSurfaceTests: XCTestCase {
             effort: nil,
             workspaceDir: workspace.path,
             permissionMode: .default,
-            storageDir: nil
+            storageDir: nil,
+            injectContext: false
         )
         let transcript = await session.transcript()
         XCTAssertTrue(transcript.isEmpty)
@@ -54,7 +56,8 @@ final class ChatSurfaceTests: XCTestCase {
                 effort: nil,
                 workspaceDir: "relative/workspace",
                 permissionMode: .default,
-                storageDir: nil
+                storageDir: nil,
+                injectContext: false
             )
         )
     }
