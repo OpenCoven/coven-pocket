@@ -60,7 +60,12 @@ pub(crate) async fn probe(host: &str, port: u16, timeout: Duration) -> DaemonPro
         Err(_) => return DaemonProbeState::TimedOut,
     };
 
-    match tokio::time::timeout(timeout, health_exchange(stream)).await {
+    // One overall budget: the exchange only gets what the connect left over.
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return DaemonProbeState::TimedOut;
+    }
+    match tokio::time::timeout(remaining, health_exchange(stream)).await {
         Ok(Ok(body)) => match parse_health(&body) {
             Some((pid, started_at)) => DaemonProbeState::Reachable {
                 pid,
@@ -78,13 +83,19 @@ pub(crate) async fn probe(host: &str, port: u16, timeout: Duration) -> DaemonPro
     }
 }
 
+/// Cap on the buffered health response. A real one is a few hundred bytes;
+/// the address is user-supplied, so an arbitrary service must not be able
+/// to balloon memory.
+const MAX_HEALTH_RESPONSE_BYTES: u64 = 64 * 1024;
+
 /// Send the same health request the CLI uses and return the raw response.
 async fn health_exchange(mut stream: TcpStream) -> std::io::Result<String> {
     stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\nConnection: close\r\n\r\n")
         .await?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    let mut limited = stream.take(MAX_HEALTH_RESPONSE_BYTES);
+    limited.read_to_end(&mut response).await?;
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
@@ -93,6 +104,9 @@ async fn health_exchange(mut stream: TcpStream) -> std::io::Result<String> {
 fn parse_health(response: &str) -> Option<(u32, String)> {
     let start = response.find('{')?;
     let end = response.rfind('}')?;
+    if end < start {
+        return None;
+    }
     let body: serde_json::Value = serde_json::from_str(&response[start..=end]).ok()?;
     if !body.get("ok")?.as_bool()? {
         return None;
@@ -197,6 +211,34 @@ mod tests {
         assert!(matches!(
             probe("definitely-not-a-real-host.invalid", 7777, TIMEOUT).await,
             DaemonProbeState::Unresolvable
+        ));
+    }
+
+    #[test]
+    fn parse_health_survives_hostile_framing() {
+        // Closing brace before the first opening brace must not slice-panic.
+        assert!(parse_health("}{").is_none());
+        assert!(parse_health("HTTP/1.1 200 OK\r\n\r\n} banner {").is_none());
+        assert!(parse_health("no braces at all").is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_capped_not_buffered() {
+        // 1 MiB of garbage: the probe must stop at the cap and classify the
+        // service as not-a-daemon rather than buffering everything.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let chunk = vec![b'x'; 1024 * 1024];
+                let _ = stream.write_all(&chunk).await;
+            }
+        });
+        assert!(matches!(
+            probe("127.0.0.1", port, TIMEOUT).await,
+            DaemonProbeState::NotADaemon { .. }
         ));
     }
 }
