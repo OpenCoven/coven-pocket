@@ -17,12 +17,14 @@ use futures::StreamExt;
 
 mod chat;
 mod codex_auth;
+mod sessions;
 
 pub use chat::{
     ChatDelegate, ChatMessage, ChatPermissionDecision, ChatPermissionMode, ChatPermissionRequest,
     ChatPermissionResponder, ChatSession,
 };
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
+pub use sessions::ChatSessionSummary;
 
 uniffi::setup_scaffolding!();
 
@@ -209,6 +211,11 @@ impl PocketEngine {
     /// the app sandbox; it is created if missing. `permission_mode` gates
     /// write tools (see [`ChatPermissionMode`]) and can be changed later via
     /// [`ChatSession::set_permission_mode`].
+    ///
+    /// With a `storage_dir` (absolute, created if missing) the conversation
+    /// persists on device and shows up in [`Self::list_chat_sessions`];
+    /// `None` keeps the session in memory only.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_chat(
         &self,
         provider: PocketProvider,
@@ -217,6 +224,7 @@ impl PocketEngine {
         effort: Option<String>,
         workspace_dir: String,
         permission_mode: ChatPermissionMode,
+        storage_dir: Option<String>,
     ) -> Result<Arc<ChatSession>, PocketError> {
         chat::start_session(
             provider,
@@ -225,7 +233,62 @@ impl PocketEngine {
             effort,
             workspace_dir,
             permission_mode,
+            storage_dir,
         )
+    }
+
+    /// Resume a stored session at its head: the full transcript is restored
+    /// and new turns append to the same record. Provider settings are the
+    /// caller's current ones, not necessarily those the session started with.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume_chat(
+        &self,
+        provider: PocketProvider,
+        api_key: String,
+        model: String,
+        effort: Option<String>,
+        workspace_dir: String,
+        permission_mode: ChatPermissionMode,
+        storage_dir: String,
+        session_id: String,
+    ) -> Result<Arc<ChatSession>, PocketError> {
+        chat::resume_session(
+            provider,
+            api_key,
+            model,
+            effort,
+            workspace_dir,
+            permission_mode,
+            storage_dir,
+            session_id,
+        )
+        .await
+    }
+
+    /// Stored sessions, newest first.
+    pub fn list_chat_sessions(
+        &self,
+        storage_dir: String,
+    ) -> Result<Vec<ChatSessionSummary>, PocketError> {
+        sessions::list_sessions(&storage_dir)
+    }
+
+    /// Delete a stored session and its transcript.
+    pub fn delete_chat_session(
+        &self,
+        storage_dir: String,
+        session_id: String,
+    ) -> Result<(), PocketError> {
+        sessions::delete_session(&storage_dir, &session_id)
+    }
+
+    /// Copy a stored session at its head under a new id, returning that id.
+    pub async fn fork_chat_session(
+        &self,
+        storage_dir: String,
+        session_id: String,
+    ) -> Result<String, PocketError> {
+        sessions::fork_session(&storage_dir, &session_id).await
     }
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.

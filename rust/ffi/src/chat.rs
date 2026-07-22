@@ -206,6 +206,9 @@ pub struct ChatSession {
     cancel: parking_lot::Mutex<tokio_util::sync::CancellationToken>,
     busy: AtomicBool,
     perms: Arc<PermissionState>,
+    session_id: String,
+    /// `None` for unpersisted sessions (no storage dir configured).
+    persistence: Option<crate::sessions::SessionPersistence>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -235,6 +238,11 @@ impl ChatSession {
     /// Whether a turn is currently running.
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Stable UUID identifying this session in the on-device store.
+    pub fn session_id(&self) -> String {
+        self.session_id.clone()
     }
 
     /// The active permission mode.
@@ -303,6 +311,10 @@ impl ChatSession {
                     }
                 }
             }
+            // Persist the user message before the network round-trip so a
+            // killed app still finds it on resume. Best-effort: a storage
+            // failure must not take the turn down.
+            self.persist_new(&messages, &delegate).await;
 
             let cancel_token = {
                 let mut guard = self.cancel.lock();
@@ -337,6 +349,10 @@ impl ChatSession {
             // forwarder to flush remaining events before the terminal call.
             let _ = forwarder.await;
 
+            // Persist whatever the loop appended (assistant turns and
+            // tool-result carriers), whatever the outcome.
+            self.persist_new(&messages, &delegate).await;
+
             match outcome {
                 QueryOutcome::EndTurn { .. } => Ok("end_turn"),
                 QueryOutcome::MaxTokens { .. } => Ok("max_tokens"),
@@ -363,6 +379,17 @@ impl ChatSession {
                 delegate.on_error(err.to_string());
                 Err(err)
             }
+        }
+    }
+
+    /// Best-effort persistence of the not-yet-stored message suffix. Storage
+    /// failures surface as a status line rather than failing the turn.
+    async fn persist_new(&self, messages: &[Message], delegate: &Arc<dyn ChatDelegate>) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        if let Err(err) = persistence.persist_new(messages).await {
+            delegate.on_status(format!("session not saved: {err}"));
         }
     }
 
@@ -501,20 +528,15 @@ pub(crate) fn start_session(
     effort: Option<String>,
     workspace_dir: String,
     permission_mode: ChatPermissionMode,
+    storage_dir: Option<String>,
 ) -> Result<Arc<ChatSession>, PocketError> {
-    let workspace = PathBuf::from(&workspace_dir);
-    if !workspace.is_absolute() {
-        return Err(PocketError::Engine {
-            message: format!("workspace_dir must be absolute, got {workspace_dir}"),
-        });
-    }
-    std::fs::create_dir_all(&workspace).map_err(|e| PocketError::Engine {
-        message: format!("cannot create workspace {workspace_dir}: {e}"),
-    })?;
-    // Resolve symlinks up front so containment checks compare real paths.
-    let workspace = workspace.canonicalize().map_err(|e| PocketError::Engine {
-        message: format!("cannot resolve workspace {workspace_dir}: {e}"),
-    })?;
+    let workspace = resolve_workspace(&workspace_dir)?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let persistence = storage_dir
+        .map(|dir| {
+            crate::sessions::SessionPersistence::create(&dir, session_id.clone(), model.clone())
+        })
+        .transpose()?;
     Ok(Arc::new(ChatSession {
         config: SessionConfig {
             provider,
@@ -527,7 +549,66 @@ pub(crate) fn start_session(
         cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
         busy: AtomicBool::new(false),
         perms: Arc::new(PermissionState::new(permission_mode)),
+        session_id,
+        persistence,
     }))
+}
+
+/// Rebuild a persisted session at its stored head. New turns append to the
+/// same transcript. Provider settings come from the caller (they may differ
+/// from the ones the session was created with).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resume_session(
+    provider: PocketProvider,
+    api_key: String,
+    model: String,
+    effort: Option<String>,
+    workspace_dir: String,
+    permission_mode: ChatPermissionMode,
+    storage_dir: String,
+    session_id: String,
+) -> Result<Arc<ChatSession>, PocketError> {
+    let workspace = resolve_workspace(&workspace_dir)?;
+    let (messages, last_uuid) =
+        crate::sessions::load_session_messages(&storage_dir, &session_id).await?;
+    let persistence = crate::sessions::SessionPersistence::resumed(
+        &storage_dir,
+        session_id.clone(),
+        model.clone(),
+        messages.len(),
+        last_uuid,
+    )?;
+    Ok(Arc::new(ChatSession {
+        config: SessionConfig {
+            provider,
+            api_key,
+            model,
+            effort,
+            workspace_dir: workspace,
+        },
+        messages: tokio::sync::Mutex::new(messages),
+        cancel: parking_lot::Mutex::new(tokio_util::sync::CancellationToken::new()),
+        busy: AtomicBool::new(false),
+        perms: Arc::new(PermissionState::new(permission_mode)),
+        session_id,
+        persistence: Some(persistence),
+    }))
+}
+
+fn resolve_workspace(workspace_dir: &str) -> Result<PathBuf, PocketError> {
+    let workspace = PathBuf::from(workspace_dir);
+    if !workspace.is_absolute() {
+        return Err(PocketError::Engine {
+            message: format!("workspace_dir must be absolute, got {workspace_dir}"),
+        });
+    }
+    std::fs::create_dir_all(&workspace).map_err(|e| PocketError::Engine {
+        message: format!("cannot create workspace {workspace_dir}: {e}"),
+    })?;
+    // Resolve symlinks up front so containment checks compare real paths.
+    workspace.canonicalize().map_err(|e| PocketError::Engine {
+        message: format!("cannot resolve workspace {workspace_dir}: {e}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,6 +1126,7 @@ mod tests {
             None,
             "relative/dir".to_string(),
             ChatPermissionMode::Default,
+            None,
         );
         assert!(err.is_err());
     }
@@ -1112,6 +1194,7 @@ mod tests {
             None,
             workspace.display().to_string(),
             ChatPermissionMode::Default,
+            None,
         )
         .unwrap();
 
@@ -1186,6 +1269,7 @@ mod tests {
             None,
             std::env::temp_dir().display().to_string(),
             ChatPermissionMode::Default,
+            None,
         )
         .unwrap();
         let (_client, _config, ctx) = session.build_loop_inputs().unwrap();
@@ -1322,5 +1406,223 @@ mod tests {
             root,
         );
         assert_eq!(summary, "a.txt, b.txt");
+    }
+
+    // -- session persistence -------------------------------------------------
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pocket-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Build a persisted session and write one user + one assistant message
+    /// through the same hook `run_turn` uses.
+    async fn persisted_session(storage: &Path, workspace: &Path) -> Arc<ChatSession> {
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            Some(storage.display().to_string()),
+        )
+        .unwrap();
+        let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
+        {
+            let mut messages = session.messages.lock().await;
+            messages.push(Message::user("hello world\nsecond line"));
+            session.persist_new(&messages, &delegate).await;
+            messages.push(Message::assistant("hi there"));
+            session.persist_new(&messages, &delegate).await;
+            // Same length again: must be a no-op, not a duplicate append.
+            session.persist_new(&messages, &delegate).await;
+        }
+        session
+    }
+
+    #[tokio::test]
+    async fn persisted_session_shows_up_in_list_with_derived_title() {
+        let storage = temp_dir("store");
+        let workspace = temp_dir("ws");
+
+        let session = persisted_session(&storage, &workspace).await;
+        let listed = crate::sessions::list_sessions(&storage.display().to_string()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session.session_id());
+        assert_eq!(listed[0].title, "hello world");
+        assert_eq!(listed[0].model, "claude-test");
+        assert_eq!(listed[0].message_count, 2);
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn resume_restores_transcript_and_appends_to_same_record() {
+        let storage = temp_dir("store");
+        let workspace = temp_dir("ws");
+        let storage_str = storage.display().to_string();
+
+        let original = persisted_session(&storage, &workspace).await;
+        let resumed = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str.clone(),
+            original.session_id(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resumed.session_id(), original.session_id());
+        let transcript = resumed.transcript().await;
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].role, "user");
+        assert!(transcript[0].text.contains("hello world"));
+        assert_eq!(transcript[1].role, "assistant");
+        assert_eq!(transcript[1].text, "hi there");
+
+        // Appending after resume extends the same record without duplicating
+        // the restored prefix.
+        let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
+        {
+            let mut messages = resumed.messages.lock().await;
+            messages.push(Message::user("follow-up"));
+            resumed.persist_new(&messages, &delegate).await;
+        }
+        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 3);
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn resume_unknown_session_errors() {
+        let storage = temp_dir("store");
+        let err = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            std::env::temp_dir().display().to_string(),
+            ChatPermissionMode::Default,
+            storage.display().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert!(err.is_err());
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[tokio::test]
+    async fn fork_copies_transcript_under_new_id() {
+        let storage = temp_dir("store");
+        let workspace = temp_dir("ws");
+        let storage_str = storage.display().to_string();
+
+        let original = persisted_session(&storage, &workspace).await;
+        let fork_id = crate::sessions::fork_session(&storage_str, &original.session_id())
+            .await
+            .unwrap();
+        assert_ne!(fork_id, original.session_id());
+
+        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        assert_eq!(listed.len(), 2);
+        let fork_row = listed
+            .iter()
+            .find(|s| s.session_id == fork_id)
+            .expect("fork listed");
+        assert_eq!(fork_row.title, "hello world");
+        assert_eq!(fork_row.model, "claude-test");
+        assert_eq!(fork_row.message_count, 2);
+
+        // Deleting the original leaves the fork intact and resumable.
+        crate::sessions::delete_session(&storage_str, &original.session_id()).unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        assert_eq!(listed.len(), 1);
+        let resumed_fork = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str.clone(),
+            fork_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed_fork.transcript().await.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session_and_blocks_resume() {
+        let storage = temp_dir("store");
+        let workspace = temp_dir("ws");
+        let storage_str = storage.display().to_string();
+
+        let session = persisted_session(&storage, &workspace).await;
+        crate::sessions::delete_session(&storage_str, &session.session_id()).unwrap();
+        assert!(crate::sessions::list_sessions(&storage_str)
+            .unwrap()
+            .is_empty());
+        let err = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str,
+            session.session_id(),
+        )
+        .await;
+        assert!(err.is_err());
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn unpersisted_session_stays_out_of_the_store() {
+        let storage = temp_dir("store");
+        let workspace = temp_dir("ws");
+
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert!(uuid::Uuid::parse_str(&session.session_id()).is_ok());
+
+        let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
+        {
+            let mut messages = session.messages.lock().await;
+            messages.push(Message::user("hello"));
+            session.persist_new(&messages, &delegate).await;
+        }
+        assert!(
+            crate::sessions::list_sessions(&storage.display().to_string())
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

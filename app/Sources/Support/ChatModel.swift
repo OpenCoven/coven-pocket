@@ -33,69 +33,6 @@ struct ToolCallInfo {
     var isRunning = true
 }
 
-/// Settings a chat session is bound to. Changing any of them requires a new
-/// engine session (the transcript restarts).
-struct ChatSettings: Equatable {
-    var provider: PocketProvider = .anthropic
-    var apiKey: String = ""
-    var model: String = ""
-    var effort: String = "medium"
-}
-
-/// Answer sink for one approval request. `ChatPermissionResponder` conforms;
-/// tests substitute a fake.
-protocol ApprovalResponding {
-    func respond(decision: ChatPermissionDecision)
-}
-
-extension ChatPermissionResponder: ApprovalResponding {}
-
-/// An engine approval request awaiting the user's decision. Dropping it
-/// without responding denies the tool call on the Rust side.
-struct PendingApproval: Identifiable {
-    let request: ChatPermissionRequest
-    let responder: any ApprovalResponding
-
-    var id: UInt64 { request.requestId }
-}
-
-extension ChatPermissionMode {
-    static let all: [ChatPermissionMode] = [.default, .acceptEdits, .plan]
-
-    /// Stable string for UserDefaults persistence.
-    var storageValue: String {
-        switch self {
-        case .default: return "default"
-        case .acceptEdits: return "accept-edits"
-        case .plan: return "plan"
-        }
-    }
-
-    init(storageValue: String?) {
-        switch storageValue {
-        case ChatPermissionMode.acceptEdits.storageValue: self = .acceptEdits
-        case ChatPermissionMode.plan.storageValue: self = .plan
-        default: self = .default
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .default: return "Ask to edit"
-        case .acceptEdits: return "Accept edits"
-        case .plan: return "Plan (read-only)"
-        }
-    }
-
-    var symbolName: String {
-        switch self {
-        case .default: return "shield.lefthalf.filled"
-        case .acceptEdits: return "checkmark.shield"
-        case .plan: return "lock.shield"
-        }
-    }
-}
-
 /// Drives the agentic chat surface: owns the engine session, the rendered
 /// transcript, and the delegate bridge from Rust callback threads.
 @MainActor
@@ -135,6 +72,13 @@ final class ChatModel: ObservableObject {
     static var workspaceURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("workspace", isDirectory: true)
+    }
+
+    /// Where transcripts and the session index live: app data, not user
+    /// documents, so it stays out of the Files app.
+    static var sessionStoreURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("chat-sessions", isDirectory: true)
     }
 
     func send(prompt: String, settings: ChatSettings) async {
@@ -197,11 +141,76 @@ final class ChatModel: ObservableObject {
             model: settings.model,
             effort: settings.effort,
             workspaceDir: workspace.path,
-            permissionMode: permissionMode
+            permissionMode: permissionMode,
+            storageDir: Self.sessionStoreURL.path
         )
         session = fresh
         sessionSettings = settings
         return fresh
+    }
+
+    // MARK: - Session browser
+
+    /// Stored sessions, newest first.
+    func storedSessions() -> [ChatSessionSummary] {
+        (try? engine.listChatSessions(storageDir: Self.sessionStoreURL.path)) ?? []
+    }
+
+    /// Swap the live conversation for a stored one, restoring its transcript.
+    func resume(_ summary: ChatSessionSummary, settings: ChatSettings) async {
+        guard !isBusy else { return }
+        do {
+            let workspace = Self.workspaceURL
+            try FileManager.default.createDirectory(
+                at: workspace, withIntermediateDirectories: true
+            )
+            let resumed = try await engine.resumeChat(
+                provider: settings.provider,
+                apiKey: settings.apiKey,
+                model: settings.model,
+                effort: settings.effort,
+                workspaceDir: workspace.path,
+                permissionMode: permissionMode,
+                storageDir: Self.sessionStoreURL.path,
+                sessionId: summary.sessionId
+            )
+            reset()
+            session = resumed
+            sessionSettings = settings
+            items = Self.items(fromTranscript: await resumed.transcript())
+        } catch {
+            appendError(error.localizedDescription)
+        }
+    }
+
+    func deleteSession(_ summary: ChatSessionSummary) {
+        try? engine.deleteChatSession(
+            storageDir: Self.sessionStoreURL.path,
+            sessionId: summary.sessionId
+        )
+    }
+
+    /// Copy a stored session at its head; returns whether the fork was made.
+    func forkSession(_ summary: ChatSessionSummary) async -> Bool {
+        do {
+            _ = try await engine.forkChatSession(
+                storageDir: Self.sessionStoreURL.path,
+                sessionId: summary.sessionId
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Rendered rows for a restored transcript.
+    static func items(fromTranscript transcript: [ChatMessage]) -> [ChatItem] {
+        transcript.map { message in
+            ChatItem(
+                kind: message.role == "assistant" ? .assistant : .user,
+                text: message.text
+            )
+        }
     }
 
     // MARK: - Bridge entry points (already on the main actor)

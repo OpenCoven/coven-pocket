@@ -12,6 +12,7 @@ struct ChatView: View {
     )
     @State private var prompt = ""
     @State private var showSettings = false
+    @State private var showSessions = false
 
     private var canSend: Bool {
         guard !model.isBusy, !settings.model.isEmpty,
@@ -48,6 +49,14 @@ struct ChatView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        showSessions = true
+                    } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+                    .accessibilityLabel("Sessions")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
                         showSettings = true
                     } label: {
                         Image(systemName: "slider.horizontal.3")
@@ -57,6 +66,9 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showSettings) {
                 ChatSettingsView(settings: $settings, client: client, model: model)
+            }
+            .sheet(isPresented: $showSessions) {
+                SessionsView(model: model, settings: settings)
             }
             .sheet(item: $model.pendingApproval, onDismiss: model.approvalDismissed) { approval in
                 ApprovalSheet(approval: approval, model: model)

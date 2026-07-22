@@ -20,7 +20,8 @@ final class ChatSurfaceTests: XCTestCase {
             model: "claude-test",
             effort: "medium",
             workspaceDir: workspace.path,
-            permissionMode: .default
+            permissionMode: .default,
+            storageDir: nil
         )
         XCTAssertFalse(session.isBusy())
     }
@@ -36,7 +37,8 @@ final class ChatSurfaceTests: XCTestCase {
             model: "claude-test",
             effort: nil,
             workspaceDir: workspace.path,
-            permissionMode: .default
+            permissionMode: .default,
+            storageDir: nil
         )
         let transcript = await session.transcript()
         XCTAssertTrue(transcript.isEmpty)
@@ -51,7 +53,8 @@ final class ChatSurfaceTests: XCTestCase {
                 model: "claude-test",
                 effort: nil,
                 workspaceDir: "relative/workspace",
-                permissionMode: .default
+                permissionMode: .default,
+                storageDir: nil
             )
         )
     }
@@ -173,5 +176,50 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertNil(model.pendingApproval)
         model.approvalDismissed()
         XCTAssertNil(model.pendingApproval, "queued approvals must not survive a reset")
+    }
+
+    // MARK: - Session browser
+
+    @MainActor
+    func testTranscriptItemsMapRoles() {
+        let items = ChatModel.items(fromTranscript: [
+            ChatMessage(role: "user", text: "hello"),
+            ChatMessage(role: "assistant", text: "hi"),
+            ChatMessage(role: "user", text: "again")
+        ])
+        XCTAssertEqual(items.map(\.kind), [.user, .assistant, .user])
+        XCTAssertEqual(items.map(\.text), ["hello", "hi", "again"])
+    }
+
+    private func makeSummary(
+        title: String = "t",
+        updatedAt: String = "2026-01-02T03:04:05+00:00"
+    ) -> ChatSessionSummary {
+        ChatSessionSummary(
+            sessionId: UUID().uuidString.lowercased(),
+            title: title,
+            model: "claude-test",
+            createdAt: "2026-01-01T00:00:00+00:00",
+            updatedAt: updatedAt,
+            messageCount: 2
+        )
+    }
+
+    func testSummaryParsesChronoTimestamps() {
+        // chrono's to_rfc3339 emits nanosecond fractions.
+        let nano = makeSummary(updatedAt: "2026-01-02T03:04:05.123456789+00:00")
+        XCTAssertNotNil(nano.updatedDate)
+        let plain = makeSummary(updatedAt: "2026-01-02T03:04:05+00:00")
+        XCTAssertNotNil(plain.updatedDate)
+        XCTAssertEqual(nano.updatedDate?.timeIntervalSince1970.rounded(),
+                       plain.updatedDate?.timeIntervalSince1970.rounded())
+        XCTAssertNil(makeSummary(updatedAt: "not a date").updatedDate)
+    }
+
+    func testSummaryDisplayTitleFallsBack() {
+        XCTAssertEqual(makeSummary(title: "Fix the bug").displayTitle, "Fix the bug")
+        XCTAssertEqual(makeSummary(title: "").displayTitle, "Untitled session")
+        let summary = makeSummary()
+        XCTAssertEqual(summary.id, summary.sessionId)
     }
 }
