@@ -25,9 +25,9 @@ pub struct RemoteSession {
     pub updated_at: String,
 }
 
-/// One redacted event row from the session event ledger. `payload_json`
-/// is a stream-json frame (`system` / `user` / `assistant` / `tool_result`
-/// / `output` / `result`); the app parses what it renders.
+/// One redacted event row from the session event ledger. For `output`
+/// rows, `payload_json.data` contains a raw stdout chunk that may split
+/// stream-json frames across rows; the app reassembles what it renders.
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct RemoteEvent {
     pub seq: i64,

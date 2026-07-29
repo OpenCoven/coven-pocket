@@ -4,6 +4,20 @@ enum ChatBackend: String, CaseIterable, Hashable {
     case companionClaude
     case codex
 
+    static func available(
+        companionAvailable: Bool,
+        codexAvailable: Bool
+    ) -> [ChatBackend] {
+        var backends: [ChatBackend] = []
+        if companionAvailable {
+            backends.append(.companionClaude)
+        }
+        if codexAvailable {
+            backends.append(.codex)
+        }
+        return backends
+    }
+
     var label: String {
         switch self {
         case .companionClaude: return "Claude via Companion"

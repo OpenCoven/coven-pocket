@@ -11,7 +11,6 @@ final class CompanionChatModel: ObservableObject {
     @Published private(set) var items: [ChatItem] = []
     @Published private(set) var isBusy = false
     @Published private(set) var canRetry = false
-    @Published private(set) var approvalPrompt: String?
     @Published private(set) var availability: Availability = .checking
 
     private(set) var cursor: Int64 = 0
@@ -108,6 +107,9 @@ final class CompanionChatModel: ObservableObject {
             startPolling()
         } catch {
             isBusy = false
+            if Self.isSessionNotLive(error) {
+                abandonSession()
+            }
             fail(error.localizedDescription, retryPrompt: trimmedPrompt)
         }
     }
@@ -144,6 +146,7 @@ final class CompanionChatModel: ObservableObject {
                     sessionID: session.id,
                     afterSeq: cursor
                 )
+                guard !Task.isCancelled else { return }
                 let knownSequences = Set(accumulatedEvents.map(\.seq))
                 accumulatedEvents.append(
                     contentsOf: page.events.filter { !knownSequences.contains($0.seq) }
@@ -153,14 +156,13 @@ final class CompanionChatModel: ObservableObject {
             }
             apply(events: accumulatedEvents)
         } catch {
+            guard !Task.isCancelled else { return }
             items.append(ChatItem(kind: .error, text: error.localizedDescription))
             pollTask?.cancel()
             pollTask = nil
             isBusy = false
-            if error.localizedDescription.localizedCaseInsensitiveContains(
-                "session is not live"
-            ) {
-                self.session = nil
+            if Self.isSessionNotLive(error) {
+                abandonSession()
                 retriesPolling = false
                 canRetry = false
             } else {
@@ -173,32 +175,23 @@ final class CompanionChatModel: ObservableObject {
     func apply(events: [RemoteEvent]) {
         accumulatedEvents = events
         cursor = max(cursor, events.map(\.seq).max() ?? cursor)
-        let remoteItems = RemoteTranscript.items(
+        let snapshot = RemoteTranscript.snapshot(
             from: events,
             resultSemantics: .turn
         )
-        items = Self.chatItems(from: remoteItems)
+        items = Self.chatItems(from: snapshot.items)
         if let initialPrompt {
             items.insert(ChatItem(kind: .user, text: initialPrompt), at: 0)
         }
-        approvalPrompt = RemoteTranscript.approvalPrompt(in: remoteItems)
-
-        if let newestResult = events
-            .filter({ $0.kind == "result" })
-            .map(\.seq)
-            .max(),
+        if let newestResult = snapshot.latestResultSeq,
            newestResult > lastCompletedResultSeq {
             lastCompletedResultSeq = newestResult
             isBusy = false
         }
-    }
-
-    func approve() async {
-        await sendControl("y\n")
-    }
-
-    func deny() async {
-        await sendControl("n\n")
+        if snapshot.sessionEnded {
+            isBusy = false
+            abandonSession()
+        }
     }
 
     func stop() async {
@@ -207,15 +200,12 @@ final class CompanionChatModel: ObservableObject {
         }
         do {
             try await client.kill(pairing: verified, sessionID: session.id)
-            pollTask?.cancel()
-            pollTask = nil
-            self.session = nil
-            isBusy = false
-            canRetry = false
-            retriesPolling = false
-            approvalPrompt = nil
-            items.append(ChatItem(kind: .status, text: "Stopped."))
+            finishStoppedSession(message: "Stopped.")
         } catch {
+            if Self.isSessionNotLive(error) {
+                finishStoppedSession(message: "Session already stopped.")
+                return
+            }
             items.append(ChatItem(kind: .error, text: error.localizedDescription))
         }
     }
@@ -237,7 +227,6 @@ final class CompanionChatModel: ObservableObject {
         retryPrompt = nil
         retryProjectRoot = ""
         items = []
-        approvalPrompt = nil
         isBusy = false
         canRetry = false
     }
@@ -281,23 +270,6 @@ private extension CompanionChatModel {
         return nil
     }
 
-    func sendControl(_ data: String) async {
-        guard let session,
-              let verified = await verifiedPairing(reportFailure: true) else {
-            return
-        }
-        do {
-            try await client.sendInput(
-                pairing: verified,
-                sessionID: session.id,
-                data: data
-            )
-            approvalPrompt = nil
-        } catch {
-            items.append(ChatItem(kind: .error, text: error.localizedDescription))
-        }
-    }
-
     func startPolling() {
         guard pollTask == nil else { return }
         pollTask = Task { [weak self] in
@@ -317,7 +289,20 @@ private extension CompanionChatModel {
         initialPrompt = nil
         retriesPolling = false
         items = []
-        approvalPrompt = nil
+    }
+
+    func abandonSession() {
+        pollTask?.cancel()
+        pollTask = nil
+        session = nil
+    }
+
+    func finishStoppedSession(message: String) {
+        abandonSession()
+        isBusy = false
+        canRetry = false
+        retriesPolling = false
+        items.append(ChatItem(kind: .status, text: message))
     }
 
     func fail(_ message: String, retryPrompt: String?) {
@@ -358,6 +343,12 @@ private extension CompanionChatModel {
                 )
             }
         }
+    }
+
+    static func isSessionNotLive(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return message.contains("session is not live")
+            || message.contains("session is not running")
     }
 }
 

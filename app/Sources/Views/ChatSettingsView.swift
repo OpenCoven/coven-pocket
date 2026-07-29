@@ -11,21 +11,23 @@ struct ChatSettingsView: View {
         NavigationStack {
             Form {
                 Section("Backend") {
-                    Picker("Backend", selection: $settings.backend) {
-                        if companionModel.isAvailable || settings.backend == .companionClaude {
-                            Text(ChatBackend.companionClaude.label)
-                                .tag(ChatBackend.companionClaude)
+                    if availableBackends.count > 1 {
+                        Picker("Backend", selection: $settings.backend) {
+                            ForEach(availableBackends, id: \.self) { backend in
+                                Text(backend.label).tag(backend)
+                            }
                         }
-                        if client.codexAccount != nil || settings.backend == .codex {
-                            Text(ChatBackend.codex.label)
-                                .tag(ChatBackend.codex)
+                        .pickerStyle(.segmented)
+                        .onChange(of: settings.backend) { _, backend in
+                            if backend == .codex, settings.model.isEmpty {
+                                settings.model = client.defaultCodexModel
+                            }
                         }
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: settings.backend) { _, backend in
-                        if backend == .codex, settings.model.isEmpty {
-                            settings.model = client.defaultCodexModel
-                        }
+                    } else {
+                        LabeledContent(
+                            "Backend",
+                            value: availableBackends.first?.label ?? "Unavailable"
+                        )
                     }
 
                     switch settings.backend {
@@ -74,11 +76,39 @@ struct ChatSettingsView: View {
             }
             .navigationTitle("Chat Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .task {
+                await companionModel.refreshAvailability()
+                normalizeBackendSelection()
+            }
+            .onChange(of: companionModel.availability) {
+                normalizeBackendSelection()
+            }
+            .onChange(of: client.codexAccount != nil) {
+                normalizeBackendSelection()
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
+        }
+    }
+
+    private var availableBackends: [ChatBackend] {
+        ChatBackend.available(
+            companionAvailable: companionModel.isAvailable,
+            codexAvailable: client.codexAccount != nil
+        )
+    }
+
+    private func normalizeBackendSelection() {
+        guard !availableBackends.contains(settings.backend),
+              let fallback = availableBackends.first else {
+            return
+        }
+        settings.backend = fallback
+        if fallback == .codex, settings.model.isEmpty {
+            settings.model = client.defaultCodexModel
         }
     }
 

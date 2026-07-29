@@ -16,6 +16,42 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertEqual(settings.daemonProjectRoot, "")
     }
 
+    func testBackendChoicesGateCompanionOnVerifiedAvailability() {
+        XCTAssertEqual(
+            ChatBackend.available(companionAvailable: false, codexAvailable: true),
+            [.codex]
+        )
+        XCTAssertEqual(
+            ChatBackend.available(companionAvailable: true, codexAvailable: true),
+            [.companionClaude, .codex]
+        )
+        XCTAssertEqual(
+            ChatBackend.available(companionAvailable: true, codexAvailable: false),
+            [.companionClaude]
+        )
+        XCTAssertTrue(
+            ChatBackend.available(companionAvailable: false, codexAvailable: false).isEmpty
+        )
+    }
+
+    func testCompanionChatHasNoPTYApprovalControls() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let files = [
+            "Sources/Support/CompanionChatModel.swift",
+            "Sources/Views/ChatView.swift"
+        ]
+        let source = try files
+            .map { try String(contentsOf: root.appendingPathComponent($0), encoding: .utf8) }
+            .joined(separator: "\n")
+
+        XCTAssertFalse(source.contains("companionApprovalBar"))
+        XCTAssertFalse(source.contains("func approve()"))
+        XCTAssertFalse(source.contains("func deny()"))
+        XCTAssertFalse(source.contains("sendControl"))
+    }
+
     func testChatSurfaceHasNoAnthropicAPIKeyUIOrKeychainRead() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

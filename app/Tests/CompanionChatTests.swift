@@ -1,22 +1,33 @@
 import XCTest
 @testable import CovenPocket
 
-private enum FakeCompanionError: LocalizedError {
+enum FakeCompanionError: LocalizedError {
     case polling
+    case sessionNotLive
 
     var errorDescription: String? {
-        "Polling failed"
+        switch self {
+        case .polling:
+            return "Polling failed"
+        case .sessionNotLive:
+            return "engine error: Session is not running."
+        }
     }
 }
 
 @MainActor
-private final class FakeCompanionSessionClient: CompanionSessionClient {
+final class FakeCompanionSessionClient: CompanionSessionClient {
     var gate: CompanionModel.SessionGate
     var launchedPrompts: [String] = []
     var sentInputs: [String] = []
     var killedSessionIDs: [String] = []
     var eventBatches: [RemoteEventBatch] = []
     var eventError: FakeCompanionError?
+    var sendInputError: FakeCompanionError?
+    var killError: FakeCompanionError?
+    var suspendsEvents = false
+    let eventsRequested = XCTestExpectation(description: "events requested")
+    private var eventsContinuation: CheckedContinuation<RemoteEventBatch, Never>?
 
     init(gate: CompanionModel.SessionGate) {
         self.gate = gate
@@ -47,6 +58,12 @@ private final class FakeCompanionSessionClient: CompanionSessionClient {
         sessionID: String,
         afterSeq: Int64
     ) async throws -> RemoteEventBatch {
+        if suspendsEvents {
+            eventsRequested.fulfill()
+            return await withCheckedContinuation { continuation in
+                eventsContinuation = continuation
+            }
+        }
         if let eventError {
             throw eventError
         }
@@ -65,15 +82,27 @@ private final class FakeCompanionSessionClient: CompanionSessionClient {
         sessionID: String,
         data: String
     ) async throws {
+        if let sendInputError {
+            throw sendInputError
+        }
         sentInputs.append(data)
     }
 
     func kill(pairing: DaemonPairing, sessionID: String) async throws {
+        if let killError {
+            throw killError
+        }
         killedSessionIDs.append(sessionID)
+    }
+
+    func resumeEvents(with batch: RemoteEventBatch) {
+        let continuation = eventsContinuation
+        eventsContinuation = nil
+        continuation?.resume(returning: batch)
     }
 }
 
-private func pairedDaemon() -> DaemonPairing {
+func pairedDaemon() -> DaemonPairing {
     DaemonPairing(
         host: "mac.tailnet.ts.net",
         port: 7777,
@@ -82,6 +111,19 @@ private func pairedDaemon() -> DaemonPairing {
         pid: 42,
         startedAt: "now",
         pairedAt: Date()
+    )
+}
+
+func daemonOutputEvent(seq: Int64, data: String) throws -> RemoteEvent {
+    let payload = try JSONSerialization.data(withJSONObject: ["data": data])
+    guard let payloadJSON = String(data: payload, encoding: .utf8) else {
+        throw CocoaError(.fileReadInapplicableStringEncoding)
+    }
+    return RemoteEvent(
+        seq: seq,
+        kind: "output",
+        payloadJson: payloadJSON,
+        createdAt: "t"
     )
 }
 
@@ -151,19 +193,6 @@ final class CompanionChatTests: XCTestCase {
         XCTAssertEqual(model.cursor, 8)
         XCTAssertEqual(model.items.map(\.text), ["first", "Done", "Turn complete"])
         XCTAssertFalse(model.isBusy)
-    }
-
-    func testApprovalsAndStopUseDaemonInputAndKill() async {
-        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
-        let model = CompanionChatModel(client: client)
-        await model.send(prompt: "first", projectRoot: "/srv/repo")
-
-        await model.approve()
-        await model.deny()
-        await model.stop()
-
-        XCTAssertEqual(client.sentInputs, ["y\n", "n\n"])
-        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
     }
 
     func testSendAfterStopLaunchesWithAFreshEventCursor() async {
@@ -267,6 +296,35 @@ final class CompanionChatTests: XCTestCase {
         await model.reset()
 
         XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertEqual(model.cursor, 0)
+        XCTAssertFalse(model.isBusy)
+    }
+
+    func testResetIgnoresEventsReturnedByCanceledPoll() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsEvents = true
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        await fulfillment(of: [client.eventsRequested], timeout: 1)
+
+        await model.reset()
+        client.resumeEvents(
+            with: RemoteEventBatch(
+                events: [
+                    RemoteEvent(
+                        seq: 1,
+                        kind: "assistant",
+                        payloadJson: #"{"type":"assistant","message":{"content":[{"type":"text","text":"Late"}]}}"#,
+                        createdAt: "t"
+                    )
+                ],
+                nextAfterSeq: 1,
+                hasMore: false
+            )
+        )
+        await Task.yield()
+
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertEqual(model.cursor, 0)
         XCTAssertFalse(model.isBusy)

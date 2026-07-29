@@ -48,11 +48,6 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 transcript
                 Divider()
-                if let approval = companionModel.approvalPrompt,
-                   settings.backend == .companionClaude {
-                    companionApprovalBar(approval)
-                    Divider()
-                }
                 inputBar
             }
             .navigationTitle("Chat")
@@ -134,6 +129,7 @@ struct ChatView: View {
             .task(id: router.selectedTab) {
                 if router.selectedTab == .chat {
                     await companionModel.refreshAvailability()
+                    normalizeBackendSelection()
                 }
             }
             .task(id: router.pendingPrompt) { await consumeRouterPrompt() }
@@ -231,26 +227,6 @@ private extension ChatView {
         }
     }
 
-    private func companionApprovalBar(_ approval: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(approval)
-                .font(.footnote)
-                .lineLimit(3)
-            HStack {
-                Button("Deny", role: .destructive) {
-                    Task { await companionModel.deny() }
-                }
-                Spacer()
-                Button("Approve") {
-                    Task { await companionModel.approve() }
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-    }
-
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField("Message", text: $prompt, axis: .vertical)
@@ -320,6 +296,21 @@ private extension ChatView {
             await companionModel.reset()
         case .codex:
             model.reset()
+        }
+    }
+
+    private func normalizeBackendSelection() {
+        let available = ChatBackend.available(
+            companionAvailable: companionModel.isAvailable,
+            codexAvailable: client.codexAccount != nil
+        )
+        guard !available.contains(settings.backend),
+              let fallback = available.first else {
+            return
+        }
+        settings.backend = fallback
+        if fallback == .codex, settings.model.isEmpty {
+            settings.model = client.defaultCodexModel
         }
     }
 }
