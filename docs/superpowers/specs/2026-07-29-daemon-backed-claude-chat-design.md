@@ -1,6 +1,6 @@
 # Daemon-Backed Claude Chat Design
 
-**Status:** Approved in conversation on 2026-07-29
+**Status:** Implemented; corrected against the daemon stream contract on 2026-07-29
 **Bead:** `pocket-d3u`
 **GitHub issue:** `OpenCoven/coven-pocket#9`
 
@@ -99,7 +99,7 @@ Stop re-verifies the pairing and calls `/kill`. Reset cancels polling and kills
 an active daemon session before clearing local presentation state. The app
 never silently changes backends or replays the prompt through a provider API.
 
-### Transcript and approvals
+### Transcript and permission behavior
 
 The existing `RemoteTranscript` parser remains the authority for daemon event
 payloads. A small mapping layer converts its roles into the existing Chat
@@ -116,9 +116,11 @@ it does not mean that the daemon session or CLI process exited. The companion
 Chat mapper therefore renders turn-complete copy and keeps polling. The
 existing one-shot remote-attach mapper retains its session-finished copy.
 
-Approval prompts detected in the terminal tail use the existing companion
-Approve and Deny controls. Responses travel through `/input`; the app does not
-answer permissions locally or assume the daemon's harness policy.
+Companion Chat does not synthesize Approve or Deny controls from stream output.
+For stream sessions, `/input` wraps every payload as a new Claude user-message
+envelope, so forwarding `y` or `n` would create a chat turn rather than answer
+a PTY prompt. The existing Remote Attach surface retains its approval controls
+because it attaches to interactive sessions where `/input` is terminal input.
 
 The Chat share sheet continues to operate on rendered, already-redacted daemon
 events. Raw daemon artifacts are not fetched by this feature.
@@ -163,7 +165,6 @@ session-client protocol. Its responsibilities are:
 - first-turn launch;
 - subsequent input;
 - event polling and cursor ownership;
-- approval input;
 - kill/reset; and
 - mapping remote transcript rows into Chat presentation state.
 
@@ -211,7 +212,8 @@ Swift tests prove:
 - the first turn launches exactly once;
 - later turns use `/input` rather than launching another session;
 - event cursors advance without duplicate rows;
-- approvals and Stop route to the daemon;
+- stream output never exposes false PTY approval controls;
+- Stop routes to the daemon;
 - pairing, launch, and polling failures do not fall back to a provider API;
 - reset cancels and kills an active remote session;
 - daemon project paths never reuse iOS workspace paths; and
@@ -243,8 +245,8 @@ The feature is complete only when:
    `claude` CLI.
 2. Chat no longer reads, displays, or submits an Anthropic API key.
 3. Pairing is freshly verified before daemon traffic.
-4. First turn, follow-up input, events, approvals, Stop, and Reset all use the
-   daemon session contract.
+4. First turn, follow-up input, events, Stop, and Reset all use the daemon
+   session contract; Chat does not treat stream `/input` as PTY approval input.
 5. No daemon failure silently falls back to a provider API.
 6. On-device Codex and the Playground remain functional.
 7. Focused tests and the full repository quality gates pass.

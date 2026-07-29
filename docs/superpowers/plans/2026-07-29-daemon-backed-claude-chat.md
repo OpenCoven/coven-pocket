@@ -4,6 +4,11 @@
 
 **Goal:** Replace Chat's Anthropic API-key path with a paired-daemon Claude stream session while preserving on-device Codex and the Playground.
 
+**Post-plan correction:** The final audit proved that stream-session `/input`
+wraps data as Claude user messages; it is not PTY input. Any approval-control
+scaffolding below is superseded: companion Chat does not send `y`/`n`, while
+the existing interactive Remote Attach surface retains approval controls.
+
 **Architecture:** Extend the existing bounded Rust daemon client with typed session launch, then add a Swift companion-chat model behind an injectable client protocol. `ChatView` selects either the new daemon model or the existing Codex model; daemon output remains event-ledger authoritative and no failure falls back to provider HTTP.
 
 **Tech Stack:** Swift 5.10, SwiftUI, XCTest, Rust, Tokio, Serde, UniFFI, Coven daemon `coven.daemon.v1`
@@ -22,7 +27,7 @@
 - Modify `app/Tests/RemoteAttachTests.swift`: lock result semantics for one-shot and stream views.
 - Modify `app/Tests/ChatSurfaceTests.swift`: lock backend settings and absence of Anthropic key usage from Chat.
 - Modify `app/Sources/Views/ChatSettingsView.swift`: show backend-specific Codex or daemon settings.
-- Modify `app/Sources/Views/ChatView.swift`: select models, render daemon approvals, and route Chat actions.
+- Modify `app/Sources/Views/ChatView.swift`: select models and route Chat actions.
 - Modify `app/Sources/Views/RemoteSessionsView.swift`: support presentation from the Chat history sheet.
 - Modify `app/Sources/Intents/CovenIntents.swift`: clarify that optional iOS workspaces apply only to on-device Codex.
 - Modify `ROADMAP.md`: mark the approved M2 item complete after verification.
@@ -1125,9 +1130,9 @@ Route Send, Retry, Stop, Reset, share items, empty-state copy, and settings to
 the active model. For companion Stop and Reset, wrap the async methods in a
 `Task`.
 
-When companion approval copy is non-nil, insert a bar above the input with
-Approve and Deny buttons calling `companionModel.approve()` and
-`companionModel.deny()`.
+Do not infer PTY approvals from companion Chat stream output. The stream
+`/input` contract creates a Claude user turn, so `y`/`n` approval forwarding
+belongs only to the existing interactive Remote Attach surface.
 
 Keep the local `ApprovalSheet` and permission toolbar only for Codex.
 
