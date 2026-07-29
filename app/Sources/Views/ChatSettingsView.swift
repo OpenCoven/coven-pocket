@@ -4,78 +4,88 @@ struct ChatSettingsView: View {
     @Binding var settings: ChatSettings
     @ObservedObject var client: EngineClient
     @ObservedObject var model: ChatModel
+    @ObservedObject var companionModel: CompanionChatModel
     @Environment(\.dismiss) private var dismiss
-
-    private static let effortLevels: [(id: String, label: String)] = [
-        ("low", "○ Low"),
-        ("medium", "◐ Medium"),
-        ("high", "● High"),
-        ("max", "◉ Max")
-    ]
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Provider") {
-                    Picker("Provider", selection: $settings.provider) {
-                        Text("Anthropic").tag(PocketProvider.anthropic)
-                        Text("Codex").tag(PocketProvider.codex)
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: settings.provider) { _, newValue in
-                        settings.model = newValue == .anthropic
-                            ? client.defaultModel
-                            : client.defaultCodexModel
-                    }
-
-                    switch settings.provider {
-                    case .anthropic: anthropicRows
-                    case .codex: codexRows
-                    }
-
-                    Picker("Effort", selection: $settings.effort) {
-                        ForEach(Self.effortLevels, id: \.id) { level in
-                            Text(level.label).tag(level.id)
+                Section("Backend") {
+                    if availableBackends.count > 1 {
+                        Picker("Backend", selection: $settings.backend) {
+                            ForEach(availableBackends, id: \.self) { backend in
+                                Text(backend.label).tag(backend)
+                            }
                         }
-                    }
-                }
-
-                Section {
-                    Toggle("Inject project memory", isOn: Binding(
-                        get: { model.injectContext },
-                        set: { model.injectContext = $0 }
-                    ))
-                    NavigationLink("Manage memory notes") {
-                        MemoryView(
-                            engine: model.engine,
-                            workspacePath: model.effectiveWorkspaceURL.path
+                        .pickerStyle(.segmented)
+                        .onChange(of: settings.backend) { _, backend in
+                            if backend == .codex, settings.model.isEmpty {
+                                settings.model = client.defaultCodexModel
+                            }
+                        }
+                    } else {
+                        LabeledContent(
+                            "Backend",
+                            value: availableBackends.first?.label ?? "Unavailable"
                         )
                     }
-                } header: {
-                    Text("Memory")
-                } footer: {
-                    Text(
-                        "When on, new sessions read the workspace's AGENTS.md "
-                            + "files and memory notes into the system prompt. "
-                            + "Applies per workspace, from the next session."
-                    )
+
+                    switch settings.backend {
+                    case .companionClaude:
+                        companionRows
+                    case .codex:
+                        codexRows
+                    }
                 }
 
-                Section {
-                    Button("Clear conversation", role: .destructive) {
-                        model.reset()
-                        dismiss()
+                if settings.backend == .codex {
+                    Section {
+                        Toggle("Inject project memory", isOn: Binding(
+                            get: { model.injectContext },
+                            set: { model.injectContext = $0 }
+                        ))
+                        NavigationLink("Manage memory notes") {
+                            MemoryView(
+                                engine: model.engine,
+                                workspacePath: model.effectiveWorkspaceURL.path
+                            )
+                        }
+                    } header: {
+                        Text("Memory")
+                    } footer: {
+                        Text(
+                            "When on, new sessions read the workspace's AGENTS.md "
+                                + "files and memory notes into the system prompt. "
+                                + "Applies per workspace, from the next session."
+                        )
                     }
-                } footer: {
-                    Text(
-                        "The agent works inside Documents/workspace. "
-                            + "Changing settings starts a new conversation; "
-                            + "the permission mode (shield menu) applies live."
-                    )
+
+                    Section {
+                        Button("Clear conversation", role: .destructive) {
+                            model.reset()
+                            dismiss()
+                        }
+                    } footer: {
+                        Text(
+                            "Codex works inside the selected on-device workspace. "
+                                + "Changing settings starts a new conversation; "
+                                + "the permission mode (shield menu) applies live."
+                        )
+                    }
                 }
             }
             .navigationTitle("Chat Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .task {
+                await companionModel.refreshAvailability()
+                normalizeBackendSelection()
+            }
+            .onChange(of: companionModel.availability) {
+                normalizeBackendSelection()
+            }
+            .onChange(of: client.codexAccount != nil) {
+                normalizeBackendSelection()
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
@@ -84,26 +94,69 @@ struct ChatSettingsView: View {
         }
     }
 
-    @ViewBuilder private var anthropicRows: some View {
-        SecureField("Anthropic API key", text: $settings.apiKey)
+    private var availableBackends: [ChatBackend] {
+        ChatBackend.available(
+            companionAvailable: companionModel.isAvailable,
+            codexAvailable: client.codexAccount != nil
+        )
+    }
+
+    private func normalizeBackendSelection() {
+        guard !availableBackends.contains(settings.backend),
+              let fallback = availableBackends.first else {
+            return
+        }
+        settings.backend = fallback
+        if fallback == .codex, settings.model.isEmpty {
+            settings.model = client.defaultCodexModel
+        }
+    }
+
+    @ViewBuilder private var companionRows: some View {
+        TextField("Project path on daemon host", text: $settings.daemonProjectRoot)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
-            .onChange(of: settings.apiKey) { _, newValue in
-                Keychain.set(newValue, for: "anthropic-api-key")
+            .onChange(of: settings.daemonProjectRoot) { _, value in
+                UserDefaults.standard.set(value, forKey: "daemon-chat-project-root")
             }
-        Picker("Model", selection: $settings.model) {
-            if client.models.isEmpty {
-                Text(settings.model).tag(settings.model)
+
+        switch companionModel.availability {
+        case .checking:
+            Label("Checking the daemon…", systemImage: "antenna.radiowaves.left.and.right")
+                .foregroundStyle(.secondary)
+        case let .ready(pairing):
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Daemon verified")
+                    Text("\(pairing.host):\(pairing.port)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
             }
-            ForEach(client.models, id: \.id) { entry in
-                Text(entry.name).tag(entry.id)
+        case let .blocked(reason, hint):
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(reason)
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "xmark.octagon.fill")
+                    .foregroundStyle(.red)
             }
         }
-        .task(id: settings.apiKey) {
-            guard !settings.apiKey.isEmpty, client.models.isEmpty else { return }
-            try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled else { return }
-            await client.loadModels(apiKey: settings.apiKey)
+
+        Button("Verify daemon") {
+            Task { await companionModel.refreshAvailability() }
+        }
+
+        Button("Open Companion") {
+            AppRouter.shared.selectedTab = .companion
+            dismiss()
         }
     }
 

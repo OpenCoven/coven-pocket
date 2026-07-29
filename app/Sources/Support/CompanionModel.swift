@@ -202,6 +202,12 @@ final class CompanionModel: ObservableObject {
         status = .idle
     }
 
+    /// Refresh the in-memory snapshot after another model changes the shared
+    /// Keychain pairing.
+    func reloadPairing() {
+        pairing = store.load()
+    }
+
     /// Re-run the handshake against the stored pairing and surface the result.
     func verifyPairing() async {
         status = .probing

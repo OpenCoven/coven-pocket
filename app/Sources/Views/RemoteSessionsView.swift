@@ -3,8 +3,11 @@ import SwiftUI
 /// Sessions running on the paired daemon; tap one to attach.
 struct RemoteSessionsView: View {
     @StateObject private var model: RemoteSessionsModel
+    @Environment(\.dismiss) private var dismiss
+    private let showsDoneButton: Bool
 
-    init(companion: CompanionModel) {
+    init(companion: CompanionModel, showsDoneButton: Bool = false) {
+        self.showsDoneButton = showsDoneButton
         _model = StateObject(wrappedValue: RemoteSessionsModel(companion: companion))
     }
 
@@ -13,6 +16,13 @@ struct RemoteSessionsView: View {
             content
         }
         .navigationTitle("Remote sessions")
+        .toolbar {
+            if showsDoneButton {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
         .task { await model.refresh() }
         .refreshable { await model.refresh() }
     }

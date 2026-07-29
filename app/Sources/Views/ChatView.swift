@@ -1,28 +1,45 @@
 import SwiftUI
 
-/// M1 agentic chat surface: a multi-turn conversation with the on-device
-/// engine, streaming text and tool-call cards, bound to the app's sandboxed
-/// workspace directory.
+/// Multi-turn chat through either a verified companion daemon's Claude CLI
+/// or the on-device Codex engine.
 struct ChatView: View {
     @StateObject private var model = ChatModel()
     @StateObject private var client = EngineClient()
+    @StateObject private var companionModel = CompanionChatModel()
     @ObservedObject private var router = AppRouter.shared
 
     @State private var settings = ChatSettings(
-        apiKey: Keychain.get("anthropic-api-key") ?? ""
+        daemonProjectRoot: UserDefaults.standard.string(
+            forKey: "daemon-chat-project-root"
+        ) ?? ""
     )
     @State private var prompt = ""
     @State private var showSettings = false
     @State private var showSessions = false
     @State private var showShare = false
 
+    private var activeItems: [ChatItem] {
+        settings.backend == .companionClaude ? companionModel.items : model.items
+    }
+
+    private var activeIsBusy: Bool {
+        settings.backend == .companionClaude ? companionModel.isBusy : model.isBusy
+    }
+
+    private var activeCanRetry: Bool {
+        settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry
+    }
+
     private var canSend: Bool {
-        guard !model.isBusy, !settings.model.isEmpty,
+        guard !activeIsBusy,
               !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return false }
-        switch settings.provider {
-        case .anthropic: return !settings.apiKey.isEmpty
-        case .codex: return client.codexAccount != nil
+        switch settings.backend {
+        case .companionClaude:
+            return companionModel.isAvailable
+                && CompanionChatModel.isAbsoluteHostPath(settings.daemonProjectRoot)
+        case .codex:
+            return client.codexAccount != nil && !settings.model.isEmpty
         }
     }
 
@@ -36,18 +53,20 @@ struct ChatView: View {
             .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Menu {
-                        Picker("Permission mode", selection: $model.permissionMode) {
-                            ForEach(ChatPermissionMode.all, id: \.self) { mode in
-                                Label(mode.label, systemImage: mode.symbolName)
-                                    .tag(mode)
+                if settings.backend == .codex {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Menu {
+                            Picker("Permission mode", selection: $model.permissionMode) {
+                                ForEach(ChatPermissionMode.all, id: \.self) { mode in
+                                    Label(mode.label, systemImage: mode.symbolName)
+                                        .tag(mode)
+                                }
                             }
+                        } label: {
+                            Image(systemName: model.permissionMode.symbolName)
                         }
-                    } label: {
-                        Image(systemName: model.permissionMode.symbolName)
+                        .accessibilityLabel("Permission mode")
                     }
-                    .accessibilityLabel("Permission mode")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -55,7 +74,7 @@ struct ChatView: View {
                     } label: {
                         Image(systemName: "square.and.arrow.up")
                     }
-                    .disabled(model.items.isEmpty)
+                    .disabled(activeItems.isEmpty)
                     .accessibilityLabel("Share session")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -76,13 +95,27 @@ struct ChatView: View {
                 }
             }
             .sheet(isPresented: $showSettings) {
-                ChatSettingsView(settings: $settings, client: client, model: model)
+                ChatSettingsView(
+                    settings: $settings,
+                    client: client,
+                    model: model,
+                    companionModel: companionModel
+                )
             }
             .sheet(isPresented: $showSessions) {
-                SessionsView(model: model, settings: settings)
+                if settings.backend == .companionClaude {
+                    NavigationStack {
+                        RemoteSessionsView(
+                            companion: companionModel.companion,
+                            showsDoneButton: true
+                        )
+                    }
+                } else {
+                    SessionsView(model: model, settings: settings)
+                }
             }
             .sheet(isPresented: $showShare) {
-                ShareSessionSheet(items: model.items)
+                ShareSessionSheet(items: activeItems)
             }
             .sheet(item: $model.pendingApproval, onDismiss: model.approvalDismissed) { approval in
                 ApprovalSheet(approval: approval, model: model)
@@ -90,20 +123,29 @@ struct ChatView: View {
             }
             .task {
                 if settings.model.isEmpty {
-                    settings.model = client.defaultModel
+                    settings.model = client.defaultCodexModel
+                }
+            }
+            .task(id: router.selectedTab) {
+                if router.selectedTab == .chat {
+                    await companionModel.refreshAvailability()
+                    normalizeBackendSelection()
                 }
             }
             .task(id: router.pendingPrompt) { await consumeRouterPrompt() }
             .task(id: router.pendingSessionID) { await consumeRouterSession() }
             .task(id: router.pendingReset) {
-                if router.consumeReset() { model.reset() }
+                guard router.consumeReset() else { return }
+                await resetActiveConversation()
             }
         }
     }
+}
 
+private extension ChatView {
     // MARK: - Intent / Spotlight handoff
 
-    /// Run a prompt queued by `AskCovenIntent`: send it when the provider is
+    /// Run a prompt queued by `AskCovenIntent`: send it when the backend is
     /// configured, otherwise leave it in the input bar for the user.
     /// Consuming clears the published value (changing the task id), so the
     /// actual work runs in a detached-lifetime `Task` that survives the
@@ -113,13 +155,17 @@ struct ChatView: View {
         prompt = queued
         guard canSend else { return }
         prompt = ""
-        let settings = settings
-        Task { await model.send(prompt: queued, settings: settings) }
+        Task { await send(queued) }
     }
 
-    /// Resume a stored session picked from a Spotlight result.
+    /// Spotlight indexes on-device sessions, so this explicit history choice
+    /// switches to Codex rather than acting as an error fallback.
     private func consumeRouterSession() async {
         guard let sessionID = router.consumeSessionID() else { return }
+        settings.backend = .codex
+        if settings.model.isEmpty {
+            settings.model = client.defaultCodexModel
+        }
         let settings = settings
         Task {
             guard
@@ -134,16 +180,16 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if model.items.isEmpty {
+                    if activeItems.isEmpty {
                         emptyState
                     }
-                    ForEach(model.items) { item in
+                    ForEach(activeItems) { item in
                         ChatRow(item: item)
                             .id(item.id)
                     }
-                    if model.canRetry {
+                    if activeCanRetry {
                         Button("Retry") {
-                            Task { await model.retry() }
+                            Task { await retryActiveConversation() }
                         }
                         .buttonStyle(.bordered)
                     }
@@ -151,8 +197,8 @@ struct ChatView: View {
                 .padding(.horizontal)
                 .padding(.vertical, 12)
             }
-            .onChange(of: model.items.last?.text) {
-                if let last = model.items.last {
+            .onChange(of: activeItems.last?.text) {
+                if let last = activeItems.last {
                     proxy.scrollTo(last.id, anchor: .bottom)
                 }
             }
@@ -161,17 +207,24 @@ struct ChatView: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Agentic chat")
+            Text(settings.backend == .companionClaude ? "Claude via Companion" : "On-device Codex")
                 .font(.headline)
-            Text(
-                "The agent can read, search, and edit files inside this app's "
-                    + "workspace folder (visible in the Files app). Shell and "
-                    + "network tools are not available on device."
-            )
-            .font(.footnote)
-            .foregroundStyle(.secondary)
+            Text(emptyStateDescription)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
         .padding(.top, 24)
+    }
+
+    private var emptyStateDescription: String {
+        switch settings.backend {
+        case .companionClaude:
+            return "Claude runs on the paired daemon using the host's signed-in CLI "
+                + "and works in the explicit host project path."
+        case .codex:
+            return "Codex can read, search, and edit files inside this app's workspace. "
+                + "Shell and network tools are not available on device."
+        }
     }
 
     private var inputBar: some View {
@@ -180,9 +233,9 @@ struct ChatView: View {
                 .lineLimit(1 ... 4)
                 .textFieldStyle(.roundedBorder)
 
-            if model.isBusy {
+            if activeIsBusy {
                 Button {
-                    model.stop()
+                    Task { await stopActiveConversation() }
                 } label: {
                     Image(systemName: "stop.circle.fill")
                         .font(.title2)
@@ -192,7 +245,7 @@ struct ChatView: View {
                 Button {
                     let text = prompt
                     prompt = ""
-                    Task { await model.send(prompt: text, settings: settings) }
+                    Task { await send(text) }
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
@@ -206,109 +259,62 @@ struct ChatView: View {
         .padding(.horizontal)
         .padding(.vertical, 8)
     }
-}
 
-/// A single transcript row.
-private struct ChatRow: View {
-    let item: ChatItem
+    private func send(_ text: String) async {
+        switch settings.backend {
+        case .companionClaude:
+            await companionModel.send(
+                prompt: text,
+                projectRoot: settings.daemonProjectRoot
+            )
+        case .codex:
+            await model.send(prompt: text, settings: settings)
+        }
+    }
 
-    var body: some View {
-        switch item.kind {
-        case .user:
-            HStack {
-                Spacer(minLength: 40)
-                Text(item.text)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color.accentColor.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-            }
-        case .assistant:
-            Text(item.text)
-                .textSelection(.enabled)
-        case .thinking:
-            DisclosureGroup("Thinking") {
-                Text(item.text)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-        case .status:
-            Text(item.text)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        case .error:
-            Label(item.text, systemImage: "exclamationmark.triangle")
-                .font(.footnote)
-                .foregroundStyle(.red)
-        case .tool:
-            if let tool = item.tool {
-                ToolCallCard(tool: tool)
-            }
+    private func retryActiveConversation() async {
+        switch settings.backend {
+        case .companionClaude:
+            await companionModel.retry()
+        case .codex:
+            await model.retry()
+        }
+    }
+
+    private func stopActiveConversation() async {
+        switch settings.backend {
+        case .companionClaude:
+            await companionModel.stop()
+        case .codex:
+            model.stop()
+        }
+    }
+
+    private func resetActiveConversation() async {
+        switch settings.backend {
+        case .companionClaude:
+            await companionModel.reset()
+        case .codex:
+            model.reset()
+        }
+    }
+
+    private func normalizeBackendSelection() {
+        let available = ChatBackend.available(
+            companionAvailable: companionModel.isAvailable,
+            codexAvailable: client.codexAccount != nil
+        )
+        guard !available.contains(settings.backend),
+              let fallback = available.first else {
+            return
+        }
+        settings.backend = fallback
+        if fallback == .codex, settings.model.isEmpty {
+            settings.model = client.defaultCodexModel
         }
     }
 }
 
-/// Card for one tool invocation: name, target, and expandable result.
-private struct ToolCallCard: View {
-    let tool: ToolCallInfo
-    @State private var expanded = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                statusIcon
-                Text(tool.name)
-                    .font(.subheadline.weight(.medium))
-                if !tool.inputSummary.isEmpty {
-                    Text(tool.inputSummary)
-                        .font(.subheadline.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer(minLength: 0)
-            }
-            if expanded, let result = tool.result {
-                Text(result)
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(tool.isError ? .red : .secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(20)
-            }
-        }
-        .padding(10)
-        .background(.quaternary.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            guard tool.result != nil else { return }
-            withAnimation(.easeInOut(duration: 0.15)) {
-                expanded.toggle()
-            }
-        }
-    }
-
-    @ViewBuilder private var statusIcon: some View {
-        if tool.isRunning {
-            ProgressView()
-                .controlSize(.small)
-        } else if tool.isError {
-            Image(systemName: "xmark.circle.fill")
-                .foregroundStyle(.red)
-        } else {
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-        }
-    }
-}
-
-/// Provider, credential, model, and effort settings for the chat session.
-/// Changing anything starts a new session (the engine conversation is bound
-/// to its settings), so the transcript resets on the next send.
 #Preview {
     ChatView()
 }

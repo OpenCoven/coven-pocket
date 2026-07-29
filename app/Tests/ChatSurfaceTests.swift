@@ -9,6 +9,68 @@ final class ChatSurfaceTests: XCTestCase {
         return url
     }
 
+    func testChatSettingsDefaultToCompanionWithoutAnAPIKey() {
+        let settings = ChatSettings()
+        XCTAssertEqual(settings.backend, .companionClaude)
+        XCTAssertEqual(settings.model, "")
+        XCTAssertEqual(settings.daemonProjectRoot, "")
+    }
+
+    func testBackendChoicesGateCompanionOnVerifiedAvailability() {
+        XCTAssertEqual(
+            ChatBackend.available(companionAvailable: false, codexAvailable: true),
+            [.codex]
+        )
+        XCTAssertEqual(
+            ChatBackend.available(companionAvailable: true, codexAvailable: true),
+            [.companionClaude, .codex]
+        )
+        XCTAssertEqual(
+            ChatBackend.available(companionAvailable: true, codexAvailable: false),
+            [.companionClaude]
+        )
+        XCTAssertTrue(
+            ChatBackend.available(companionAvailable: false, codexAvailable: false).isEmpty
+        )
+    }
+
+    func testCompanionChatHasNoPTYApprovalControls() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let files = [
+            "Sources/Support/CompanionChatModel.swift",
+            "Sources/Views/ChatView.swift"
+        ]
+        let source = try files
+            .map { try String(contentsOf: root.appendingPathComponent($0), encoding: .utf8) }
+            .joined(separator: "\n")
+
+        XCTAssertFalse(source.contains("companionApprovalBar"))
+        XCTAssertFalse(source.contains("func approve()"))
+        XCTAssertFalse(source.contains("func deny()"))
+        XCTAssertFalse(source.contains("sendControl"))
+    }
+
+    func testChatSurfaceHasNoAnthropicAPIKeyUIOrKeychainRead() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let files = [
+            "Sources/Support/ChatTypes.swift",
+            "Sources/Views/ChatView.swift",
+            "Sources/Views/ChatSettingsView.swift"
+        ]
+        let source = try files
+            .map { try String(contentsOf: root.appendingPathComponent($0), encoding: .utf8) }
+            .joined(separator: "\n")
+
+        XCTAssertFalse(source.contains("anthropic-api-key"))
+        XCTAssertFalse(source.contains("Anthropic API key"))
+        XCTAssertFalse(source.contains("settings.apiKey"))
+        XCTAssertTrue(source.contains("Claude via Companion"))
+    }
+
     func testStartChatCreatesIdleSession() throws {
         let engine = PocketEngine()
         let workspace = try makeWorkspace()

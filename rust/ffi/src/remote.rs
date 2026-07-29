@@ -25,9 +25,9 @@ pub struct RemoteSession {
     pub updated_at: String,
 }
 
-/// One redacted event row from the session event ledger. `payload_json`
-/// is a stream-json frame (`system` / `user` / `assistant` / `tool_result`
-/// / `output` / `result`); the app parses what it renders.
+/// One redacted event row from the session event ledger. For `output`
+/// rows, `payload_json.data` contains a raw stdout chunk that may split
+/// stream-json frames across rows; the app reassembles what it renders.
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct RemoteEvent {
     pub seq: i64,
@@ -44,6 +44,38 @@ pub struct RemoteEventBatch {
     /// when the page was empty.
     pub next_after_seq: i64,
     pub has_more: bool,
+}
+
+/// Launch a long-lived Claude stream session on the paired daemon.
+pub(crate) async fn launch(
+    host: &str,
+    port: u16,
+    project_root: &str,
+    prompt: &str,
+    title: &str,
+    timeout: Duration,
+) -> Result<RemoteSession, PocketError> {
+    let payload = serde_json::json!({
+        "projectRoot": project_root,
+        "cwd": project_root,
+        "harness": "claude",
+        "prompt": prompt,
+        "title": title,
+        "launchMode": "stream",
+    })
+    .to_string();
+    let body = request(
+        host,
+        port,
+        "POST",
+        "/api/v1/sessions",
+        Some(&payload),
+        timeout,
+    )
+    .await?;
+    let row: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| daemon_shape_error("launched session", error))?;
+    Ok(session_from(&row))
 }
 
 /// List sessions on the daemon, newest first as the daemon returns them.
@@ -308,6 +340,63 @@ mod tests {
         assert_eq!(rows[0].harness, "codex");
         assert_eq!(rows[0].status, "running");
         assert_eq!(rows[0].project_root, "/w");
+    }
+
+    #[tokio::test]
+    async fn launches_claude_stream_session_with_explicit_host_root() {
+        let (port, rx) = serve_once(
+            "HTTP/1.1 201 Created",
+            r#"{"id":"s-claude","project_root":"/srv/repo","harness":"claude",
+                "title":"Fix tests","status":"running",
+                "created_at":"2026-07-29T00:00:00Z",
+                "updated_at":"2026-07-29T00:00:00Z"}"#,
+        )
+        .await;
+
+        let session = launch(
+            "127.0.0.1",
+            port,
+            "/srv/repo",
+            "Fix tests",
+            "Fix tests",
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.id, "s-claude");
+        assert_eq!(session.harness, "claude");
+        assert_eq!(session.project_root, "/srv/repo");
+
+        let request = rx.await.unwrap();
+        assert!(
+            request.starts_with("POST /api/v1/sessions HTTP/1.1"),
+            "got: {request}"
+        );
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["projectRoot"], "/srv/repo");
+        assert_eq!(payload["cwd"], "/srv/repo");
+        assert_eq!(payload["harness"], "claude");
+        assert_eq!(payload["prompt"], "Fix tests");
+        assert_eq!(payload["title"], "Fix tests");
+        assert_eq!(payload["launchMode"], "stream");
+        assert!(payload.get("apiKey").is_none());
+    }
+
+    #[tokio::test]
+    async fn launch_surfaces_the_daemon_auth_failure_without_fallback() {
+        let (port, _rx) = serve_once(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":{"code":"launch_failed","message":"claude is not signed in"}}"#,
+        )
+        .await;
+
+        let error = launch("127.0.0.1", port, "/srv/repo", "hello", "hello", TIMEOUT)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("claude is not signed in"));
     }
 
     #[tokio::test]

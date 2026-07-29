@@ -74,7 +74,7 @@ enum IntentActions {
 struct AskCovenIntent: AppIntent {
     static let title: LocalizedStringResource = "Ask the Agent"
     static let description = IntentDescription(
-        "Send a prompt to the on-device coding agent, optionally in a specific workspace."
+        "Send a prompt to the coding agent. Optional iOS workspaces apply to on-device Codex."
     )
     static let openAppWhenRun = true
 
