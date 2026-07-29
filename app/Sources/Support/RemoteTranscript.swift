@@ -18,13 +18,30 @@ struct RemoteTranscriptItem: Identifiable, Equatable {
 /// Pure mapping from daemon event rows to transcript items. Static so
 /// tests can drive it with fixture payloads; no networking in here.
 enum RemoteTranscript {
+    enum ResultSemantics: Equatable {
+        case session
+        case turn
+    }
+
     /// Build display items from the full accumulated event list.
     /// Consecutive `output` frames merge into one terminal block, since
     /// PTY chunk boundaries are arbitrary.
-    static func items(from events: [RemoteEvent]) -> [RemoteTranscriptItem] {
+    static func items(
+        from events: [RemoteEvent],
+        resultSemantics: ResultSemantics = .session
+    ) -> [RemoteTranscriptItem] {
         var items: [RemoteTranscriptItem] = []
         for event in events {
             guard let payload = parse(event.payloadJson) else { continue }
+            if event.kind == "input" {
+                append(
+                    &items,
+                    id: event.seq,
+                    role: .user,
+                    text: payload["data"] as? String ?? ""
+                )
+                continue
+            }
             switch payload["type"] as? String {
             case "user":
                 append(&items, id: event.seq, role: .user, text: messageText(payload))
@@ -39,7 +56,12 @@ enum RemoteTranscript {
             case "output":
                 appendTerminal(&items, id: event.seq, payload: payload)
             case "system", "result":
-                appendStatus(&items, id: event.seq, payload: payload)
+                appendStatus(
+                    &items,
+                    id: event.seq,
+                    payload: payload,
+                    resultSemantics: resultSemantics
+                )
             default:
                 continue
             }
@@ -63,7 +85,10 @@ enum RemoteTranscript {
     }
 
     private static func appendStatus(
-        _ items: inout [RemoteTranscriptItem], id: Int64, payload: [String: Any]
+        _ items: inout [RemoteTranscriptItem],
+        id: Int64,
+        payload: [String: Any],
+        resultSemantics: ResultSemantics
     ) {
         switch payload["type"] as? String {
         case "system":
@@ -75,9 +100,13 @@ enum RemoteTranscript {
             )
         case "result":
             let isError = payload["is_error"] as? Bool ?? false
+            let successText = resultSemantics == .turn ? "Turn complete" : "Session finished"
+            let errorText = resultSemantics == .turn
+                ? "Turn finished with an error"
+                : "Session finished with an error"
             append(
                 &items, id: id, role: .status,
-                text: isError ? "Session finished with an error" : "Session finished"
+                text: isError ? errorText : successText
             )
         default:
             return

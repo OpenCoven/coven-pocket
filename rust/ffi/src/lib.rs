@@ -450,6 +450,28 @@ impl PocketEngine {
         .await
     }
 
+    /// Launch Claude through the paired daemon's host-side CLI login.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remote_launch_session(
+        &self,
+        host: String,
+        port: u16,
+        project_root: String,
+        prompt: String,
+        title: String,
+        timeout_ms: u32,
+    ) -> Result<RemoteSession, PocketError> {
+        remote::launch(
+            &host,
+            port,
+            &project_root,
+            &prompt,
+            &title,
+            millis(timeout_ms),
+        )
+        .await
+    }
+
     /// List sessions on the paired daemon. Callers gate on a verified
     /// pairing first; this is plain transport.
     pub async fn remote_sessions(

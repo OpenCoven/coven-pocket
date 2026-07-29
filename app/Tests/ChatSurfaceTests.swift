@@ -9,6 +9,32 @@ final class ChatSurfaceTests: XCTestCase {
         return url
     }
 
+    func testChatSettingsDefaultToCompanionWithoutAnAPIKey() {
+        let settings = ChatSettings()
+        XCTAssertEqual(settings.backend, .companionClaude)
+        XCTAssertEqual(settings.model, "")
+        XCTAssertEqual(settings.daemonProjectRoot, "")
+    }
+
+    func testChatSurfaceHasNoAnthropicAPIKeyUIOrKeychainRead() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let files = [
+            "Sources/Support/ChatTypes.swift",
+            "Sources/Views/ChatView.swift",
+            "Sources/Views/ChatSettingsView.swift"
+        ]
+        let source = try files
+            .map { try String(contentsOf: root.appendingPathComponent($0), encoding: .utf8) }
+            .joined(separator: "\n")
+
+        XCTAssertFalse(source.contains("anthropic-api-key"))
+        XCTAssertFalse(source.contains("Anthropic API key"))
+        XCTAssertFalse(source.contains("settings.apiKey"))
+        XCTAssertTrue(source.contains("Claude via Companion"))
+    }
+
     func testStartChatCreatesIdleSession() throws {
         let engine = PocketEngine()
         let workspace = try makeWorkspace()

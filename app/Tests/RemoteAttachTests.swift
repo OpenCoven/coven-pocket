@@ -64,6 +64,33 @@ final class RemoteAttachTests: XCTestCase {
         XCTAssertEqual(items[4].role, .status)
     }
 
+    func testStreamResultMeansTurnCompleteWithoutChangingOneShotCopy() {
+        let events = [
+            event(
+                seq: 1,
+                kind: "result",
+                payload: #"{"type":"result","subtype":"success","is_error":false}"#
+            )
+        ]
+
+        XCTAssertEqual(RemoteTranscript.items(from: events)[0].text, "Session finished")
+        XCTAssertEqual(
+            RemoteTranscript.items(from: events, resultSemantics: .turn)[0].text,
+            "Turn complete"
+        )
+    }
+
+    func testDaemonInputEventsRenderAsUserTurns() {
+        let events = [
+            event(seq: 10, kind: "input", payload: #"{"data":"follow up"}"#)
+        ]
+
+        let items = RemoteTranscript.items(from: events, resultSemantics: .turn)
+
+        XCTAssertEqual(items.map(\.role), [.user])
+        XCTAssertEqual(items.map(\.text), ["follow up"])
+    }
+
     func testConsecutiveOutputFramesMergeIntoOneTerminalBlock() {
         let events = [
             event(seq: 1, kind: "output", payload: #"{"type":"output","text":"$ cargo te"}"#),

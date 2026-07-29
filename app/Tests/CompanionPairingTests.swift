@@ -84,6 +84,21 @@ final class CompanionPairingTests: XCTestCase {
         XCTAssertEqual(model.pairing?.host, "mac")
     }
 
+    func testReloadPairingObservesAnotherModelsPairingChange() {
+        let store = InMemoryPairingStore()
+        let staleModel = makeModel(store: store)
+        let pairing = DaemonPairing(
+            host: "mac", port: 7777,
+            apiVersion: "coven.daemon.v1", covenVersion: "0.3.0",
+            pid: 1, startedAt: "x", pairedAt: Date()
+        )
+        store.stored = pairing
+
+        staleModel.reloadPairing()
+
+        XCTAssertEqual(staleModel.pairing, pairing)
+    }
+
     func testPairingRoundTripsThroughKeychain() throws {
         let keychainStore = KeychainPairingStore()
         defer { keychainStore.clear() }

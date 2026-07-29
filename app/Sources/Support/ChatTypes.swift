@@ -1,12 +1,22 @@
 import Foundation
 
-/// Settings a chat session is bound to. Changing any of them requires a new
-/// engine session (the transcript restarts).
+enum ChatBackend: String, CaseIterable, Hashable {
+    case companionClaude
+    case codex
+
+    var label: String {
+        switch self {
+        case .companionClaude: return "Claude via Companion"
+        case .codex: return "Codex"
+        }
+    }
+}
+
+/// Backend-specific settings for the Chat surface.
 struct ChatSettings: Equatable {
-    var provider: PocketProvider = .anthropic
-    var apiKey: String = ""
+    var backend: ChatBackend = .companionClaude
     var model: String = ""
-    var effort: String = "medium"
+    var daemonProjectRoot: String = ""
 }
 
 /// Answer sink for one approval request. `ChatPermissionResponder` conforms;

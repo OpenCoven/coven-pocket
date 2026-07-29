@@ -170,10 +170,10 @@ final class ChatModel: ObservableObject {
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         items = []
         let fresh = try engine.startChat(
-            provider: settings.provider,
-            apiKey: settings.apiKey,
+            provider: .codex,
+            apiKey: "",
             model: settings.model,
-            effort: settings.effort,
+            effort: nil,
             workspaceDir: workspace.path,
             permissionMode: permissionMode,
             storageDir: Self.sessionStoreURL.path,
@@ -202,10 +202,10 @@ final class ChatModel: ObservableObject {
                 at: workspace, withIntermediateDirectories: true
             )
             let resumed = try await engine.resumeChat(
-                provider: settings.provider,
-                apiKey: settings.apiKey,
+                provider: .codex,
+                apiKey: "",
                 model: settings.model,
-                effort: settings.effort,
+                effort: nil,
                 workspaceDir: workspace.path,
                 permissionMode: permissionMode,
                 storageDir: Self.sessionStoreURL.path,
