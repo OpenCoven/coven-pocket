@@ -81,8 +81,9 @@ extension CompanionChatModel {
                 pairing: verified,
                 generation: generation
             )
-        } else if activeSession != nil {
+        } else if let activeSession {
             await discardSessionForSupersededPairingIfNeeded(
+                activeSession,
                 pairing: verified,
                 generation: generation
             )
@@ -134,6 +135,7 @@ extension CompanionChatModel {
         generation: UInt64
     ) async {
         if session?.id == launched.id {
+            guard sessionVerifiedPairing == pairing else { return }
             abandonSession()
             prepareForNewSession()
         }
@@ -166,10 +168,23 @@ extension CompanionChatModel {
         pairing verified: VerifiedPairing,
         generation: UInt64
     ) async {
+        guard let activeSession = session else { return }
+        await discardSessionForSupersededPairingIfNeeded(
+            activeSession,
+            pairing: verified,
+            generation: generation
+        )
+    }
+
+    func discardSessionForSupersededPairingIfNeeded(
+        _ activeSession: RemoteSession,
+        pairing verified: VerifiedPairing,
+        generation: UInt64
+    ) async {
         guard generation == operationGeneration,
               !Task.isCancelled,
               !isVerifiedPairingCurrent(verified),
-              let activeSession = session else { return }
+              session?.id == activeSession.id else { return }
         abandonSession()
         pairing = nil
         await cleanupReturnedLaunch(

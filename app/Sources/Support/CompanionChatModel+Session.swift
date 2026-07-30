@@ -38,12 +38,12 @@ extension CompanionChatModel {
         )
         var launchedSession: RemoteSession?
         if !reusedSession {
-            try await prepareAndLaunch(
+            guard let launched = try await prepareAndLaunch(
                 context: context,
                 pairing: verified,
                 generation: generation
-            )
-            launchedSession = session
+            ) else { return }
+            launchedSession = launched
         }
         await finalizeSendIfCurrent(
             context: context,
@@ -66,6 +66,16 @@ extension CompanionChatModel {
             launchedSession: launchedSession,
             activeSession: nil
         )) else { return }
+        if let launchedSession,
+           session?.id != launchedSession.id
+            || sessionVerifiedPairing != verified {
+            await discardAdoptedLaunch(
+                launchedSession,
+                pairing: verified,
+                generation: generation
+            )
+            return
+        }
         await finalizeSend(
             verified,
             generation: generation,
@@ -213,7 +223,7 @@ extension CompanionChatModel {
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
         generation: UInt64
-    ) async throws {
+    ) async throws -> RemoteSession? {
         prepareForNewSession()
         guard !(await finishInvalidatedSendIfNeeded(
             context: context,
@@ -221,7 +231,7 @@ extension CompanionChatModel {
             pairing: verified,
             launchedSession: nil,
             activeSession: nil
-        )) else { return }
+        )) else { return nil }
         let launched: RemoteSession
         do {
             launched = try await requestLaunch(
@@ -233,7 +243,7 @@ extension CompanionChatModel {
                 context: context,
                 pairing: verified,
                 generation: generation
-            ) else { return }
+            ) else { return nil }
             throw error
         }
         if await discardReturnedLaunchIfNeeded(
@@ -242,26 +252,27 @@ extension CompanionChatModel {
             context: context,
             generation: generation
         ) {
-            return
+            return nil
         }
         guard try await confirmLaunchedFamiliar(
             launched,
             context: context,
             pairing: verified,
             generation: generation
-        ) else { return }
+        ) else { return nil }
         guard !(await finishInvalidatedSendIfNeeded(
             context: context,
             generation: generation,
             pairing: verified,
             launchedSession: launched,
             activeSession: nil
-        )) else { return }
+        )) else { return nil }
         adoptLaunchedSession(
             launched,
             context: context,
             pairing: verified
         )
+        return launched
     }
 
     func requestLaunch(

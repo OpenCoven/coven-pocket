@@ -38,6 +38,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     var killChecksCancellation = false
     var launchError: FakeCompanionError?
     var launchedProjectRoot: String?
+    var launchResponseID = "session-1"
     var echoesRequestedFamiliarID = true
     var launchResponseFamiliarID: String?
     var suspendsEvents = false
@@ -50,6 +51,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     let gateRequested = XCTestExpectation(description: "session gate requested")
     let secondGateRequested = XCTestExpectation(description: "second session gate requested")
     let launchRequested = XCTestExpectation(description: "session launch requested")
+    let secondLaunchRequested = XCTestExpectation(description: "second session launch requested")
     let sendInputRequested = XCTestExpectation(description: "session input requested")
     let killRequested = XCTestExpectation(description: "session kill requested")
     private var eventsContinuation: CheckedContinuation<RemoteEventBatch, Never>?
@@ -60,6 +62,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     private var sendInputContinuation: CheckedContinuation<Void, Never>?
     private var killContinuation: CheckedContinuation<Void, Never>?
     private var suspendedLaunchFamiliarID: String?
+    private var launchCallCount = 0
 
     init(gate: CompanionModel.SessionGate) {
         self.gate = gate
@@ -93,6 +96,10 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         title: String,
         familiarID: String?
     ) async throws -> RemoteSession {
+        launchCallCount += 1
+        if launchCallCount == 2 {
+            secondLaunchRequested.fulfill()
+        }
         launchedPrompts.append(prompt)
         launchedFamiliarIDs.append(familiarID)
         launchedPairings.append(pairing)
@@ -108,6 +115,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             throw launchError
         }
         return remoteSession(
+            id: launchResponseID,
             title: title,
             projectRoot: launchedProjectRoot ?? projectRoot,
             familiarID: responseFamiliarID(for: familiarID)
