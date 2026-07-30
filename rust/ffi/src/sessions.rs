@@ -155,6 +155,105 @@ impl CheckedStorage {
         Self::open_path(PathBuf::from(storage_dir), storage_dir)
     }
 
+    fn validate_existing_root_component(path: &Path) -> Result<(), PocketError> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|err| {
+            persistence_err(
+                path,
+                format!("cannot inspect configured storage root component: {err}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(persistence_err(
+                path,
+                "configured storage root component is a symlink",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(persistence_err(
+                path,
+                "configured storage root component is not a directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn walk_root_components(root: &Path, create_missing: bool) -> Result<(), PocketError> {
+        let mut current = PathBuf::new();
+        let mut has_validated_parent = false;
+
+        for component in root.components() {
+            match component {
+                std::path::Component::Prefix(_) => {
+                    current.push(component.as_os_str());
+                    if current.has_root() {
+                        Self::validate_existing_root_component(&current)?;
+                        has_validated_parent = true;
+                    }
+                }
+                std::path::Component::RootDir => {
+                    current.push(component.as_os_str());
+                    Self::validate_existing_root_component(&current)?;
+                    has_validated_parent = true;
+                }
+                std::path::Component::Normal(component) => {
+                    if !has_validated_parent {
+                        return Err(persistence_err(
+                            &current,
+                            "configured storage root component has no validated absolute parent",
+                        ));
+                    }
+                    current.push(component);
+                    match std::fs::symlink_metadata(&current) {
+                        Ok(_) => Self::validate_existing_root_component(&current)?,
+                        Err(err)
+                            if create_missing && err.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            let parent = current.parent().ok_or_else(|| {
+                                persistence_err(
+                                    &current,
+                                    "configured storage root component has no parent",
+                                )
+                            })?;
+                            Self::validate_existing_root_component(parent)?;
+                            match std::fs::create_dir(&current) {
+                                Ok(()) => {}
+                                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                                Err(err) => {
+                                    return Err(persistence_err(
+                                        &current,
+                                        format!(
+                                            "cannot create configured storage root component: {err}"
+                                        ),
+                                    ));
+                                }
+                            }
+                            Self::validate_existing_root_component(&current)?;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(persistence_err(
+                                &current,
+                                "configured storage root component is missing",
+                            ));
+                        }
+                        Err(err) => {
+                            return Err(persistence_err(
+                                &current,
+                                format!("cannot inspect configured storage root component: {err}"),
+                            ));
+                        }
+                    }
+                }
+                std::path::Component::CurDir | std::path::Component::ParentDir => {
+                    return Err(persistence_err(
+                        root,
+                        "configured storage root contains a non-normal component",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn open_path(root: PathBuf, display_path: &str) -> Result<Self, PocketError> {
         if !root.is_absolute() {
             return Err(PocketError::Engine {
@@ -162,40 +261,8 @@ impl CheckedStorage {
             });
         }
         let root = normalize_storage_root(&root)?;
-        match std::fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(persistence_err(
-                    &root,
-                    "configured storage root is a symlink",
-                ));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(persistence_err(
-                    &root,
-                    "configured storage root is not a directory",
-                ));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(&root)
-                    .map_err(|create_err| engine_err("cannot create storage dir", create_err))?;
-            }
-            Err(err) => return Err(engine_err("cannot inspect storage dir", err)),
-        }
-        let metadata = std::fs::symlink_metadata(&root)
-            .map_err(|err| engine_err("cannot inspect created storage dir", err))?;
-        if metadata.file_type().is_symlink() {
-            return Err(persistence_err(
-                &root,
-                "configured storage root is a symlink",
-            ));
-        }
-        if !metadata.is_dir() {
-            return Err(persistence_err(
-                &root,
-                "configured storage root is not a directory",
-            ));
-        }
+        Self::walk_root_components(&root, true)?;
+        Self::walk_root_components(&root, false)?;
         let canonical_root = std::fs::canonicalize(&root)
             .map_err(|err| engine_err("cannot canonicalize storage dir", err))?;
         let storage = Self {
@@ -216,17 +283,7 @@ impl CheckedStorage {
     }
 
     fn validate_root(&self) -> Result<(), PocketError> {
-        let metadata = std::fs::symlink_metadata(&self.root)
-            .map_err(|err| engine_err("cannot inspect storage root", err))?;
-        if metadata.file_type().is_symlink() {
-            return Err(persistence_err(&self.root, "storage root became a symlink"));
-        }
-        if !metadata.is_dir() {
-            return Err(persistence_err(
-                &self.root,
-                "storage root is not a directory",
-            ));
-        }
+        Self::walk_root_components(&self.root, false)?;
         let canonical = std::fs::canonicalize(&self.root)
             .map_err(|err| engine_err("cannot canonicalize storage root", err))?;
         if canonical != self.root {
@@ -2469,6 +2526,106 @@ mod tests {
 
         remove_symlink_if_present(&storage);
         std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_root_intermediate_symlink_to_missing_store_is_rejected_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = test_storage("unsafe-intermediate-root-link");
+        let alias = parent.join("alias");
+        let (external, sentinel) = external_sentinel("unsafe-intermediate-root-target");
+        symlink(&external, &alias).unwrap();
+        let configured = alias.join("store");
+
+        let result = list_sessions(&configured.display().to_string()).await;
+        let sentinel_contents = std::fs::read(&sentinel).unwrap();
+        let external_entries = std::fs::read_dir(&external)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+
+        remove_symlink_if_present(&alias);
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+
+        assert_eq!(sentinel_contents, EXTERNAL_SENTINEL);
+        assert_eq!(
+            external_entries,
+            [sentinel.file_name().unwrap().to_os_string()],
+            "storage root or index was created through {}",
+            alias.display()
+        );
+        assert_unsafe_storage_path(result, &alias, "symlink");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_root_intermediate_symlink_to_existing_store_is_rejected_before_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let parent = test_storage("unsafe-existing-intermediate-root-link");
+        let alias = parent.join("alias");
+        let external = test_storage("unsafe-existing-intermediate-root-target");
+        let target_store = external.join("store");
+        std::fs::create_dir(&target_store).unwrap();
+        let sentinel = target_store.join("sentinel");
+        std::fs::write(&sentinel, EXTERNAL_SENTINEL).unwrap();
+        symlink(&external, &alias).unwrap();
+        let configured = alias.join("store");
+
+        let result = list_sessions(&configured.display().to_string()).await;
+        let sentinel_contents = std::fs::read(&sentinel).unwrap();
+        let store_entries = std::fs::read_dir(&target_store)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+
+        remove_symlink_if_present(&alias);
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+
+        assert_eq!(sentinel_contents, EXTERNAL_SENTINEL);
+        assert_eq!(
+            store_entries,
+            [sentinel.file_name().unwrap().to_os_string()],
+            "storage artifacts were created through {}",
+            alias.display()
+        );
+        assert_unsafe_storage_path(result, &alias, "symlink");
+    }
+
+    #[tokio::test]
+    async fn storage_root_missing_nested_components_are_created_and_usable() {
+        let parent = test_storage("missing-nested-storage-root");
+        let configured = parent.join("one").join("two").join("store");
+
+        let sessions = list_sessions(&configured.display().to_string())
+            .await
+            .unwrap();
+
+        assert!(sessions.is_empty());
+        for directory in [
+            parent.join("one"),
+            parent.join("one").join("two"),
+            configured.clone(),
+        ] {
+            let metadata = std::fs::symlink_metadata(&directory).unwrap();
+            assert!(
+                metadata.is_dir(),
+                "{} was not a directory",
+                directory.display()
+            );
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "{} was a symlink",
+                directory.display()
+            );
+        }
+        assert!(configured.join("index.sqlite").is_file());
+
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

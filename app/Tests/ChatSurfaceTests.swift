@@ -176,6 +176,37 @@ final class ChatSurfaceTests: XCTestCase {
         return url
     }
 
+    @MainActor
+    func testSessionStoreURLResolvesApplicationSupportAliasBeforeAppendingLeaf() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("session-store-url-\(UUID().uuidString)", isDirectory: true)
+        let applicationSupport = root
+            .appendingPathComponent("real", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+        let alias = root.appendingPathComponent("application-support-alias", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: applicationSupport,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: alias,
+            withDestinationURL: applicationSupport
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = ChatModel.sessionStoreURL(applicationSupportBase: alias)
+        let canonicalParent = applicationSupport
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+
+        XCTAssertEqual(store.deletingLastPathComponent(), canonicalParent)
+        XCTAssertEqual(
+            store,
+            canonicalParent.appendingPathComponent("chat-sessions", isDirectory: true)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.path))
+    }
+
     func testChatSettingsDefaultToCompanionWithoutAnAPIKey() {
         let settings = ChatSettings()
         XCTAssertEqual(settings.backend, .companionClaude)

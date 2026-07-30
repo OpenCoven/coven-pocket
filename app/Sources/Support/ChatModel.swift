@@ -137,7 +137,19 @@ final class ChatModel: ObservableObject {
     /// Where transcripts and the session index live: app data, not user
     /// documents, so it stays out of the Files app.
     static var sessionStoreURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        sessionStoreURL(
+            applicationSupportBase: FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            )[0]
+        )
+    }
+
+    static func sessionStoreURL(applicationSupportBase: URL) -> URL {
+        applicationSupportBase
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
             .appendingPathComponent("chat-sessions", isDirectory: true)
     }
 
