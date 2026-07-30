@@ -23,6 +23,7 @@ final class CompanionChatModel: ObservableObject {
     let client: any CompanionSessionClient
     var pairing: DaemonPairing?
     var session: RemoteSession?
+    var sessionProjectRoot: String?
     var accumulatedEvents: [RemoteEvent] = []
     var retryPrompt: String?
     var retryProjectRoot = ""
@@ -261,6 +262,7 @@ extension CompanionChatModel {
         pollTask = nil
         pairing = nil
         session = nil
+        sessionProjectRoot = nil
         accumulatedEvents = []
         cursor = 0
         lastCompletedResultSeq = 0

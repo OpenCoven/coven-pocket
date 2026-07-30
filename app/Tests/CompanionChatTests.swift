@@ -273,6 +273,26 @@ final class CompanionChatHardeningStreamTests: XCTestCase {
         XCTAssertEqual(client.launchedPrompts, ["first", "second"])
     }
 
+    func testCanonicalDaemonRootDoesNotRestartFollowUp() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.launchedProjectRoot = "/srv/repo"
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/repo/")
+        model.apply(events: [
+            RemoteEvent(
+                seq: 1,
+                kind: "result",
+                payloadJson: #"{"type":"result","is_error":false}"#,
+                createdAt: "t"
+            )
+        ])
+
+        await model.send(prompt: "second", projectRoot: "/srv/repo/")
+
+        XCTAssertEqual(client.launchedPrompts, ["first"])
+        XCTAssertEqual(client.sentInputs, ["second"])
+    }
+
     func testDaemonRestartLaunchesAFreshSession() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         let model = CompanionChatModel(client: client)

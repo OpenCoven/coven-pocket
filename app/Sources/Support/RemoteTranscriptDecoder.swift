@@ -117,7 +117,9 @@ private extension RemoteTranscriptDecoder {
 
     mutating func appendTerminal(id: Int64, text rawText: String) {
         let text = RemoteTranscript.cleanTerminalText(rawText)
-        guard !text.isEmpty else { return }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
         if let last = items.last, last.role == .terminal {
             items[items.count - 1] = RemoteTranscriptItem(
                 identity: last.id,
@@ -125,7 +127,16 @@ private extension RemoteTranscriptDecoder {
                 text: Self.mergeTerminal(last.text, text)
             )
         } else {
-            append(id: id, role: .terminal, text: text)
+            items.append(
+                RemoteTranscriptItem(
+                    identity: RemoteTranscriptItem.Identity(
+                        eventSequence: id,
+                        ordinal: items.count
+                    ),
+                    role: .terminal,
+                    text: text
+                )
+            )
         }
     }
 

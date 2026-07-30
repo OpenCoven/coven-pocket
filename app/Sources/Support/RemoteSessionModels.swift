@@ -129,7 +129,7 @@ final class RemoteAttachModel: ObservableObject {
             ? nil
             : RemoteTranscript.approvalPrompt(in: items)
         finished = snapshot.sessionEnded
-            || (attachmentMode != .stream && snapshot.latestResultSeq != nil)
+            || (attachmentMode == .pty && snapshot.latestResultSeq != nil)
     }
 
     func send() async {

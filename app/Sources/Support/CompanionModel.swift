@@ -99,6 +99,7 @@ final class CompanionModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let store: PairingStore
+    private var sessionGateGeneration: UInt64 = 0
 
     static let hostKey = "daemon-host"
     static let portKey = "daemon-port"
@@ -177,6 +178,7 @@ final class CompanionModel: ObservableObject {
 
     func confirmPairing() {
         guard let identity = pendingIdentity, let port else { return }
+        sessionGateGeneration &+= 1
         let confirmed = DaemonPairing(
             host: trimmedHost,
             port: port,
@@ -187,7 +189,15 @@ final class CompanionModel: ObservableObject {
             pairedAt: Date()
         )
         store.save(confirmed)
-        pairing = confirmed
+        if let persisted = store.load(),
+           persisted.host == confirmed.host,
+           persisted.port == confirmed.port,
+           persisted.pid == confirmed.pid,
+           persisted.startedAt == confirmed.startedAt {
+            pairing = persisted
+        } else {
+            pairing = confirmed
+        }
         pendingIdentity = nil
         status = .idle
     }
@@ -197,6 +207,7 @@ final class CompanionModel: ObservableObject {
     }
 
     func unpair() {
+        sessionGateGeneration &+= 1
         store.clear()
         pairing = nil
         status = .idle
@@ -205,6 +216,7 @@ final class CompanionModel: ObservableObject {
     /// Refresh the in-memory snapshot after another model changes the shared
     /// Keychain pairing.
     func reloadPairing() {
+        sessionGateGeneration &+= 1
         pairing = store.load()
     }
 
@@ -225,12 +237,29 @@ final class CompanionModel: ObservableObject {
     /// pairing so a swapped or downgraded daemon cannot slip past it. The
     /// stored identity refreshes on success (daemon restarts are normal).
     func gateForSessionTraffic() async -> SessionGate {
+        sessionGateGeneration &+= 1
+        let generation = sessionGateGeneration
         guard var current = pairing else { return .notPaired }
         let result = await engine.handshakeDaemon(
             host: current.host,
             port: current.port,
             timeoutMs: Self.probeTimeoutMs
         )
+        let stored = store.load()
+        guard generation == sessionGateGeneration,
+              pairing?.host == current.host,
+              pairing?.port == current.port,
+              pairing?.pairedAt == current.pairedAt,
+              stored?.host == current.host,
+              stored?.port == current.port,
+              stored?.pairedAt == current.pairedAt,
+              stored?.pid == current.pid,
+              stored?.startedAt == current.startedAt else {
+            return .blocked(
+                reason: "Pairing check superseded",
+                hint: "Retry with the currently paired daemon."
+            )
+        }
         switch result {
         case let .compatible(identity, _):
             current.covenVersion = identity.covenVersion

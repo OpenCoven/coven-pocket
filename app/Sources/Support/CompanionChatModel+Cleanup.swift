@@ -142,6 +142,7 @@ extension CompanionChatModel {
         let message = error.localizedDescription.lowercased()
         return message.contains("session is not live")
             || message.contains("session is not running")
+            || message.contains("session_not_live")
             || message.contains("session was not found")
             || message.contains("session_not_found")
     }

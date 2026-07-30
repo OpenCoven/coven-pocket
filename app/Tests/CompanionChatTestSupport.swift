@@ -30,6 +30,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     var sendInputError: FakeCompanionError?
     var killError: FakeCompanionError?
     var launchError: FakeCompanionError?
+    var launchedProjectRoot: String?
     var suspendsEvents = false
     var suspendsGate = false
     var suspendsLaunch = false
@@ -77,7 +78,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             harness: "claude",
             title: title,
             status: "running",
-            projectRoot: projectRoot,
+            projectRoot: launchedProjectRoot ?? projectRoot,
             createdAt: "c",
             updatedAt: "u"
         )

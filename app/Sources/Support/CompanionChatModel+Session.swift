@@ -56,7 +56,7 @@ extension CompanionChatModel {
             abandonSession()
             return true
         }
-        guard activeSession.projectRoot != projectRoot else { return true }
+        guard sessionProjectRoot != projectRoot else { return true }
         do {
             try await client.kill(pairing: pairing, sessionID: activeSession.id)
         } catch {
@@ -155,6 +155,7 @@ extension CompanionChatModel {
                 return
             }
             session = launched
+            sessionProjectRoot = projectRoot
             initialPrompt = prompt
             initialPromptID = "companion-initial-\(launched.id)"
             items = [
@@ -257,5 +258,6 @@ extension CompanionChatModel {
         pollTask?.cancel()
         pollTask = nil
         session = nil
+        sessionProjectRoot = nil
     }
 }

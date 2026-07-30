@@ -23,6 +23,32 @@ private func makeIdentity(pid: UInt32 = 31415) -> DaemonIdentity {
 
 @MainActor
 final class CompanionPairingTests: XCTestCase {
+    func testConfirmPublishesPersistedPairingRepresentation() {
+        final class RoundTripStore: PairingStore {
+            var stored: DaemonPairing?
+
+            func load() -> DaemonPairing? { stored }
+
+            func save(_ pairing: DaemonPairing) {
+                guard let data = try? DaemonPairing.encoder.encode(pairing) else {
+                    return
+                }
+                stored = try? DaemonPairing.decoder.decode(DaemonPairing.self, from: data)
+            }
+
+            func clear() {
+                stored = nil
+            }
+        }
+
+        let store = RoundTripStore()
+        let model = makeModel(store: store)
+        model.stage(identity: makeIdentity())
+        model.confirmPairing()
+
+        XCTAssertEqual(model.pairing, store.stored)
+    }
+
     private func makeModel(store: PairingStore) -> CompanionModel {
         let defaults = UserDefaults(suiteName: "pairing-tests-\(UUID().uuidString)")!
         return CompanionModel(defaults: defaults, store: store)

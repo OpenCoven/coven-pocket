@@ -107,6 +107,17 @@ final class RemoteAttachTests: XCTestCase {
         XCTAssertTrue(items[0].text.contains("running 5 tests"))
     }
 
+    func testConsecutiveTerminalFramesPreserveNewlineBoundaries() {
+        let events = [
+            event(seq: 1, kind: "output", payload: #"{"type":"output","text":"line 1\n"}"#),
+            event(seq: 2, kind: "output", payload: #"{"type":"output","text":"line 2\n"}"#)
+        ]
+
+        let items = RemoteTranscript.items(from: events)
+
+        XCTAssertEqual(items.map(\.text), ["line 1\nline 2\n"])
+    }
+
     func testUnknownKindsAndMalformedPayloadsAreSkipped() {
         let events = [
             event(seq: 1, kind: "mystery", payload: #"{"type":"mystery"}"#),
@@ -272,6 +283,26 @@ final class RemoteAttachModelTests: XCTestCase {
         XCTAssertNil(
             RemoteAttachModel.inputData("follow up", mode: .unknown)
         )
+    }
+
+    func testUnknownResultIsTurnCompleteButDoesNotFinishAttachment() {
+        let session = RemoteSession(
+            id: "s-1", harness: "claude", title: "T", status: "running",
+            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+        )
+        let model = RemoteAttachModel(session: session, companion: makeCompanion())
+
+        model.apply(events: [
+            event(
+                seq: 1,
+                kind: "result",
+                payload: #"{"type":"result","is_error":false}"#
+            )
+        ])
+
+        XCTAssertEqual(model.items.map(\.text), ["Turn complete"])
+        XCTAssertFalse(model.finished)
+        XCTAssertFalse(model.acceptsInput)
     }
 
     @MainActor

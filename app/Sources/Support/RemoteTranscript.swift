@@ -96,7 +96,7 @@ enum RemoteTranscript {
         let mode = RemoteAttachmentClassifier.classify(events)
         let decoded = snapshot(
             from: events,
-            resultSemantics: mode == .stream ? .turn : .session
+            resultSemantics: mode == .pty ? .session : .turn
         )
         return Snapshot(
             items: decoded.items,

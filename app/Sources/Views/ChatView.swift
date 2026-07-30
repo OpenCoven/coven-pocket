@@ -301,6 +301,7 @@ private extension ChatView {
     }
 
     private func normalizeBackendSelection() {
+        guard companionModel.availability != .checking else { return }
         let available = ChatBackend.available(
             companionAvailable: companionModel.isAvailable,
             codexAvailable: client.codexAccount != nil
