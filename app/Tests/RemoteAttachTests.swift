@@ -169,7 +169,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testAttachModelDerivesApprovalAndCompletion() {
         let session = RemoteSession(
             id: "s-1", harness: "codex", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
 
@@ -200,7 +201,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testAttachModelDecodesStreamTurnsAndFinishesOnlyOnExit() throws {
         let session = RemoteSession(
             id: "s-1", harness: "claude", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
         let firstChunk = try JSONSerialization.data(
@@ -249,7 +251,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testAttachModelDoesNotOfferTextApprovalForStreamOutput() throws {
         let session = RemoteSession(
             id: "s-1", harness: "claude", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
         let data = try JSONSerialization.data(
@@ -273,7 +276,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testAttachModelKeepsInputDisabledUntilSessionModeIsKnown() {
         let session = RemoteSession(
             id: "s-1", harness: "claude", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
 
@@ -288,7 +292,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testUnknownResultIsTurnCompleteButDoesNotFinishAttachment() {
         let session = RemoteSession(
             id: "s-1", harness: "claude", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
 
@@ -309,7 +314,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testPartialStreamPrefixDoesNotEnableInput() throws {
         let session = RemoteSession(
             id: "s-1", harness: "claude", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
 
@@ -325,7 +331,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testInterleavedStderrClassifiesAttachAsStream() throws {
         let session = RemoteSession(
             id: "s-1", harness: "claude", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
         let events = [
@@ -367,7 +374,8 @@ final class RemoteAttachModelTests: XCTestCase {
     func testAttachRefusesTrafficWhenNotPaired() async {
         let session = RemoteSession(
             id: "s-1", harness: "codex", title: "T", status: "running",
-            projectRoot: "/w", createdAt: "c", updatedAt: "u"
+            projectRoot: "/w", createdAt: "c", updatedAt: "u",
+            familiarId: nil
         )
         let model = RemoteAttachModel(session: session, companion: makeCompanion())
 

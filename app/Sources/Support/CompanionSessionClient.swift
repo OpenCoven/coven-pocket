@@ -47,6 +47,7 @@ final class LiveCompanionSessionClient: CompanionSessionClient {
             projectRoot: projectRoot,
             prompt: prompt,
             title: title,
+            familiarId: nil,
             timeoutMs: CompanionChatModel.requestTimeoutMs
         )
     }

@@ -85,7 +85,8 @@ final class AppIntentsTests: XCTestCase {
             model: "claude-test",
             createdAt: "2026-07-20T10:00:00Z",
             updatedAt: "2026-07-21T11:30:00Z",
-            messageCount: 7
+            messageCount: 7,
+            familiar: nil
         )
 
         let items = SessionSpotlight.searchableItems(for: [summary])
@@ -101,7 +102,8 @@ final class AppIntentsTests: XCTestCase {
     func testSearchableItemsFallBackToUntitled() {
         let summary = ChatSessionSummary(
             sessionId: "id", title: "", model: "m",
-            createdAt: "", updatedAt: "not-a-date", messageCount: 0
+            createdAt: "", updatedAt: "not-a-date", messageCount: 0,
+            familiar: nil
         )
         let item = SessionSpotlight.searchableItems(for: [summary])[0]
         XCTAssertEqual(item.attributeSet.title, "Untitled session")

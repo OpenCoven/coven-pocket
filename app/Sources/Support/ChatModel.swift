@@ -127,7 +127,7 @@ final class ChatModel: ObservableObject {
 
         canRetry = false
         do {
-            let session = try activeSession(for: settings)
+            let session = try await activeSession(for: settings)
             items.append(ChatItem(kind: .user, text: trimmed))
             isBusy = true
             defer { isBusy = false }
@@ -168,14 +168,14 @@ final class ChatModel: ObservableObject {
 
     /// Reuse the live session when settings and workspace are unchanged;
     /// otherwise start a fresh one bound to the effective workspace.
-    private func activeSession(for settings: ChatSettings) throws -> ChatSession {
+    private func activeSession(for settings: ChatSettings) async throws -> ChatSession {
         let workspace = effectiveWorkspaceURL
         if let session, sessionSettings == settings, sessionWorkspace == workspace.path {
             return session
         }
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         items = []
-        let fresh = try engine.startChat(
+        let fresh = try await engine.startChat(
             provider: .codex,
             apiKey: "",
             model: settings.model,
@@ -183,6 +183,7 @@ final class ChatModel: ObservableObject {
             workspaceDir: workspace.path,
             permissionMode: permissionMode,
             storageDir: Self.sessionStoreURL.path,
+            familiar: nil,
             injectContext: injectContext
         )
         session = fresh

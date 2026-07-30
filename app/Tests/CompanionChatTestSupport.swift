@@ -80,7 +80,8 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             status: "running",
             projectRoot: launchedProjectRoot ?? projectRoot,
             createdAt: "c",
-            updatedAt: "u"
+            updatedAt: "u",
+            familiarId: nil
         )
         if suspendsLaunch {
             launchRequested.fulfill()
@@ -181,7 +182,8 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
                     status: "running",
                     projectRoot: projectRoot,
                     createdAt: "c",
-                    updatedAt: "u"
+                    updatedAt: "u",
+                    familiarId: nil
                 )
             )
         }

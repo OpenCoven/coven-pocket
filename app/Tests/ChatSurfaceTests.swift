@@ -71,19 +71,19 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertTrue(source.contains("Claude via Companion"))
     }
 
-    func testStartChatCreatesIdleSession() throws {
+    func testStartChatCreatesIdleSession() async throws {
         let engine = PocketEngine()
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
 
-        let session = try engine.startChat(
+        let session = try await engine.startChat(
             provider: .anthropic,
             apiKey: "test-key",
             model: "claude-test",
             effort: "medium",
             workspaceDir: workspace.path,
             permissionMode: .default,
-            storageDir: nil,
+            storageDir: nil, familiar: nil,
             injectContext: false
         )
         XCTAssertFalse(session.isBusy())
@@ -94,34 +94,37 @@ final class ChatSurfaceTests: XCTestCase {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
 
-        let session = try engine.startChat(
+        let session = try await engine.startChat(
             provider: .anthropic,
             apiKey: "test-key",
             model: "claude-test",
             effort: nil,
             workspaceDir: workspace.path,
             permissionMode: .default,
-            storageDir: nil,
+            storageDir: nil, familiar: nil,
             injectContext: false
         )
         let transcript = await session.transcript()
         XCTAssertTrue(transcript.isEmpty)
     }
 
-    func testStartChatRejectsRelativeWorkspace() {
+    func testStartChatRejectsRelativeWorkspace() async {
         let engine = PocketEngine()
-        XCTAssertThrowsError(
-            try engine.startChat(
+        do {
+            _ = try await engine.startChat(
                 provider: .anthropic,
                 apiKey: "test-key",
                 model: "claude-test",
                 effort: nil,
                 workspaceDir: "relative/workspace",
                 permissionMode: .default,
-                storageDir: nil,
+                storageDir: nil, familiar: nil,
                 injectContext: false
             )
-        )
+        } catch {
+            return
+        }
+        XCTFail("Expected a relative workspace to be rejected")
     }
 
     @MainActor
@@ -266,7 +269,7 @@ final class ChatSurfaceTests: XCTestCase {
             model: "claude-test",
             createdAt: "2026-01-01T00:00:00+00:00",
             updatedAt: updatedAt,
-            messageCount: 2
+            messageCount: 2, familiar: nil
         )
     }
 
