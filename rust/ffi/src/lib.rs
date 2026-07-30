@@ -302,7 +302,7 @@ impl PocketEngine {
         &self,
         storage_dir: String,
     ) -> Result<Vec<ChatSessionSummary>, PocketError> {
-        sessions::list_sessions(&storage_dir)
+        sessions::list_sessions(&storage_dir).await
     }
 
     /// Delete a stored session and its transcript.
@@ -311,7 +311,7 @@ impl PocketEngine {
         storage_dir: String,
         session_id: String,
     ) -> Result<(), PocketError> {
-        sessions::delete_session(&storage_dir, &session_id)
+        sessions::delete_session(&storage_dir, &session_id).await
     }
 
     /// Copy a stored session at its head under a new id, returning that id.

@@ -615,9 +615,8 @@ pub(crate) async fn resume_session(
     inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = resolve_workspace(&workspace_dir)?;
-    let (messages, last_uuid) =
-        crate::sessions::load_session_messages(&storage_dir, &session_id).await?;
-    let familiar = crate::sessions::load_familiar_metadata(&storage_dir, &session_id)?;
+    let (messages, last_uuid, familiar) =
+        crate::sessions::load_session_snapshot(&storage_dir, &session_id).await?;
     let persistence = crate::sessions::SessionPersistence::resumed(
         &storage_dir,
         session_id.clone(),
@@ -1685,7 +1684,9 @@ mod tests {
         let workspace = temp_dir("ws");
 
         let session = persisted_session(&storage, &workspace).await;
-        let listed = crate::sessions::list_sessions(&storage.display().to_string()).unwrap();
+        let listed = crate::sessions::list_sessions(&storage.display().to_string())
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, session.session_id());
         assert_eq!(listed[0].title, "hello world");
@@ -1733,7 +1734,7 @@ mod tests {
             messages.push(Message::user("follow-up"));
             resumed.persist_new(&messages, &delegate).await;
         }
-        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].message_count, 3);
 
@@ -1853,7 +1854,7 @@ mod tests {
             .unwrap();
         assert_ne!(fork_id, original.session_id());
 
-        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 2);
         let fork_row = listed
             .iter()
@@ -1864,8 +1865,10 @@ mod tests {
         assert_eq!(fork_row.message_count, 2);
 
         // Deleting the original leaves the fork intact and resumable.
-        crate::sessions::delete_session(&storage_str, &original.session_id()).unwrap();
-        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        crate::sessions::delete_session(&storage_str, &original.session_id())
+            .await
+            .unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         let resumed_fork = resume_session(
             PocketProvider::Anthropic,
@@ -1893,8 +1896,11 @@ mod tests {
         let storage_str = storage.display().to_string();
 
         let session = persisted_session(&storage, &workspace).await;
-        crate::sessions::delete_session(&storage_str, &session.session_id()).unwrap();
+        crate::sessions::delete_session(&storage_str, &session.session_id())
+            .await
+            .unwrap();
         assert!(crate::sessions::list_sessions(&storage_str)
+            .await
             .unwrap()
             .is_empty());
         let err = resume_session(
@@ -1942,6 +1948,7 @@ mod tests {
         }
         assert!(
             crate::sessions::list_sessions(&storage.display().to_string())
+                .await
                 .unwrap()
                 .is_empty()
         );

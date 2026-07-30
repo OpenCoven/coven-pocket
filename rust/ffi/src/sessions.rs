@@ -26,6 +26,8 @@ use claurst_core::SqliteSessionStore;
 use crate::remote::FamiliarIdentity;
 use crate::PocketError;
 
+static SESSION_LIFECYCLE_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 /// Summary row for the session browser.
 #[derive(uniffi::Record)]
 pub struct ChatSessionSummary {
@@ -313,9 +315,7 @@ fn build_entry(
     }
 }
 
-/// Load a persisted transcript for resuming: full messages plus the chain
-/// tail needed to keep appending.
-pub(crate) async fn load_session_messages(
+async fn load_session_messages_unlocked(
     storage_dir: &str,
     session_id: &str,
 ) -> Result<(Vec<Message>, Option<String>), PocketError> {
@@ -337,8 +337,24 @@ pub(crate) async fn load_session_messages(
     Ok((messages_from_transcript(&entries), last_uuid))
 }
 
+/// Load the complete persisted state needed to resume under one read lock.
+pub(crate) async fn load_session_snapshot(
+    storage_dir: &str,
+    session_id: &str,
+) -> Result<(Vec<Message>, Option<String>, Option<FamiliarIdentity>), PocketError> {
+    let _lifecycle_guard = SESSION_LIFECYCLE_LOCK.read().await;
+    let (messages, last_uuid) = load_session_messages_unlocked(storage_dir, session_id).await?;
+    let familiar = load_familiar_metadata(storage_dir, session_id)?;
+    Ok((messages, last_uuid, familiar))
+}
+
 /// Newest-first summaries for the browser.
-pub fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
+pub async fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
+    let _lifecycle_guard = SESSION_LIFECYCLE_LOCK.read().await;
+    list_sessions_unlocked(storage_dir)
+}
+
+fn list_sessions_unlocked(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
     let root = storage_root(storage_dir)?;
     let store = index_store(&root)?;
     let rows = store
@@ -361,7 +377,12 @@ pub fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, Pocke
 }
 
 /// Drop a session from the index and delete its transcript file.
-pub fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
+pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
+    let _lifecycle_guard = SESSION_LIFECYCLE_LOCK.write().await;
+    delete_session_unlocked(storage_dir, session_id)
+}
+
+fn delete_session_unlocked(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
     validate_session_id(session_id)?;
     let root = storage_root(storage_dir)?;
     index_store(&root)?
@@ -377,7 +398,12 @@ pub fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketE
 /// Copy a session's transcript under a fresh id at its current head.
 /// Returns the new session id.
 pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String, PocketError> {
-    let (messages, _) = load_session_messages(storage_dir, session_id).await?;
+    let _lifecycle_guard = SESSION_LIFECYCLE_LOCK.write().await;
+    fork_session_unlocked(storage_dir, session_id).await
+}
+
+async fn fork_session_unlocked(storage_dir: &str, session_id: &str) -> Result<String, PocketError> {
+    let (messages, _) = load_session_messages_unlocked(storage_dir, session_id).await?;
     if messages.is_empty() {
         return Err(PocketError::Engine {
             message: format!("session {session_id} has no messages to fork"),
@@ -414,7 +440,7 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
         parent = Some(uuid);
     }
     if let Err(copy_err) = copy_familiar_metadata(storage_dir, session_id, &new_id) {
-        return match delete_session(storage_dir, &new_id) {
+        return match delete_session_unlocked(storage_dir, &new_id) {
             Ok(()) => Err(PocketError::Engine {
                 message: format!("cannot copy familiar metadata: {copy_err}; fork rolled back"),
             }),
@@ -473,13 +499,14 @@ mod tests {
         assert_eq!(derive_title(&[]), "");
     }
 
-    #[test]
-    fn list_on_fresh_dir_is_empty_and_relative_dir_errors() {
+    #[tokio::test]
+    async fn list_on_fresh_dir_is_empty_and_relative_dir_errors() {
         let dir = test_storage("list");
         assert!(list_sessions(&dir.display().to_string())
+            .await
             .unwrap()
             .is_empty());
-        assert!(list_sessions("relative/dir").is_err());
+        assert!(list_sessions("relative/dir").await.is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -529,8 +556,8 @@ mod tests {
         std::fs::remove_dir_all(storage).unwrap();
     }
 
-    #[test]
-    fn list_sessions_includes_pinned_familiar_and_old_sessions_use_none() {
+    #[tokio::test]
+    async fn list_sessions_includes_pinned_familiar_and_old_sessions_use_none() {
         let storage = test_storage("list-metadata");
         let storage_str = storage.display().to_string();
         let pinned_id = uuid::Uuid::new_v4().to_string();
@@ -543,7 +570,7 @@ mod tests {
         let identity = familiar();
         save_familiar_metadata(&storage_str, &pinned_id, Some(&identity)).unwrap();
 
-        let listed = list_sessions(&storage_str).unwrap();
+        let listed = list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(
             listed
@@ -565,8 +592,8 @@ mod tests {
         std::fs::remove_dir_all(storage).unwrap();
     }
 
-    #[test]
-    fn malformed_familiar_sidecar_fails_the_whole_session_list() {
+    #[tokio::test]
+    async fn malformed_familiar_sidecar_fails_the_whole_session_list() {
         let storage = test_storage("list-malformed");
         let storage_str = storage.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -577,7 +604,7 @@ mod tests {
         std::fs::create_dir_all(storage.join("metadata")).unwrap();
         std::fs::write(familiar_file(&storage, &session_id), b"not-json").unwrap();
 
-        let err = match list_sessions(&storage_str) {
+        let err = match list_sessions(&storage_str).await {
             Ok(_) => panic!("malformed familiar metadata must fail the list"),
             Err(err) => err,
         };
@@ -611,7 +638,7 @@ mod tests {
             .join(format!("{fork_id}.familiar.json"));
         assert!(fork_sidecar.exists());
 
-        delete_session(&storage_str, &fork_id).unwrap();
+        delete_session(&storage_str, &fork_id).await.unwrap();
         assert!(!fork_sidecar.exists());
 
         std::fs::remove_dir_all(storage).unwrap();
@@ -638,7 +665,7 @@ mod tests {
         assert!(err.to_string().contains("fork rolled back"));
 
         std::fs::remove_file(familiar_file(&storage, &source_id)).unwrap();
-        let listed = list_sessions(&storage_str).unwrap();
+        let listed = list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, source_id);
 
@@ -654,6 +681,177 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(metadata.is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_and_delete_serialize_through_the_lifecycle_lock() {
+        let storage = test_storage("resume-delete-lock");
+        let workspace = test_storage("resume-delete-workspace");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, source_id.clone(), "model".to_string())
+                .unwrap();
+        persistence
+            .persist_new(&[Message::user("seeded source")])
+            .await
+            .unwrap();
+        save_familiar_metadata(&storage_str, &source_id, Some(&familiar())).unwrap();
+
+        let write_guard = SESSION_LIFECYCLE_LOCK.write().await;
+        let (resume_started_tx, resume_started_rx) = tokio::sync::oneshot::channel();
+        let resume_storage = storage_str.clone();
+        let resume_workspace = workspace.display().to_string();
+        let resume_id = source_id.clone();
+        let mut resume_task = tokio::spawn(async move {
+            let _ = resume_started_tx.send(());
+            crate::chat::resume_session(
+                crate::PocketProvider::Anthropic,
+                "key".to_string(),
+                "model".to_string(),
+                None,
+                resume_workspace,
+                crate::chat::ChatPermissionMode::Default,
+                resume_storage,
+                resume_id,
+                false,
+            )
+            .await
+        });
+        resume_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut resume_task)
+                .await
+                .is_err(),
+            "resume completed while lifecycle writes were excluded"
+        );
+        drop(write_guard);
+        let resumed = resume_task.await.unwrap().unwrap();
+        assert_eq!(resumed.session_id(), source_id);
+
+        let read_guard = SESSION_LIFECYCLE_LOCK.read().await;
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let delete_storage = storage_str.clone();
+        let delete_id = source_id.clone();
+        let mut delete_task = tokio::spawn(async move {
+            let _ = delete_started_tx.send(());
+            delete_session(&delete_storage, &delete_id).await
+        });
+        delete_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut delete_task)
+                .await
+                .is_err(),
+            "delete completed while a lifecycle reader was active"
+        );
+        drop(read_guard);
+        delete_task.await.unwrap().unwrap();
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_and_delete_wait_until_fork_identity_is_published() {
+        let storage = test_storage("fork-publication-lock");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source =
+            SessionPersistence::create(&storage_str, source_id.clone(), "model".to_string())
+                .unwrap();
+        source
+            .persist_new(&[Message::user("seeded source")])
+            .await
+            .unwrap();
+        let identity = familiar();
+        save_familiar_metadata(&storage_str, &source_id, Some(&identity)).unwrap();
+
+        let write_guard = SESSION_LIFECYCLE_LOCK.write().await;
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let fork =
+            SessionPersistence::create(&storage_str, fork_id.clone(), "model".to_string()).unwrap();
+        fork.persist_new(&[Message::user("seeded source")])
+            .await
+            .unwrap();
+
+        let (list_started_tx, list_started_rx) = tokio::sync::oneshot::channel();
+        let list_storage = storage_str.clone();
+        let mut list_task = tokio::spawn(async move {
+            let _ = list_started_tx.send(());
+            list_sessions(&list_storage).await
+        });
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let delete_storage = storage_str.clone();
+        let delete_id = source_id.clone();
+        let mut delete_task = tokio::spawn(async move {
+            let _ = delete_started_tx.send(());
+            delete_session(&delete_storage, &delete_id).await
+        });
+        list_started_rx.await.unwrap();
+        delete_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut list_task)
+                .await
+                .is_err(),
+            "list observed the fork before its identity was published"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut delete_task)
+                .await
+                .is_err(),
+            "delete interfered while the fork identity was unpublished"
+        );
+
+        save_familiar_metadata(&storage_str, &fork_id, Some(&identity)).unwrap();
+        drop(write_guard);
+
+        let listed = list_task.await.unwrap().unwrap();
+        let fork_row = listed.iter().find(|row| row.session_id == fork_id).unwrap();
+        assert_eq!(fork_row.familiar, Some(identity));
+        delete_task.await.unwrap().unwrap();
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_waits_for_lifecycle_readers_before_loading_the_source() {
+        let storage = test_storage("fork-reader-lock");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source =
+            SessionPersistence::create(&storage_str, source_id.clone(), "model".to_string())
+                .unwrap();
+        source
+            .persist_new(&[Message::user("seeded source")])
+            .await
+            .unwrap();
+        let identity = familiar();
+        save_familiar_metadata(&storage_str, &source_id, Some(&identity)).unwrap();
+
+        let read_guard = SESSION_LIFECYCLE_LOCK.read().await;
+        let (fork_started_tx, fork_started_rx) = tokio::sync::oneshot::channel();
+        let fork_storage = storage_str.clone();
+        let fork_source_id = source_id.clone();
+        let mut fork_task = tokio::spawn(async move {
+            let _ = fork_started_tx.send(());
+            fork_session(&fork_storage, &fork_source_id).await
+        });
+        fork_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut fork_task)
+                .await
+                .is_err(),
+            "fork loaded its source while a lifecycle reader was active"
+        );
+        drop(read_guard);
+
+        let fork_id = fork_task.await.unwrap().unwrap();
+        assert_eq!(
+            load_familiar_metadata(&storage_str, &fork_id).unwrap(),
+            Some(identity)
+        );
 
         std::fs::remove_dir_all(storage).unwrap();
     }
