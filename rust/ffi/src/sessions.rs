@@ -48,9 +48,18 @@ use crate::remote::FamiliarIdentity;
 use crate::PocketError;
 
 const INDEX_RECORD_VERSION: u32 = 1;
-const MAX_INDEX_RECORD_BYTES: u64 = MAX_TRANSCRIPT_BYTES;
 const MAX_BASELINE_RECORD_BYTES: u64 = 4 * 1024;
 const MAX_SESSION_MODEL_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_INDEX_RECORD_ENVELOPE_BYTES: u64 = 4 * 1024;
+const MAX_SESSION_TITLE_CHARS: usize = 60;
+const MAX_LEGACY_INDEX_RECORD_BYTES: u64 = MAX_TRANSCRIPT_BYTES;
+/// A pending record duplicates the indexable text from one transcript entry.
+/// The transcript line itself is capped at 50 MiB; another 64 KiB is reserved
+/// for model metadata, and 4 KiB covers the two UUIDs, role, JSON syntax, and
+/// the derived title (at most [`MAX_SESSION_TITLE_CHARS`] Unicode scalar
+/// values, including worst-case JSON escaping).
+const MAX_INDEX_RECORD_BYTES: u64 =
+    MAX_TRANSCRIPT_BYTES + MAX_SESSION_MODEL_RECORD_BYTES + MAX_INDEX_RECORD_ENVELOPE_BYTES;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionKey {
@@ -878,10 +887,60 @@ impl From<PocketError> for TranscriptAppendError {
     }
 }
 
-fn append_transcript_entry(
+struct PreparedTranscriptAppend {
+    line: Vec<u8>,
+    existed: bool,
+    original_len: u64,
+}
+
+fn inspect_transcript_append(
+    storage: &CheckedStorage,
+    path: &Path,
+    line_len: u64,
+) -> Result<(bool, u64), PocketError> {
+    let (existed, original_len) = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            storage.validate_regular_file(path, false)?;
+            (true, metadata.len())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, 0),
+        Err(err) => return Err(engine_err("cannot inspect transcript before append", err)),
+    };
+    if original_len >= MAX_TRANSCRIPT_BYTES
+        || line_len > MAX_TRANSCRIPT_BYTES.saturating_sub(original_len)
+    {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot write transcript: transcript size limit of {MAX_TRANSCRIPT_BYTES} bytes \
+                 reached"
+            ),
+        });
+    }
+    Ok((existed, original_len))
+}
+
+fn prepare_transcript_append(
     storage: &CheckedStorage,
     path: &Path,
     entry: &TranscriptEntry,
+) -> Result<PreparedTranscriptAppend, PocketError> {
+    let mut line =
+        serde_json::to_vec(entry).map_err(|err| engine_err("cannot serialize transcript", err))?;
+    line.push(b'\n');
+    let line_len =
+        u64::try_from(line.len()).map_err(|err| engine_err("cannot serialize transcript", err))?;
+    let (existed, original_len) = inspect_transcript_append(storage, path, line_len)?;
+    Ok(PreparedTranscriptAppend {
+        line,
+        existed,
+        original_len,
+    })
+}
+
+fn append_transcript_entry(
+    storage: &CheckedStorage,
+    path: &Path,
+    prepared: &PreparedTranscriptAppend,
 ) -> Result<(), TranscriptAppendError> {
     #[cfg(test)]
     {
@@ -900,36 +959,26 @@ fn append_transcript_entry(
         }
     }
 
-    let mut line =
-        serde_json::to_vec(entry).map_err(|err| engine_err("cannot serialize transcript", err))?;
-    line.push(b'\n');
-    let (existed, original_len) = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => (true, metadata.len()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, 0),
-        Err(err) => {
-            return Err(engine_err("cannot inspect transcript before append", err).into());
-        }
-    };
-    let directory = path
-        .parent()
-        .ok_or_else(|| persistence_err(path, "transcript path has no containing directory"))?;
-    if original_len >= MAX_TRANSCRIPT_BYTES
-        || line.len() as u64 > MAX_TRANSCRIPT_BYTES - original_len
-    {
+    let line_len = u64::try_from(prepared.line.len())
+        .map_err(|err| engine_err("cannot write transcript", err))?;
+    let (existed, original_len) = inspect_transcript_append(storage, path, line_len)?;
+    if existed != prepared.existed || original_len != prepared.original_len {
         return Err(PocketError::Engine {
-            message: format!(
-                "cannot write transcript: transcript size limit of {MAX_TRANSCRIPT_BYTES} bytes reached"
-            ),
+            message: "cannot write transcript: transcript changed after append preflight"
+                .to_string(),
         }
         .into());
     }
+    let directory = path
+        .parent()
+        .ok_or_else(|| persistence_err(path, "transcript path has no containing directory"))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|err| engine_err("cannot write transcript", err))?;
 
-    let mut write_result = file.write_all(&line);
+    let mut write_result = file.write_all(&prepared.line);
     #[cfg(test)]
     {
         let mut faults = SESSION_TEST_FAULTS
@@ -962,7 +1011,7 @@ fn append_transcript_entry(
                     path,
                     directory,
                     original_len,
-                    &line,
+                    &prepared.line,
                     existed,
                 )
                 .unwrap_or(false)
@@ -1604,7 +1653,12 @@ where
     T: for<'de> serde::Deserialize<'de>,
 {
     storage.validate_regular_file(path, false)?;
-    let len = std::fs::metadata(path)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|err| engine_err(context, err))?;
+    let len = file
+        .metadata()
         .map_err(|err| engine_err(context, err))?
         .len();
     if len > max_bytes {
@@ -1613,7 +1667,18 @@ where
             format!("record is too large ({len} bytes, max {max_bytes})"),
         ));
     }
-    let bytes = std::fs::read(path).map_err(|err| engine_err(context, err))?;
+    let capacity = usize::try_from(len)
+        .map_err(|err| engine_err(context, format!("record size does not fit memory: {err}")))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| engine_err(context, err))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(persistence_err(
+            path,
+            format!("record grew beyond the size limit while reading (max {max_bytes} bytes)"),
+        ));
+    }
     serde_json::from_slice(&bytes).map_err(|err| engine_err(context, err))
 }
 
@@ -1732,6 +1797,19 @@ fn write_pending_index_record(
     record: &PendingIndexRecord,
 ) -> Result<(), PocketError> {
     validate_session_id(&record.session_id)?;
+    let destination = storage.pending_index_record(&record.session_id)?;
+    validate_pending_index_record(record, &destination, &record.session_id)?;
+    let bytes = serde_json::to_vec(record)
+        .map_err(|err| engine_err("cannot serialize pending index record", err))?;
+    if bytes.len() as u64 > MAX_INDEX_RECORD_BYTES {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot write pending index record: pending index record size limit of \
+                 {MAX_INDEX_RECORD_BYTES} bytes exceeded ({} bytes)",
+                bytes.len()
+            ),
+        });
+    }
     let directory = storage.pending_index_dir()?;
     ensure_lifecycle_record_directory(
         storage,
@@ -1739,7 +1817,6 @@ fn write_pending_index_record(
         "cannot create pending index directory",
         "cannot sync pending index directory creation",
     )?;
-    let destination = storage.pending_index_record(&record.session_id)?;
     if let Some(existing) = read_pending_index_record(storage, &record.session_id)? {
         if existing != *record {
             return Err(PocketError::Engine {
@@ -1760,9 +1837,6 @@ fn write_pending_index_record(
             "cannot sync existing pending index directory",
         );
     }
-    validate_pending_index_record(record, &destination, &record.session_id)?;
-    let bytes = serde_json::to_vec(record)
-        .map_err(|err| engine_err("cannot serialize pending index record", err))?;
     let temporary = storage.pending_index_temporary(&record.session_id)?;
     write_json_record_atomically(
         storage,
@@ -1830,10 +1904,15 @@ fn remove_pending_index_artifacts(
     storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<(), PocketError> {
-    if let Some(record) = read_pending_index_record(storage, session_id)? {
-        remove_pending_index_record(storage, &record, false)?;
-    }
     let directory = storage.pending_index_dir()?;
+    let destination = storage.pending_index_record(session_id)?;
+    remove_file_durably_if_present(
+        storage,
+        &destination,
+        &directory,
+        "cannot remove pending index record",
+        "cannot sync pending index record removal",
+    )?;
     let temporary = storage.pending_index_temporary(session_id)?;
     remove_file_durably_if_present(
         storage,
@@ -2536,7 +2615,7 @@ fn derive_title(messages: &[Message]) -> String {
                 .unwrap_or_default()
                 .trim()
                 .chars()
-                .take(60)
+                .take(MAX_SESSION_TITLE_CHARS)
                 .collect()
         })
         .unwrap_or_default()
@@ -2780,6 +2859,7 @@ impl SessionPersistence {
                 state.last_uuid.as_deref(),
                 &self.key.session_id,
             );
+            let prepared_append = prepare_transcript_append(&self.storage, &path, &entry)?;
             let record = PendingIndexRecord::from_message(
                 &self.key.session_id,
                 &message_uuid,
@@ -2832,7 +2912,7 @@ impl SessionPersistence {
                 state.pending_index.pop_back();
                 return Err(preflight_err);
             }
-            if let Err(err) = append_transcript_entry(&self.storage, &path, &entry) {
+            if let Err(err) = append_transcript_entry(&self.storage, &path, &prepared_append) {
                 let append_err = err.error;
                 if err.uncertain {
                     state.uncertain_append = Some(append_err.to_string());
@@ -3176,7 +3256,13 @@ fn reconcile_loaded_transcript(
 
 struct PendingIndexRecoveryPlan {
     records: Vec<PendingIndexRecord>,
+    oversized_records: Vec<OversizedPendingIndexRecord>,
     temporary_files: Vec<PathBuf>,
+}
+
+struct OversizedPendingIndexRecord {
+    session_id: String,
+    size: u64,
 }
 
 struct StorageRecoveryPlan {
@@ -3191,6 +3277,7 @@ fn preflight_pending_index_recovery(
     if !storage.validate_directory(&directory, true)? {
         return Ok(PendingIndexRecoveryPlan {
             records: Vec::new(),
+            oversized_records: Vec::new(),
             temporary_files: Vec::new(),
         });
     }
@@ -3198,11 +3285,15 @@ fn preflight_pending_index_recovery(
     let entries = std::fs::read_dir(&directory)
         .map_err(|err| engine_err("cannot read pending index directory", err))?;
     let mut records = Vec::new();
+    let mut oversized_records = Vec::new();
     let mut temporary_files = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| engine_err("cannot read pending index entry", err))?;
         let path = entry.path();
         storage.validate_regular_file(&path, false)?;
+        let size = std::fs::symlink_metadata(&path)
+            .map_err(|err| engine_err("cannot inspect pending index entry", err))?
+            .len();
         let file_name = entry.file_name();
         let file_name = file_name
             .to_str()
@@ -3232,6 +3323,16 @@ fn preflight_pending_index_recovery(
                 format!("invalid pending index record name {file_name:?}: {err}"),
             )
         })?;
+        // Records above the historical read cap may be remnants of the wedge.
+        // Recover them from the transcript without parsing their contents,
+        // including newly valid records in the widened metadata allowance.
+        if size > MAX_LEGACY_INDEX_RECORD_BYTES {
+            oversized_records.push(OversizedPendingIndexRecord {
+                session_id: session_id.to_string(),
+                size,
+            });
+            continue;
+        }
         let record = read_json_record(
             storage,
             &path,
@@ -3242,13 +3343,27 @@ fn preflight_pending_index_recovery(
         records.push(record);
     }
     records.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    oversized_records.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     temporary_files.sort();
 
-    for record in &records {
-        storage.validate_regular_file(&storage.transcript_file(&record.session_id)?, true)?;
+    for session_id in records
+        .iter()
+        .map(|record| record.session_id.as_str())
+        .chain(
+            oversized_records
+                .iter()
+                .map(|record| record.session_id.as_str()),
+        )
+    {
+        preflight_session_artifacts(storage, session_id)?;
+    }
+    for record in &oversized_records {
+        read_session_model_record(storage, &record.session_id)?;
+        read_index_baseline(storage, &record.session_id)?;
     }
     Ok(PendingIndexRecoveryPlan {
         records,
+        oversized_records,
         temporary_files,
     })
 }
@@ -3265,13 +3380,159 @@ fn preflight_storage_recovery(
     })
 }
 
+fn verify_oversized_pending_index_record(
+    storage: &CheckedStorage,
+    record: &OversizedPendingIndexRecord,
+) -> Result<Option<PathBuf>, PocketError> {
+    let path = storage.pending_index_record(&record.session_id)?;
+    if !storage.validate_regular_file(&path, true)? {
+        return Ok(None);
+    }
+    let size = std::fs::symlink_metadata(&path)
+        .map_err(|err| engine_err("cannot inspect oversized pending index record", err))?
+        .len();
+    if size <= MAX_LEGACY_INDEX_RECORD_BYTES {
+        return Err(persistence_err(
+            &path,
+            format!(
+                "legacy-oversized pending index record changed size before recovery ({size} bytes)"
+            ),
+        ));
+    }
+    if size != record.size {
+        return Err(persistence_err(
+            &path,
+            format!(
+                "oversized pending index record changed during recovery preflight ({} to {size} \
+                 bytes)",
+                record.size
+            ),
+        ));
+    }
+    Ok(Some(path))
+}
+
+fn remove_oversized_pending_index_record(
+    storage: &CheckedStorage,
+    record: &OversizedPendingIndexRecord,
+) -> Result<(), PocketError> {
+    let Some(path) = verify_oversized_pending_index_record(storage, record)? else {
+        return Ok(());
+    };
+    let directory = storage.pending_index_dir()?;
+    remove_file_durably_if_present(
+        storage,
+        &path,
+        &directory,
+        "cannot remove oversized pending index marker",
+        "cannot sync oversized pending index marker removal",
+    )
+}
+
+fn recover_absent_oversized_pending_index_record(
+    storage: &CheckedStorage,
+    lifecycle: &mut SessionLifecycle,
+    record: &OversizedPendingIndexRecord,
+) -> Result<(), PocketError> {
+    begin_session_deletion_and_tombstone(storage, lifecycle, &record.session_id)?;
+    cleanup_session_artifacts(
+        storage,
+        &record.session_id,
+        SessionCleanupMarker::PendingDeletion,
+    )
+    .map_err(|err| PocketError::Engine {
+        message: format!(
+            "cannot recover session {} without a durable transcript from oversized pending index \
+             marker: {err}",
+            record.session_id
+        ),
+    })
+}
+
+fn recover_oversized_pending_index_transcript(
+    storage: &CheckedStorage,
+    record: &OversizedPendingIndexRecord,
+    loaded: &LoadedSessionTranscript,
+) -> Result<(), PocketError> {
+    let model = read_session_model_record(storage, &record.session_id)?
+        .map(|record| record.model)
+        .ok_or_else(|| PocketError::Engine {
+            message: format!(
+                "cannot safely recover session {} with oversized pending index marker without \
+                 trusted model metadata",
+                record.session_id
+            ),
+        })?;
+    write_session_model_record(storage, &record.session_id, &model)?;
+    remove_index_baseline_artifacts(storage, &record.session_id)?;
+    delete_index_session(
+        storage,
+        &record.session_id,
+        "cannot reset oversized pending session index",
+    )?;
+    let store = checked_index_store(storage)?;
+    save_index_session(
+        storage,
+        &store,
+        &record.session_id,
+        Some(&derive_title(&loaded.messages)),
+        &model,
+        "cannot recover oversized pending session index",
+    )?;
+    for entry in &loaded.entries {
+        if let Some(message) = PendingIndexRecord::from_entry(&record.session_id, entry)? {
+            save_index_message(
+                storage,
+                &store,
+                &record.session_id,
+                &message.message_uuid,
+                &message.role,
+                &message.text,
+                "cannot recover oversized pending message index",
+            )?;
+        }
+    }
+    write_index_baseline(storage, &record.session_id)?;
+    remove_oversized_pending_index_record(storage, record)
+}
+
 async fn recover_pending_index_plan(
     storage: &CheckedStorage,
     lifecycle: &mut SessionLifecycle,
     plan: PendingIndexRecoveryPlan,
 ) -> Result<(), PocketError> {
+    let PendingIndexRecoveryPlan {
+        records,
+        oversized_records,
+        temporary_files,
+    } = plan;
     let directory = storage.pending_index_dir()?;
-    for temporary in plan.temporary_files {
+    for record in oversized_records {
+        if verify_oversized_pending_index_record(storage, &record)?.is_none() {
+            continue;
+        }
+        if matches!(
+            lifecycle
+                .sessions
+                .get(&session_key(storage.root(), &record.session_id)),
+            Some(SessionLifecycleState::Tombstoned | SessionLifecycleState::PendingFork)
+        ) {
+            remove_oversized_pending_index_record(storage, &record)?;
+            continue;
+        }
+        match load_existing_session_transcript_at_storage(storage, &record.session_id).await? {
+            None => {
+                recover_absent_oversized_pending_index_record(storage, lifecycle, &record)?;
+            }
+            Some(loaded) if loaded.entries.is_empty() => {
+                recover_absent_oversized_pending_index_record(storage, lifecycle, &record)?;
+            }
+            Some(loaded) => {
+                recover_oversized_pending_index_transcript(storage, &record, &loaded)?;
+            }
+        }
+    }
+    for temporary in temporary_files {
         remove_file_durably_if_present(
             storage,
             &temporary,
@@ -3281,7 +3542,7 @@ async fn recover_pending_index_plan(
         )?;
     }
 
-    for record in plan.records {
+    for record in records {
         if read_pending_index_record(storage, &record.session_id)?.is_none() {
             continue;
         }
@@ -3845,6 +4106,12 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
         records: recovery
             .pending_index
             .records
+            .into_iter()
+            .filter(|record| record.session_id != session_id)
+            .collect(),
+        oversized_records: recovery
+            .pending_index
+            .oversized_records
             .into_iter()
             .filter(|record| record.session_id != session_id)
             .collect(),
@@ -4616,6 +4883,10 @@ mod tests {
         pending_index_dir(root).join(format!("{session_id}.json"))
     }
 
+    fn pending_index_temporary(root: &Path, session_id: &str) -> PathBuf {
+        pending_index_dir(root).join(format!(".{session_id}.json.tmp"))
+    }
+
     fn session_model_marker(root: &Path, session_id: &str) -> PathBuf {
         root.join(".session-lifecycle")
             .join("session-models")
@@ -4670,6 +4941,44 @@ mod tests {
         std::fs::write(&marker, bytes).unwrap();
         std::fs::File::open(&marker).unwrap().sync_all().unwrap();
         std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+    }
+
+    fn seed_oversized_pending_index_record(root: &Path, session_id: &str) {
+        let directory = pending_index_dir(root);
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = pending_index_marker(root, session_id);
+        std::fs::File::create(&marker)
+            .unwrap()
+            .set_len(MAX_INDEX_RECORD_BYTES + 1)
+            .unwrap();
+        std::fs::File::open(&marker).unwrap().sync_all().unwrap();
+        std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+    }
+
+    fn seed_legacy_widened_band_pending_index_record(root: &Path, session_id: &str) {
+        let record = PendingIndexRecord {
+            version: INDEX_RECORD_VERSION,
+            session_id: session_id.to_string(),
+            message_uuid: uuid::Uuid::new_v4().to_string(),
+            role: "user".to_string(),
+            text: "\0".repeat(usize::try_from(MAX_TRANSCRIPT_BYTES / 6).unwrap()),
+            model: "model".to_string(),
+            title: "Speculative".to_string(),
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(bytes.len() as u64 > MAX_TRANSCRIPT_BYTES);
+        assert!(bytes.len() as u64 <= MAX_INDEX_RECORD_BYTES);
+        let directory = pending_index_dir(root);
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = pending_index_marker(root, session_id);
+        std::fs::write(&marker, bytes).unwrap();
+        std::fs::File::open(&marker).unwrap().sync_all().unwrap();
+        std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+    }
+
+    fn oversized_high_escaping_text() -> String {
+        let pairs = usize::try_from(MAX_TRANSCRIPT_BYTES / 2).unwrap();
+        "x\"".repeat(pairs)
     }
 
     fn seed_legacy_first_turn_ghost(
@@ -4909,6 +5218,15 @@ mod tests {
             .any(|row| row.id == session_id)
     }
 
+    fn index_search_contains(root: &Path, query: &str, session_id: &str) -> bool {
+        index_store(root)
+            .unwrap()
+            .search_sessions(query)
+            .unwrap()
+            .iter()
+            .any(|row| row.id == session_id)
+    }
+
     fn indexed_message_count(root: &Path, session_id: &str) -> u32 {
         index_store(root)
             .unwrap()
@@ -4976,9 +5294,89 @@ mod tests {
             Message::user(format!("{long}\nrest")),
         ];
         let title = derive_title(&messages);
-        assert_eq!(title.chars().count(), 60);
+        assert_eq!(title.chars().count(), MAX_SESSION_TITLE_CHARS);
         assert!(!title.contains('\n'));
         assert_eq!(derive_title(&[]), "");
+    }
+
+    #[test]
+    fn pending_index_bound_covers_transcript_and_bounded_metadata() {
+        assert_eq!(
+            MAX_INDEX_RECORD_BYTES,
+            MAX_TRANSCRIPT_BYTES + MAX_SESSION_MODEL_RECORD_BYTES + MAX_INDEX_RECORD_ENVELOPE_BYTES
+        );
+
+        let record = PendingIndexRecord {
+            version: INDEX_RECORD_VERSION,
+            session_id: uuid::Uuid::nil().to_string(),
+            message_uuid: uuid::Uuid::nil().to_string(),
+            role: "assistant".to_string(),
+            text: String::new(),
+            model: String::new(),
+            title: "\0".repeat(MAX_SESSION_TITLE_CHARS),
+        };
+        assert!(
+            serde_json::to_vec(&record).unwrap().len() as u64 <= MAX_INDEX_RECORD_ENVELOPE_BYTES,
+            "fixed fields and a maximally escaped derived title must fit the envelope"
+        );
+
+        let message = Message::user("text with \0, quotes \" and a slash \\");
+        let entry = build_entry(
+            message.clone(),
+            &record.message_uuid,
+            None,
+            &record.session_id,
+        );
+        let transcript_line_bytes = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
+        let bounded_model = "\0".repeat(10_000);
+        let model_record = SessionModelRecord {
+            version: INDEX_RECORD_VERSION,
+            session_id: record.session_id.clone(),
+            model: bounded_model.clone(),
+        };
+        assert!(
+            serde_json::to_vec(&model_record).unwrap().len() as u64
+                <= MAX_SESSION_MODEL_RECORD_BYTES
+        );
+        let pending = PendingIndexRecord::from_message(
+            &record.session_id,
+            &record.message_uuid,
+            &message,
+            &bounded_model,
+            &record.title,
+        );
+        assert!(
+            serde_json::to_vec(&pending).unwrap().len() as u64
+                <= transcript_line_bytes
+                    + MAX_SESSION_MODEL_RECORD_BYTES
+                    + MAX_INDEX_RECORD_ENVELOPE_BYTES
+        );
+    }
+
+    #[test]
+    fn pending_index_writer_rejects_oversized_serialization_before_write() {
+        let storage = test_storage("persist-pending-index-writer-size-limit");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+        let record = PendingIndexRecord {
+            version: INDEX_RECORD_VERSION,
+            session_id: session_id.clone(),
+            message_uuid: uuid::Uuid::new_v4().to_string(),
+            role: "user".to_string(),
+            text: "\0".repeat(usize::try_from(MAX_INDEX_RECORD_BYTES / 6 + 1).unwrap()),
+            model: "model".to_string(),
+            title: "Oversized".to_string(),
+        };
+        assert!(serde_json::to_vec(&record).unwrap().len() as u64 > MAX_INDEX_RECORD_BYTES);
+
+        let err = write_pending_index_record(&checked, &record).unwrap_err();
+
+        assert!(err.to_string().contains("pending index record size limit"));
+        assert!(!pending_index_dir(&storage).exists());
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_index_temporary(&storage, &session_id).exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
     }
 
     fn chain_uuid_and_parent(entry: &TranscriptEntry) -> (String, Option<String>) {
@@ -5589,6 +5987,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_first_message_is_rejected_before_pending_intent() {
+        let storage = test_storage("persist-oversized-first-message");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+
+        let err = persistence
+            .persist_new(&[Message::user(oversized_high_escaping_text())])
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("transcript size limit"));
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_index_temporary(&storage, &session_id).exists());
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 0);
+            assert!(state.last_uuid.is_none());
+            assert!(state.pending_index.is_empty());
+        }
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_later_message_preserves_existing_session() {
+        let storage = test_storage("persist-oversized-later-message");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let first = Message::user("durable first message");
+        persistence
+            .persist_new(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        let transcript_before = std::fs::read(&transcript).unwrap();
+        let index_before = indexed_session_fields(&storage, &session_id).unwrap();
+        let baseline_before = std::fs::read(index_baseline_marker(&storage, &session_id)).unwrap();
+
+        let err = persistence
+            .persist_new(&[first, Message::assistant(oversized_high_escaping_text())])
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("transcript size limit"));
+        assert_eq!(std::fs::read(&transcript).unwrap(), transcript_before);
+        assert_eq!(
+            indexed_session_fields(&storage, &session_id),
+            Some(index_before)
+        );
+        assert_eq!(
+            std::fs::read(index_baseline_marker(&storage, &session_id)).unwrap(),
+            baseline_before
+        );
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_index_temporary(&storage, &session_id).exists());
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 1);
+            assert!(state.pending_index.is_empty());
+        }
+
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].message_count, 1);
+        let (resumed, messages, _) =
+            SessionPersistence::resume(&storage_str, session_id, "model".to_string())
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+
+        drop(resumed);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn new_transcript_directory_sync_failure_rolls_back_append() {
         let storage = test_storage("persist-transcript-file-sync-failure");
         let storage_str = storage.display().to_string();
@@ -5717,6 +6206,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_pending_marker_reindexes_only_affected_transcript() {
+        let storage = test_storage("persist-oversized-one-of-one-hundred");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let target_store = index_store(&storage).unwrap();
+        target_store
+            .save_session(&session_id, Some("Stale"), "model")
+            .unwrap();
+        target_store
+            .save_message(
+                &session_id,
+                &uuid::Uuid::new_v4().to_string(),
+                "assistant",
+                "stale index only",
+                None,
+            )
+            .unwrap();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+        write_session_model_record(&checked, &session_id, "model").unwrap();
+        seed_index_baseline_record(&storage, &session_id);
+        let messages = [
+            Message::user("actual first"),
+            Message::assistant("actual second"),
+        ];
+        let actual_uuids = seed_transcript(&storage, &session_id, &messages).await;
+        seed_oversized_pending_index_record(&storage, &session_id);
+
+        let mut unrelated = Vec::new();
+        for index in 0..100 {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let text = format!("unrelated {index}");
+            let message_uuid = uuid::Uuid::new_v4().to_string();
+            let store = index_store(&storage).unwrap();
+            store
+                .save_session(&session_id, Some(&text), "model")
+                .unwrap();
+            store
+                .save_message(&session_id, &message_uuid, "user", &text, None)
+                .unwrap();
+            unrelated.push((session_id, text));
+        }
+        let unaffected_id = unrelated.last().unwrap().0.clone();
+        let unaffected_before = indexed_session_fields(&storage, &unaffected_id).unwrap();
+        clear_message_index_attempts(&storage);
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+
+        assert!(listed.iter().any(|session| {
+            session.session_id == session_id && session.message_count == messages.len() as u32
+        }));
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &session_id),
+            actual_uuids
+        );
+        assert_eq!(message_index_attempts_for(&storage).len(), messages.len());
+        assert_eq!(
+            indexed_message_count(&storage, &session_id),
+            messages.len() as u32
+        );
+        assert_eq!(
+            indexed_session_fields(&storage, &unaffected_id),
+            Some(unaffected_before)
+        );
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_index_temporary(&storage, &session_id).exists());
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(session_model_marker(&storage, &session_id).is_file());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn restart_recovers_durable_append_once_without_duplicate_line() {
         let storage = test_storage("persist-restart-pending-index");
         let storage_str = storage.display().to_string();
@@ -5796,6 +6357,91 @@ mod tests {
         assert!(!index_contains(&storage, &session_id));
         assert_eq!(indexed_message_count(&storage, &session_id), 0);
         assert!(message_index_attempts_for(&storage).is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_pending_marker_deletes_absent_zero_count_ghost() {
+        let storage = test_storage("persist-oversized-absent-first-turn-ghost");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&session_id, Some("Speculative"), "model")
+            .unwrap();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+        write_session_model_record(&checked, &session_id, "model").unwrap();
+        seed_index_baseline_record(&storage, &session_id);
+        save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
+        seed_oversized_pending_index_record(&storage, &session_id);
+        for index in 0..100 {
+            index_store(&storage)
+                .unwrap()
+                .save_session(
+                    &uuid::Uuid::new_v4().to_string(),
+                    Some(&format!("unrelated {index}")),
+                    "model",
+                )
+                .unwrap();
+        }
+        assert!(index_search_contains(&storage, "Speculative", &session_id));
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 100);
+        assert!(listed
+            .iter()
+            .all(|session| session.session_id != session_id));
+        assert!(!index_search_contains(&storage, "Speculative", &session_id));
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        clear_module_state_for_root(&storage).await;
+        assert_eq!(list_sessions(&storage_str).await.unwrap().len(), 100);
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_widened_band_marker_deletes_old_zero_count_ghost() {
+        let storage = test_storage("persist-legacy-widened-band-first-turn-ghost");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&session_id, Some("Speculative widened band"), "model")
+            .unwrap();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+        write_session_model_record(&checked, &session_id, "model").unwrap();
+        seed_index_baseline_record(&storage, &session_id);
+        seed_legacy_widened_band_pending_index_record(&storage, &session_id);
+        for index in 0..100 {
+            index_store(&storage)
+                .unwrap()
+                .save_session(
+                    &uuid::Uuid::new_v4().to_string(),
+                    Some(&format!("newer unrelated {index}")),
+                    "model",
+                )
+                .unwrap();
+        }
+        assert!(index_search_contains(
+            &storage,
+            "Speculative widened band",
+            &session_id
+        ));
+
+        assert_eq!(list_sessions(&storage_str).await.unwrap().len(), 100);
+
+        assert!(!index_search_contains(
+            &storage,
+            "Speculative widened band",
+            &session_id
+        ));
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(!session_model_marker(&storage, &session_id).exists());
+        assert!(!index_baseline_marker(&storage, &session_id).exists());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
@@ -6176,6 +6822,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_oversized_recovery_failure_keeps_marker_without_partial_mutation() {
+        let storage = test_storage("persist-oversized-recovery-retry");
+        let storage_str = storage.display().to_string();
+        let unrelated_id = uuid::Uuid::new_v4().to_string();
+        let unrelated = SessionPersistence::create(
+            &storage_str,
+            unrelated_id.clone(),
+            "model".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        unrelated
+            .persist_new(&[Message::user("unrelated")])
+            .await
+            .unwrap();
+        drop(unrelated);
+        let unrelated_before = indexed_session_fields(&storage, &unrelated_id).unwrap();
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&session_id, Some("Stale"), "model")
+            .unwrap();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+        write_session_model_record(&checked, &session_id, "model").unwrap();
+        seed_index_baseline_record(&storage, &session_id);
+        let uuids = seed_transcript(
+            &storage,
+            &session_id,
+            &[Message::user("retry oversized recovery")],
+        )
+        .await;
+        seed_oversized_pending_index_record(&storage, &session_id);
+        clear_message_index_attempts(&storage);
+        fail_message_index_attempts(&storage, [true, true]);
+
+        for _ in 0..2 {
+            let err = match list_sessions(&storage_str).await {
+                Ok(_) => panic!("oversized pending index recovery failure must be surfaced"),
+                Err(err) => err,
+            };
+            assert!(err
+                .to_string()
+                .contains("cannot recover oversized pending message index"));
+            assert!(pending_index_marker(&storage, &session_id).is_file());
+            assert_eq!(indexed_message_count(&storage, &session_id), 0);
+            assert_eq!(
+                indexed_session_fields(&storage, &unrelated_id),
+                Some(unrelated_before.clone())
+            );
+            assert_eq!(
+                std::fs::metadata(pending_index_marker(&storage, &session_id))
+                    .unwrap()
+                    .len(),
+                MAX_INDEX_RECORD_BYTES + 1
+            );
+        }
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &session_id),
+            [uuids[0].clone(), uuids[0].clone()]
+        );
+        assert!(message_index_attempt_uuids(&storage, &unrelated_id).is_empty());
+
+        assert!(list_sessions(&storage_str).await.is_ok());
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_recovery_failure_precedes_normal_pending_mutation() {
+        let storage = test_storage("persist-oversized-precedes-normal-recovery");
+        let storage_str = storage.display().to_string();
+        let normal_id = uuid::Uuid::new_v4().to_string();
+        let normal_uuids =
+            seed_legacy_session(&storage, &normal_id, &[Message::user("normal pending")]).await;
+        seed_index_baseline_record(&storage, &normal_id);
+        seed_pending_index_record(
+            &storage,
+            &normal_id,
+            &normal_uuids[0],
+            "user",
+            "normal pending",
+        );
+
+        let oversized_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&oversized_id, Some("Oversized"), "model")
+            .unwrap();
+        seed_index_baseline_record(&storage, &oversized_id);
+        seed_transcript(
+            &storage,
+            &oversized_id,
+            &[Message::user("needs trusted model metadata")],
+        )
+        .await;
+        seed_oversized_pending_index_record(&storage, &oversized_id);
+        clear_message_index_attempts(&storage);
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("unsafe oversized recovery must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("trusted model metadata"));
+        assert!(pending_index_marker(&storage, &normal_id).is_file());
+        assert!(pending_index_marker(&storage, &oversized_id).is_file());
+        assert_eq!(indexed_message_count(&storage, &normal_id), 0);
+        assert!(message_index_attempts_for(&storage).is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn malformed_pending_record_preflights_batch_before_index_mutation() {
         let storage = test_storage("persist-malformed-pending-index");
         let storage_str = storage.display().to_string();
@@ -6228,7 +6991,10 @@ mod tests {
             "user",
             "valid pending",
         );
-        std::fs::write(pending_index_dir(&storage).join("not-a-uuid.json"), b"{}").unwrap();
+        std::fs::File::create(pending_index_dir(&storage).join("not-a-uuid.json"))
+            .unwrap()
+            .set_len(MAX_INDEX_RECORD_BYTES + 1)
+            .unwrap();
         clear_message_index_attempts(&storage);
 
         let err = match list_sessions(&storage_str).await {
@@ -6400,6 +7166,60 @@ mod tests {
         assert!(message_index_attempts_for(&storage).is_empty());
 
         remove_symlink_if_present(&unsafe_marker);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_pending_index_symlink_preserves_sentinel_and_fails() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-oversized-pending-index-record");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&session_id, Some("Unsafe"), "model")
+            .unwrap();
+        let lifecycle = storage.join(".session-lifecycle");
+        let pending = pending_index_dir(&storage);
+        std::fs::create_dir_all(&pending).unwrap();
+        let (external, sentinel) = external_sentinel("unsafe-oversized-pending-index-target");
+        std::fs::File::options()
+            .write(true)
+            .open(&sentinel)
+            .unwrap()
+            .set_len(MAX_INDEX_RECORD_BYTES + 1)
+            .unwrap();
+        let mut sentinel_prefix_before = vec![0; EXTERNAL_SENTINEL.len()];
+        std::fs::File::open(&sentinel)
+            .unwrap()
+            .read_exact(&mut sentinel_prefix_before)
+            .unwrap();
+        let marker = pending_index_marker(&storage, &session_id);
+        symlink(&sentinel, &marker).unwrap();
+        clear_message_index_attempts(&storage);
+
+        let result = list_sessions(&storage_str).await;
+
+        assert_eq!(
+            std::fs::metadata(&sentinel).unwrap().len(),
+            MAX_INDEX_RECORD_BYTES + 1
+        );
+        let mut sentinel_prefix_after = vec![0; EXTERNAL_SENTINEL.len()];
+        std::fs::File::open(&sentinel)
+            .unwrap()
+            .read_exact(&mut sentinel_prefix_after)
+            .unwrap();
+        assert_eq!(sentinel_prefix_after, sentinel_prefix_before);
+        assert_unsafe_storage_path(result, &marker, "symlink");
+        assert!(marker.is_symlink());
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+        assert!(message_index_attempts_for(&storage).is_empty());
+        assert!(lifecycle.is_dir());
+
+        remove_symlink_if_present(&marker);
         std::fs::remove_dir_all(storage).unwrap();
         std::fs::remove_dir_all(external).unwrap();
     }
