@@ -32,7 +32,7 @@ pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
 pub use memory::{MemoryNote, ProjectContext};
-pub use remote::{RemoteEvent, RemoteEventBatch, RemoteSession};
+pub use remote::{FamiliarIdentity, RemoteEvent, RemoteEventBatch, RemoteFamiliar, RemoteSession};
 pub use sessions::ChatSessionSummary;
 pub use share::{RedactionFinding, RedactionResult};
 
@@ -459,6 +459,7 @@ impl PocketEngine {
         project_root: String,
         prompt: String,
         title: String,
+        familiar_id: Option<String>,
         timeout_ms: u32,
     ) -> Result<RemoteSession, PocketError> {
         remote::launch(
@@ -467,9 +468,20 @@ impl PocketEngine {
             &project_root,
             &prompt,
             &title,
+            familiar_id.as_deref(),
             millis(timeout_ms),
         )
         .await
+    }
+
+    /// List familiars on the paired daemon.
+    pub async fn remote_familiars(
+        &self,
+        host: String,
+        port: u16,
+        timeout_ms: u32,
+    ) -> Result<Vec<RemoteFamiliar>, PocketError> {
+        remote::familiars(&host, port, millis(timeout_ms)).await
     }
 
     /// List sessions on the paired daemon. Callers gate on a verified
