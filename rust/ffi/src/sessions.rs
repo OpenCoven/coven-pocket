@@ -637,6 +637,22 @@ impl ForkStage {
         })
     }
 
+    fn stage_metadata(&mut self, bytes: &[u8]) -> Result<(), PocketError> {
+        self.stage_metadata_with(bytes, write_new_file)
+    }
+
+    fn stage_metadata_with(
+        &mut self,
+        bytes: &[u8],
+        write: impl FnOnce(&Path, &[u8], &str) -> Result<(), PocketError>,
+    ) -> Result<(), PocketError> {
+        let metadata = self
+            .directory
+            .join(format!("{}.familiar.json", self.session_id));
+        self.metadata = Some(metadata.clone());
+        write(&metadata, bytes, "staged fork familiar metadata")
+    }
+
     fn cleanup(&mut self) -> Result<(), PocketError> {
         if !self.armed {
             return Ok(());
@@ -773,15 +789,13 @@ async fn fork_session_unlocked(
     let familiar_bytes = familiar_metadata_bytes_at_root(root, session_id)?;
     let mut stage = ForkStage::create(root, &new_id)?;
     if let Some(bytes) = familiar_bytes {
-        let metadata = stage.directory.join(format!("{new_id}.familiar.json"));
-        if let Err(err) = write_new_file(&metadata, &bytes, "staged fork familiar metadata") {
+        if let Err(err) = stage.stage_metadata(&bytes) {
             return Err(fork_stage_error(
                 "cannot stage fork familiar metadata",
                 err,
                 &mut stage,
             ));
         }
-        stage.metadata = Some(metadata);
     }
 
     let mut parent: Option<String> = None;
@@ -1223,6 +1237,45 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(metadata.is_empty());
+        assert!(!storage.join(".fork-staging").exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn post_create_metadata_write_failure_cleans_staged_file_and_directories() {
+        let storage = test_storage("fork-partial-metadata");
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let mut stage = ForkStage::create(&storage, &fork_id).unwrap();
+        let err = stage
+            .stage_metadata_with(b"partial metadata", |path, _, context| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|write_err| {
+                        engine_err(&format!("cannot create {context}"), write_err)
+                    })?;
+                Err(engine_err(
+                    &format!("cannot write {context}"),
+                    std::io::Error::other("injected post-create write failure"),
+                ))
+            })
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected post-create write failure"));
+
+        let stage_directory = storage.join(".fork-staging").join(&fork_id);
+        let staged_metadata = stage_directory.join(format!("{fork_id}.familiar.json"));
+        assert!(staged_metadata.exists());
+
+        let err = fork_stage_error("cannot stage fork familiar metadata", err, &mut stage);
+        assert!(err
+            .to_string()
+            .contains("injected post-create write failure"));
+        assert!(!staged_metadata.exists());
+        assert!(!stage_directory.exists());
         assert!(!storage.join(".fork-staging").exists());
 
         std::fs::remove_dir_all(storage).unwrap();
