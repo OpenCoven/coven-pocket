@@ -15,14 +15,14 @@
 //! forward-compatible parser. The SQLite index only serves the browser UI;
 //! the JSONL file is the source of truth for restores.
 
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
 
 use claurst_core::session_storage::{
     load_transcript, make_assistant_entry, make_user_entry, messages_from_transcript,
-    write_transcript_entry, TranscriptEntry,
+    write_transcript_entry, TranscriptEntry, MAX_TRANSCRIPT_BYTES,
 };
 use claurst_core::types::{Message, Role};
 use claurst_core::SqliteSessionStore;
@@ -60,11 +60,27 @@ static SESSION_LIFECYCLE_LOCK: LazyLock<tokio::sync::RwLock<SessionLifecycle>> =
 struct SessionTestFaults {
     fail_fork_publication_after_row_once: bool,
     fail_index_delete_remaining: usize,
+    fail_session_index_remaining: usize,
+    fail_message_index_attempts: VecDeque<bool>,
+    fail_transcript_append_remaining: usize,
+    fail_transcript_after_write_remaining: usize,
 }
 
 #[cfg(test)]
 static SESSION_TEST_FAULTS: LazyLock<std::sync::Mutex<HashMap<PathBuf, SessionTestFaults>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MessageIndexAttempt {
+    root: PathBuf,
+    session_id: String,
+    uuid: String,
+}
+
+#[cfg(test)]
+static MESSAGE_INDEX_ATTEMPTS: LazyLock<std::sync::Mutex<Vec<MessageIndexAttempt>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
 static DIRECTORY_SYNC_EVENTS: LazyLock<std::sync::Mutex<Vec<PathBuf>>> =
@@ -517,6 +533,382 @@ fn checked_index_store(storage: &CheckedStorage) -> Result<SqliteSessionStore, P
     SqliteSessionStore::open(&index).map_err(|err| engine_err("cannot open session index", err))
 }
 
+fn save_index_session(
+    storage: &CheckedStorage,
+    store: &SqliteSessionStore,
+    session_id: &str,
+    title: Option<&str>,
+    model: &str,
+    context: &str,
+) -> Result<(), PocketError> {
+    storage.validate_sqlite_files()?;
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(storage.root()) {
+            if faults.fail_session_index_remaining > 0 {
+                faults.fail_session_index_remaining -= 1;
+                return Err(engine_err(
+                    context,
+                    std::io::Error::other("injected session index failure"),
+                ));
+            }
+        }
+    }
+    store
+        .save_session(session_id, title, model)
+        .map_err(|err| engine_err(context, err))
+}
+
+fn save_index_message(
+    storage: &CheckedStorage,
+    store: &SqliteSessionStore,
+    session_id: &str,
+    uuid: &str,
+    role: &str,
+    text: &str,
+    context: &str,
+) -> Result<(), PocketError> {
+    storage.validate_sqlite_files()?;
+    #[cfg(test)]
+    {
+        MESSAGE_INDEX_ATTEMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(MessageIndexAttempt {
+                root: storage.root().to_path_buf(),
+                session_id: session_id.to_string(),
+                uuid: uuid.to_string(),
+            });
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(storage.root()) {
+            if faults
+                .fail_message_index_attempts
+                .pop_front()
+                .unwrap_or(false)
+            {
+                return Err(engine_err(
+                    context,
+                    std::io::Error::other("injected message index failure"),
+                ));
+            }
+        }
+    }
+    store
+        .save_message(session_id, uuid, role, text, None)
+        .map_err(|err| engine_err(context, err))
+}
+
+fn rollback_transcript_append(
+    storage: &CheckedStorage,
+    path: &Path,
+    directory: &Path,
+    original_len: u64,
+    existed: bool,
+) -> Result<(), PocketError> {
+    if existed {
+        storage.validate_regular_file(path, false)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| engine_err("cannot reopen transcript for append rollback", err))?;
+        file.set_len(original_len)
+            .and_then(|()| file.sync_all())
+            .map_err(|err| engine_err("cannot roll back partial transcript append", err))
+    } else {
+        remove_file_durably_if_present(
+            storage,
+            path,
+            directory,
+            "cannot roll back partial transcript append",
+            "cannot sync partial transcript append rollback",
+        )
+    }
+}
+
+fn recover_complete_transcript_append(
+    storage: &CheckedStorage,
+    path: &Path,
+    directory: &Path,
+    original_len: u64,
+    line: &[u8],
+    existed: bool,
+) -> Result<bool, PocketError> {
+    storage.validate_regular_file(path, false)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| engine_err("cannot inspect uncertain transcript append", err))?;
+    let expected_len = original_len.checked_add(line.len() as u64).ok_or_else(|| {
+        engine_err(
+            "cannot inspect uncertain transcript append",
+            "size overflow",
+        )
+    })?;
+    if file
+        .metadata()
+        .map_err(|err| engine_err("cannot inspect uncertain transcript append", err))?
+        .len()
+        != expected_len
+    {
+        return Ok(false);
+    }
+    file.seek(std::io::SeekFrom::Start(original_len))
+        .map_err(|err| engine_err("cannot inspect uncertain transcript append", err))?;
+    let mut actual = vec![0; line.len()];
+    file.read_exact(&mut actual)
+        .map_err(|err| engine_err("cannot inspect uncertain transcript append", err))?;
+    if actual != line {
+        return Ok(false);
+    }
+    file.sync_all()
+        .map_err(|err| engine_err("cannot sync recovered transcript append", err))?;
+    if !existed {
+        sync_directory(
+            storage,
+            directory,
+            "cannot sync recovered transcript file creation",
+        )?;
+    }
+    Ok(true)
+}
+
+fn repair_incomplete_transcript_tail(
+    storage: &CheckedStorage,
+    path: &Path,
+) -> Result<(), PocketError> {
+    storage.validate_regular_file(path, false)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+    let len = file
+        .metadata()
+        .map_err(|err| engine_err("cannot inspect transcript tail", err))?
+        .len();
+    if len > MAX_TRANSCRIPT_BYTES {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot repair transcript tail: transcript file too large ({len} bytes, max \
+                 {MAX_TRANSCRIPT_BYTES})"
+            ),
+        });
+    }
+    if len == 0 {
+        return Ok(());
+    }
+
+    file.seek(std::io::SeekFrom::Start(len - 1))
+        .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    const SCAN_CHUNK: u64 = 8 * 1024;
+    let mut position = len;
+    let mut truncate_to = 0;
+    while position > 0 {
+        let start = position.saturating_sub(SCAN_CHUNK);
+        let chunk_len = usize::try_from(position - start)
+            .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+        let mut chunk = vec![0_u8; chunk_len];
+        file.seek(std::io::SeekFrom::Start(start))
+            .and_then(|_| file.read_exact(&mut chunk))
+            .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+        if let Some(index) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            truncate_to = start + index as u64 + 1;
+            break;
+        }
+        position = start;
+    }
+
+    let tail_len = usize::try_from(len - truncate_to)
+        .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+    let mut tail = vec![0_u8; tail_len];
+    file.seek(std::io::SeekFrom::Start(truncate_to))
+        .and_then(|_| file.read_exact(&mut tail))
+        .map_err(|err| engine_err("cannot inspect transcript tail", err))?;
+    if serde_json::from_slice::<serde_json::Value>(&tail).is_ok() {
+        if len < MAX_TRANSCRIPT_BYTES {
+            file.seek(std::io::SeekFrom::End(0))
+                .and_then(|_| file.write_all(b"\n"))
+                .and_then(|_| file.flush())
+                .and_then(|_| file.sync_all())
+                .map_err(|err| engine_err("cannot repair transcript final newline", err))?;
+        }
+        return Ok(());
+    }
+
+    file.set_len(truncate_to)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| engine_err("cannot repair incomplete transcript tail", err))
+}
+
+struct TranscriptAppendError {
+    error: PocketError,
+    uncertain: bool,
+}
+
+impl TranscriptAppendError {
+    fn uncertain(error: PocketError) -> Self {
+        Self {
+            error,
+            uncertain: true,
+        }
+    }
+}
+
+impl From<PocketError> for TranscriptAppendError {
+    fn from(error: PocketError) -> Self {
+        Self {
+            error,
+            uncertain: false,
+        }
+    }
+}
+
+fn append_transcript_entry(
+    storage: &CheckedStorage,
+    path: &Path,
+    entry: &TranscriptEntry,
+) -> Result<(), TranscriptAppendError> {
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(storage.root()) {
+            if faults.fail_transcript_append_remaining > 0 {
+                faults.fail_transcript_append_remaining -= 1;
+                return Err(engine_err(
+                    "cannot write transcript",
+                    std::io::Error::other("injected transcript append failure"),
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut line =
+        serde_json::to_vec(entry).map_err(|err| engine_err("cannot serialize transcript", err))?;
+    line.push(b'\n');
+    let (existed, original_len) = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => (true, metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, 0),
+        Err(err) => {
+            return Err(engine_err("cannot inspect transcript before append", err).into());
+        }
+    };
+    let directory = path
+        .parent()
+        .ok_or_else(|| persistence_err(path, "transcript path has no containing directory"))?;
+    if original_len >= MAX_TRANSCRIPT_BYTES
+        || line.len() as u64 > MAX_TRANSCRIPT_BYTES - original_len
+    {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot write transcript: transcript size limit of {MAX_TRANSCRIPT_BYTES} bytes reached"
+            ),
+        }
+        .into());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| engine_err("cannot write transcript", err))?;
+
+    let mut write_result = file.write_all(&line);
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if write_result.is_ok() {
+            if let Some(faults) = faults.get_mut(storage.root()) {
+                if faults.fail_transcript_after_write_remaining > 0 {
+                    faults.fail_transcript_after_write_remaining -= 1;
+                    write_result = Err(std::io::Error::other(
+                        "injected post-write transcript failure",
+                    ));
+                }
+            }
+        }
+    }
+    if write_result.is_ok() {
+        write_result = file.flush();
+    }
+    if write_result.is_ok() {
+        write_result = file.sync_all();
+    }
+    if let Err(write_err) = write_result {
+        drop(file);
+        match rollback_transcript_append(storage, path, directory, original_len, existed) {
+            Ok(()) => return Err(engine_err("cannot write transcript", write_err).into()),
+            Err(first_rollback_err) => {
+                if recover_complete_transcript_append(
+                    storage,
+                    path,
+                    directory,
+                    original_len,
+                    &line,
+                    existed,
+                )
+                .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                return match rollback_transcript_append(
+                    storage,
+                    path,
+                    directory,
+                    original_len,
+                    existed,
+                ) {
+                    Ok(()) => Err(engine_err("cannot write transcript", write_err).into()),
+                    Err(second_rollback_err) => {
+                        Err(TranscriptAppendError::uncertain(PocketError::Engine {
+                            message: format!(
+                                "cannot write transcript: {write_err}; append rollback failed twice: \
+                                 {first_rollback_err}; {second_rollback_err}"
+                            ),
+                        }))
+                    }
+                };
+            }
+        }
+    }
+    if !existed {
+        drop(file);
+        if let Err(sync_err) =
+            sync_directory(storage, directory, "cannot sync transcript file creation")
+        {
+            return match remove_file_durably_if_present(
+                storage,
+                path,
+                directory,
+                "cannot roll back transcript file creation",
+                "cannot sync transcript file creation rollback",
+            ) {
+                Ok(()) => Err(sync_err.into()),
+                Err(rollback_err) => Err(TranscriptAppendError::uncertain(PocketError::Engine {
+                    message: format!("{sync_err}; rollback also failed: {rollback_err}"),
+                })),
+            };
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn index_store(root: &Path) -> Result<SqliteSessionStore, PocketError> {
     checked_index_store(&CheckedStorage::from_root(root)?)
@@ -549,6 +941,23 @@ fn delete_index_session(
             .delete_session(session_id)
             .map_err(|err| engine_err(context, err))
     })
+}
+
+fn rollback_unstarted_session_index(
+    storage: &CheckedStorage,
+    session_id: &str,
+    append_err: PocketError,
+) -> PocketError {
+    match delete_index_session(
+        storage,
+        session_id,
+        "cannot roll back session index after transcript append failure",
+    ) {
+        Ok(()) => append_err,
+        Err(rollback_err) => PocketError::Engine {
+            message: format!("{append_err}; index rollback also failed: {rollback_err}"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1499,6 +1908,14 @@ pub(crate) struct SessionPersistence {
 struct PersistState {
     persisted: usize,
     last_uuid: Option<String>,
+    pending_index: VecDeque<PendingIndexMessage>,
+    uncertain_append: Option<String>,
+}
+
+struct PendingIndexMessage {
+    uuid: String,
+    role: String,
+    text: String,
 }
 
 impl SessionPersistence {
@@ -1512,7 +1929,7 @@ impl SessionPersistence {
         let storage = CheckedStorage::open(storage_dir)?;
         let key = session_key(storage.root(), &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-        recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+        recover_storage_unlocked(&storage, &mut lifecycle).await?;
         match lifecycle.sessions.get(&key) {
             Some(SessionLifecycleState::Active { .. }) => {
                 return Err(PocketError::Engine {
@@ -1556,6 +1973,8 @@ impl SessionPersistence {
             state: tokio::sync::Mutex::new(PersistState {
                 persisted: 0,
                 last_uuid: None,
+                pending_index: VecDeque::new(),
+                uncertain_append: None,
             }),
         })
     }
@@ -1569,7 +1988,7 @@ impl SessionPersistence {
         let storage = CheckedStorage::open(storage_dir)?;
         let key = session_key(storage.root(), &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-        recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+        recover_storage_unlocked(&storage, &mut lifecycle).await?;
         ensure_session_available(&lifecycle, &key)?;
         if matches!(
             lifecycle.sessions.get(&key),
@@ -1579,7 +1998,19 @@ impl SessionPersistence {
                 message: format!("session {session_id} is already open for writing"),
             });
         }
-        let (messages, last_uuid) = load_session_messages_at_storage(&storage, &session_id).await?;
+        let loaded = load_session_transcript_at_storage(&storage, &session_id).await?;
+        let store = checked_index_store(&storage)?;
+        save_index_session(
+            &storage,
+            &store,
+            &session_id,
+            Some(&derive_title(&loaded.messages)),
+            &model,
+            "cannot reconcile session index",
+        )?;
+        reconcile_loaded_transcript(&storage, &store, &session_id, &loaded)?;
+        let last_uuid = loaded.last_uuid();
+        let messages = loaded.messages;
         let familiar = load_familiar_metadata_at_storage(&storage, &session_id)?;
         let generation = uuid::Uuid::new_v4();
         let writer_lease = Arc::new(SessionWriterLease);
@@ -1599,6 +2030,8 @@ impl SessionPersistence {
             state: tokio::sync::Mutex::new(PersistState {
                 persisted: messages.len(),
                 last_uuid,
+                pending_index: VecDeque::new(),
+                uncertain_append: None,
             }),
         };
         Ok((persistence, messages, familiar))
@@ -1610,29 +2043,58 @@ impl SessionPersistence {
         let lifecycle = SESSION_LIFECYCLE_LOCK.read().await;
         ensure_persistence_active(&lifecycle, &self.key, self.generation)?;
         let mut state = self.state.lock().await;
+        if let Some(error) = &state.uncertain_append {
+            return Err(PocketError::Engine {
+                message: format!("append outcome remains uncertain: {error}"),
+            });
+        }
+        if state.pending_index.is_empty() && messages.len() <= state.persisted {
+            return Ok(());
+        }
+
+        let store = checked_index_store(&self.storage)?;
+        drain_pending_index(
+            &self.storage,
+            &store,
+            &self.key.session_id,
+            &mut state.pending_index,
+            "cannot index message",
+        )?;
         if messages.len() <= state.persisted {
             return Ok(());
         }
 
-        let transcript_directory = self.storage.transcripts_dir()?;
-        ensure_durable_directory(
+        save_index_session(
             &self.storage,
-            self.storage.root(),
-            &transcript_directory,
-            "cannot create transcript dir",
-            "cannot sync transcript directory creation",
+            &store,
+            &self.key.session_id,
+            Some(&derive_title(messages)),
+            &self.model,
+            "cannot index session",
         )?;
-        let path = self.storage.transcript_file(&self.key.session_id)?;
-        self.storage.validate_regular_file(&path, true)?;
-        let store = checked_index_store(&self.storage)?;
-        self.storage.validate_sqlite_files()?;
-        store
-            .save_session(
-                &self.key.session_id,
-                Some(&derive_title(messages)),
-                &self.model,
-            )
-            .map_err(|e| engine_err("cannot index session", e))?;
+        let transcript_setup = (|| -> Result<(PathBuf, PathBuf), PocketError> {
+            let transcript_directory = self.storage.transcripts_dir()?;
+            ensure_durable_directory(
+                &self.storage,
+                self.storage.root(),
+                &transcript_directory,
+                "cannot create transcript dir",
+                "cannot sync transcript directory creation",
+            )?;
+            let path = self.storage.transcript_file(&self.key.session_id)?;
+            self.storage.validate_regular_file(&path, true)?;
+            Ok((transcript_directory, path))
+        })();
+        let (_transcript_directory, path) = match transcript_setup {
+            Ok(paths) => paths,
+            Err(err) => {
+                return Err(if state.persisted == 0 {
+                    rollback_unstarted_session_index(&self.storage, &self.key.session_id, err)
+                } else {
+                    err
+                });
+            }
+        };
 
         for message in &messages[state.persisted..] {
             let uuid = uuid::Uuid::new_v4().to_string();
@@ -1642,26 +2104,87 @@ impl SessionPersistence {
                 state.last_uuid.as_deref(),
                 &self.key.session_id,
             );
-            self.storage.validate_regular_file(&path, true)?;
-            write_transcript_entry(&path, &entry)
-                .await
-                .map_err(|e| engine_err("cannot write transcript", e))?;
-            self.storage.validate_regular_file(&path, false)?;
-            self.storage.validate_sqlite_files()?;
-            store
-                .save_message(
-                    &self.key.session_id,
-                    &uuid,
-                    role_str(&message.role),
-                    &message.get_all_text(),
-                    None,
-                )
-                .map_err(|e| engine_err("cannot index message", e))?;
-            state.last_uuid = Some(uuid);
+            let pending = PendingIndexMessage::from_message(&uuid, message);
+            if let Err(err) = self.storage.validate_regular_file(&path, true) {
+                return Err(if state.persisted == 0 {
+                    rollback_unstarted_session_index(&self.storage, &self.key.session_id, err)
+                } else {
+                    err
+                });
+            }
+            if let Err(err) = append_transcript_entry(&self.storage, &path, &entry) {
+                let append_err = err.error;
+                if err.uncertain {
+                    state.uncertain_append = Some(append_err.to_string());
+                    return Err(append_err);
+                }
+                return Err(if state.persisted == 0 {
+                    rollback_unstarted_session_index(
+                        &self.storage,
+                        &self.key.session_id,
+                        append_err,
+                    )
+                } else {
+                    append_err
+                });
+            }
             state.persisted += 1;
+            state.last_uuid = Some(uuid);
+            state.pending_index.push_back(pending);
+            self.storage.validate_regular_file(&path, false)?;
+            drain_pending_index(
+                &self.storage,
+                &store,
+                &self.key.session_id,
+                &mut state.pending_index,
+                "cannot index message",
+            )?;
         }
         Ok(())
     }
+}
+
+impl PendingIndexMessage {
+    fn from_message(uuid: &str, message: &Message) -> Self {
+        Self {
+            uuid: uuid.to_string(),
+            role: role_str(&message.role).to_string(),
+            text: message.get_all_text(),
+        }
+    }
+
+    fn from_entry(entry: &TranscriptEntry) -> Result<Option<Self>, PocketError> {
+        let message = match entry {
+            TranscriptEntry::User(message) | TranscriptEntry::Assistant(message) => message,
+            _ => return Ok(None),
+        };
+        let uuid = message.uuid.clone().ok_or_else(|| PocketError::Engine {
+            message: "cannot reconcile transcript message without UUID".to_string(),
+        })?;
+        Ok(Some(Self::from_message(&uuid, &message.message)))
+    }
+}
+
+fn drain_pending_index(
+    storage: &CheckedStorage,
+    store: &SqliteSessionStore,
+    session_id: &str,
+    pending: &mut VecDeque<PendingIndexMessage>,
+    context: &str,
+) -> Result<(), PocketError> {
+    while let Some(message) = pending.front() {
+        save_index_message(
+            storage,
+            store,
+            session_id,
+            &message.uuid,
+            &message.role,
+            &message.text,
+            context,
+        )?;
+        pending.pop_front();
+    }
+    Ok(())
 }
 
 fn role_str(role: &Role) -> &'static str {
@@ -1683,25 +2206,112 @@ fn build_entry(
     }
 }
 
-async fn load_session_messages_at_storage(
+struct LoadedSessionTranscript {
+    entries: Vec<TranscriptEntry>,
+    messages: Vec<Message>,
+}
+
+impl LoadedSessionTranscript {
+    fn last_uuid(&self) -> Option<String> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::User(message) | TranscriptEntry::Assistant(message) => {
+                message.uuid.clone()
+            }
+            _ => None,
+        })
+    }
+}
+
+async fn load_existing_session_transcript_at_storage(
     storage: &CheckedStorage,
     session_id: &str,
-) -> Result<(Vec<Message>, Option<String>), PocketError> {
+) -> Result<Option<LoadedSessionTranscript>, PocketError> {
     let path = storage.transcript_file(session_id)?;
     if !storage.validate_regular_file(&path, true)? {
-        return Err(PocketError::Engine {
-            message: format!("no stored session {session_id}"),
-        });
+        return Ok(None);
     }
     storage.validate_regular_file(&path, false)?;
+    repair_incomplete_transcript_tail(storage, &path)?;
     let entries = load_transcript(&path)
         .await
         .map_err(|e| engine_err("cannot load transcript", e))?;
-    let last_uuid = entries
-        .iter()
-        .rev()
-        .find_map(|e| e.uuid().map(str::to_string));
-    Ok((messages_from_transcript(&entries), last_uuid))
+    let messages = messages_from_transcript(&entries);
+    Ok(Some(LoadedSessionTranscript { entries, messages }))
+}
+
+async fn load_session_transcript_at_storage(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<LoadedSessionTranscript, PocketError> {
+    load_existing_session_transcript_at_storage(storage, session_id)
+        .await?
+        .ok_or_else(|| PocketError::Engine {
+            message: format!("no stored session {session_id}"),
+        })
+}
+
+fn reconcile_loaded_transcript(
+    storage: &CheckedStorage,
+    store: &SqliteSessionStore,
+    session_id: &str,
+    loaded: &LoadedSessionTranscript,
+) -> Result<(), PocketError> {
+    for entry in &loaded.entries {
+        if let Some(message) = PendingIndexMessage::from_entry(entry)? {
+            save_index_message(
+                storage,
+                store,
+                session_id,
+                &message.uuid,
+                &message.role,
+                &message.text,
+                "cannot reconcile message index",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_indexed_transcripts_unlocked(
+    storage: &CheckedStorage,
+    lifecycle: &SessionLifecycle,
+) -> Result<(), PocketError> {
+    let index = storage.index_file("")?;
+    if !storage.validate_regular_file(&index, true)? {
+        return Ok(());
+    }
+    let transcript_directory = storage.transcripts_dir()?;
+    if !storage.validate_directory(&transcript_directory, true)? {
+        return Ok(());
+    }
+
+    let store = checked_index_store(storage)?;
+    let rows = store
+        .list_sessions()
+        .map_err(|err| engine_err("cannot list sessions for reconciliation", err))?;
+    validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
+    for row in rows {
+        if matches!(
+            lifecycle
+                .sessions
+                .get(&session_key(storage.root(), &row.id)),
+            Some(SessionLifecycleState::Tombstoned | SessionLifecycleState::PendingFork)
+        ) {
+            continue;
+        }
+        if let Some(loaded) = load_existing_session_transcript_at_storage(storage, &row.id).await? {
+            reconcile_loaded_transcript(storage, &store, &row.id, &loaded)?;
+        }
+    }
+    Ok(())
+}
+
+async fn recover_storage_unlocked(
+    storage: &CheckedStorage,
+    lifecycle: &mut SessionLifecycle,
+) -> Result<(), PocketError> {
+    recover_pending_lifecycle_unlocked(storage, lifecycle)?;
+    reconcile_indexed_transcripts_unlocked(storage, lifecycle).await
 }
 
 #[cfg(test)]
@@ -1709,14 +2319,17 @@ async fn load_session_messages_at_root(
     root: &Path,
     session_id: &str,
 ) -> Result<(Vec<Message>, Option<String>), PocketError> {
-    load_session_messages_at_storage(&CheckedStorage::from_root(root)?, session_id).await
+    let loaded =
+        load_session_transcript_at_storage(&CheckedStorage::from_root(root)?, session_id).await?;
+    let last_uuid = loaded.last_uuid();
+    Ok((loaded.messages, last_uuid))
 }
 
 /// Newest-first summaries for the browser.
 pub async fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
     let storage = CheckedStorage::open(storage_dir)?;
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+    recover_storage_unlocked(&storage, &mut lifecycle).await?;
     list_sessions_unlocked(&storage, &lifecycle)
 }
 
@@ -2055,7 +2668,7 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+    recover_storage_unlocked(&storage, &mut lifecycle).await?;
     if let Err(start_err) = begin_session_deletion(&storage, session_id) {
         let marker_state = storage
             .pending_deletion_marker(session_id)
@@ -2094,7 +2707,7 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+    recover_storage_unlocked(&storage, &mut lifecycle).await?;
     ensure_session_available(&lifecycle, &key)?;
     fork_session_unlocked(&storage, session_id, &mut lifecycle, None).await
 }
@@ -2115,7 +2728,7 @@ async fn fork_session_with_stage_pause(
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+    recover_storage_unlocked(&storage, &mut lifecycle).await?;
     ensure_session_available(&lifecycle, &key)?;
     fork_session_unlocked(&storage, session_id, &mut lifecycle, Some(stage_pause)).await
 }
@@ -2389,7 +3002,8 @@ async fn fork_session_unlocked(
     #[cfg(test)] mut stage_pause: Option<ForkStagePause>,
     #[cfg(not(test))] _stage_pause: Option<()>,
 ) -> Result<String, PocketError> {
-    let (messages, _) = load_session_messages_at_storage(storage, session_id).await?;
+    let loaded = load_session_transcript_at_storage(storage, session_id).await?;
+    let messages = loaded.messages;
     if messages.is_empty() {
         return Err(PocketError::Engine {
             message: format!("session {session_id} has no messages to fork"),
@@ -2464,7 +3078,7 @@ async fn fork_session_unlocked(
             .map_err(|err| {
                 fork_stage_error("cannot validate staged fork transcript", err, &mut stage)
             })?;
-        indexed_messages.push((uuid.clone(), message));
+        indexed_messages.push(PendingIndexMessage::from_message(&uuid, message));
         parent = Some(uuid);
 
         #[cfg(test)]
@@ -2626,22 +3240,15 @@ async fn fork_session_unlocked(
             &key,
         ));
     }
-    for (uuid, message) in indexed_messages {
-        if let Err(err) = storage.validate_sqlite_files() {
-            return Err(fork_publication_error(
-                "cannot preflight fork message index",
-                err,
-                &mut stage,
-                lifecycle,
-                &key,
-            ));
-        }
-        if let Err(err) = store.save_message(
+    for message in indexed_messages {
+        if let Err(err) = save_index_message(
+            storage,
+            &store,
             &new_id,
-            &uuid,
-            role_str(&message.role),
-            &message.get_all_text(),
-            None,
+            &message.uuid,
+            &message.role,
+            &message.text,
+            "cannot publish fork message index",
         ) {
             return Err(fork_publication_error(
                 "cannot publish fork message index",
@@ -2703,16 +3310,58 @@ mod tests {
         fail_fork_publication_after_row_once: bool,
         fail_index_delete_remaining: usize,
     ) {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let faults = faults.entry(root.to_path_buf()).or_default();
+        faults.fail_fork_publication_after_row_once = fail_fork_publication_after_row_once;
+        faults.fail_index_delete_remaining = fail_index_delete_remaining;
+    }
+
+    fn fail_session_index(root: &Path, count: usize) {
         SESSION_TEST_FAULTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.to_path_buf(),
-                SessionTestFaults {
-                    fail_fork_publication_after_row_once,
-                    fail_index_delete_remaining,
-                },
-            );
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_session_index_remaining = count;
+    }
+
+    fn fail_message_index_attempts(root: &Path, failures: impl IntoIterator<Item = bool>) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_message_index_attempts = failures.into_iter().collect();
+    }
+
+    fn fail_transcript_append(root: &Path, count: usize) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_transcript_append_remaining = count;
+    }
+
+    fn fail_transcript_after_write(root: &Path, count: usize) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_transcript_after_write_remaining = count;
+    }
+
+    fn message_index_attempt_uuids(root: &Path, session_id: &str) -> Vec<String> {
+        MESSAGE_INDEX_ATTEMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|attempt| attempt.root == root && attempt.session_id == session_id)
+            .map(|attempt| attempt.uuid.clone())
+            .collect()
     }
 
     fn directory_syncs_for(root: &Path) -> Vec<PathBuf> {
@@ -2757,6 +3406,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(root);
+        MESSAGE_INDEX_ATTEMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|attempt| attempt.root != root);
     }
 
     fn indexed_fork_id(root: &Path, source_id: &str) -> String {
@@ -2884,6 +3537,17 @@ mod tests {
             .any(|row| row.id == session_id)
     }
 
+    fn indexed_message_count(root: &Path, session_id: &str) -> u32 {
+        index_store(root)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == session_id)
+            .map(|row| row.message_count)
+            .unwrap_or_default()
+    }
+
     fn assert_deletion_fixture_present(storage: &Path, session_id: &str, staged_file: &Path) {
         assert!(index_contains(storage, session_id));
         assert!(transcript_file(storage, session_id).exists());
@@ -2919,6 +3583,741 @@ mod tests {
         assert_eq!(title.chars().count(), 60);
         assert!(!title.contains('\n'));
         assert_eq!(derive_title(&[]), "");
+    }
+
+    fn chain_uuid_and_parent(entry: &TranscriptEntry) -> (String, Option<String>) {
+        match entry {
+            TranscriptEntry::User(message) | TranscriptEntry::Assistant(message) => (
+                message.uuid.clone().expect("chain entry must have a UUID"),
+                message.parent_uuid.clone(),
+            ),
+            _ => panic!("expected a chain entry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn message_index_retry_reuses_durable_transcript_uuid() {
+        let storage = test_storage("persist-index-retry");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("hello")];
+        fail_message_index_attempts(&storage, [true]);
+
+        let err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(err.to_string().contains("cannot index message"));
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let (durable_uuid, parent) = chain_uuid_and_parent(&entries[0]);
+        assert!(parent.is_none());
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+
+        persistence.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            chain_uuid_and_parent(&entries[0]),
+            (durable_uuid.clone(), None)
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &session_id),
+            [durable_uuid.clone(), durable_uuid]
+        );
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_message_index_failure_retries_without_reappend() {
+        let storage = test_storage("persist-second-index-retry");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("first"), Message::assistant("second")];
+        fail_message_index_attempts(&storage, [false, true]);
+
+        let err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(err.to_string().contains("cannot index message"));
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let (first_uuid, first_parent) = chain_uuid_and_parent(&entries[0]);
+        let (second_uuid, second_parent) = chain_uuid_and_parent(&entries[1]);
+        assert!(first_parent.is_none());
+        assert_eq!(second_parent.as_deref(), Some(first_uuid.as_str()));
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        persistence.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            chain_uuid_and_parent(&entries[0]),
+            (first_uuid.clone(), None)
+        );
+        assert_eq!(
+            chain_uuid_and_parent(&entries[1]),
+            (second_uuid.clone(), Some(first_uuid.clone()))
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &session_id),
+            [first_uuid, second_uuid.clone(), second_uuid]
+        );
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchanged_message_slice_drains_pending_index_work() {
+        let storage = test_storage("persist-unchanged-index-retry");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("unchanged")];
+        fail_message_index_attempts(&storage, [true]);
+
+        persistence.persist_new(&messages).await.unwrap_err();
+        persistence.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_message_index_failures_never_append_extra_lines() {
+        let storage = test_storage("persist-repeated-index-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("retry me")];
+        fail_message_index_attempts(&storage, [true, true, true]);
+
+        for _ in 0..3 {
+            let err = persistence.persist_new(&messages).await.unwrap_err();
+            assert!(err.to_string().contains("cannot index message"));
+            assert_eq!(
+                load_transcript(&transcript_file(&storage, &session_id))
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(indexed_message_count(&storage, &session_id), 0);
+        }
+
+        persistence.persist_new(&messages).await.unwrap();
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_index_failure_before_append_does_not_advance_state() {
+        let storage = test_storage("persist-session-index-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("not yet durable")];
+        fail_session_index(&storage, 1);
+
+        let err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(err.to_string().contains("cannot index session"));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 0);
+            assert!(state.last_uuid.is_none());
+            assert!(state.pending_index.is_empty());
+        }
+
+        persistence.persist_new(&messages).await.unwrap();
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcript_append_failure_does_not_advance_state() {
+        let storage = test_storage("persist-transcript-append-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("append later")];
+        fail_transcript_append(&storage, 1);
+
+        let err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(err.to_string().contains("cannot write transcript"));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 0);
+            assert!(state.last_uuid.is_none());
+            assert!(state.pending_index.is_empty());
+        }
+
+        persistence.persist_new(&messages).await.unwrap();
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_write_transcript_failure_rolls_back_before_retry() {
+        let storage = test_storage("persist-transcript-post-write-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("append atomically")];
+        fail_transcript_after_write(&storage, 1);
+
+        let err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected post-write transcript failure"));
+        assert!(load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 0);
+            assert!(state.last_uuid.is_none());
+            assert!(state.pending_index.is_empty());
+        }
+
+        persistence.persist_new(&messages).await.unwrap();
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_recovers_complete_append_without_duplicate() {
+        let storage = test_storage("persist-transcript-rollback-recovery");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("recover complete append")];
+        let transcript = transcript_file(&storage, &session_id);
+        fail_transcript_after_write(&storage, 1);
+        fail_file_remove(&transcript, 1);
+
+        persistence.persist_new(&messages).await.unwrap();
+        persistence.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+        let state = persistence.state.lock().await;
+        assert_eq!(state.persisted, 1);
+        assert!(state.pending_index.is_empty());
+        drop(state);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncertain_append_failure_blocks_new_uuid_retry() {
+        let storage = test_storage("persist-transcript-uncertain-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("do not duplicate uncertain append")];
+        let transcript_directory = storage.join("transcripts");
+        std::fs::create_dir_all(&transcript_directory).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        fail_transcript_after_write(&storage, 1);
+        fail_file_remove(&transcript, 2);
+        fail_directory_sync(&transcript_directory, 1);
+
+        let first_err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(first_err
+            .to_string()
+            .contains("append rollback failed twice"));
+        let second_err = persistence.persist_new(&messages).await.unwrap_err();
+        assert!(second_err
+            .to_string()
+            .contains("append outcome remains uncertain"));
+
+        let entries = load_transcript(&transcript).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(load_transcript(&transcript).await.unwrap().len(), 1);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_truncates_partial_tail_before_later_append() {
+        let storage = test_storage("persist-transcript-partial-tail");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        persistence
+            .persist_new(&[Message::user("before partial tail")])
+            .await
+            .unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        let entries = load_transcript(&transcript).await.unwrap();
+        let (first_uuid, _) = chain_uuid_and_parent(&entries[0]);
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(br#"{"type":"assistant","uuid":"partial"#)
+            .unwrap();
+
+        let (resumed, mut messages, _) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        messages.push(Message::assistant("after partial tail"));
+        resumed.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        let (_, parent) = chain_uuid_and_parent(&entries[1]);
+        assert_eq!(parent.as_deref(), Some(first_uuid.as_str()));
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+
+        drop(resumed);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_complete_final_entry_without_newline() {
+        let storage = test_storage("persist-transcript-missing-newline");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        persistence
+            .persist_new(&[Message::user("complete without newline")])
+            .await
+            .unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        let original_len = std::fs::metadata(&transcript).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_len(original_len - 1)
+            .unwrap();
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        let (resumed, mut messages, _) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+        messages.push(Message::assistant("after repaired newline"));
+        resumed.persist_new(&messages).await.unwrap();
+
+        let bytes = std::fs::read(&transcript).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(load_transcript(&transcript).await.unwrap().len(), 2);
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+
+        drop(resumed);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn tail_repair_rejects_oversized_transcript_before_allocation() {
+        let storage = test_storage("persist-transcript-oversized-tail");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let transcript_directory = storage.join("transcripts");
+        std::fs::create_dir_all(&transcript_directory).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        std::fs::File::create(&transcript)
+            .unwrap()
+            .set_len(claurst_core::session_storage::MAX_TRANSCRIPT_BYTES + 1)
+            .unwrap();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+
+        let err = repair_incomplete_transcript_tail(&checked, &transcript).unwrap_err();
+        assert!(err.to_string().contains("too large"));
+        assert_eq!(
+            std::fs::metadata(&transcript).unwrap().len(),
+            claurst_core::session_storage::MAX_TRANSCRIPT_BYTES + 1
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn tail_repair_preserves_complete_future_json_entry() {
+        let storage = test_storage("persist-transcript-future-tail");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let transcript_directory = storage.join("transcripts");
+        std::fs::create_dir_all(&transcript_directory).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        let future_entry = br#"{"type":"user","futureRequiredField":true}"#;
+        std::fs::write(&transcript, future_entry).unwrap();
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+
+        repair_incomplete_transcript_tail(&checked, &transcript).unwrap();
+
+        let mut expected = future_entry.to_vec();
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&transcript).unwrap(), expected);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcript_size_limit_is_an_explicit_non_mutating_failure() {
+        let storage = test_storage("persist-transcript-size-limit");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let transcript_directory = storage.join("transcripts");
+        std::fs::create_dir_all(&transcript_directory).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        std::fs::File::create(&transcript)
+            .unwrap()
+            .set_len(claurst_core::session_storage::MAX_TRANSCRIPT_BYTES)
+            .unwrap();
+
+        let err = persistence
+            .persist_new(&[Message::user("must not be indexed")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("transcript size limit"));
+        assert_eq!(
+            std::fs::metadata(&transcript).unwrap().len(),
+            claurst_core::session_storage::MAX_TRANSCRIPT_BYTES
+        );
+        assert!(!index_contains(&storage, &session_id));
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 0);
+            assert!(state.last_uuid.is_none());
+            assert!(state.pending_index.is_empty());
+        }
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_transcript_directory_sync_failure_rolls_back_append() {
+        let storage = test_storage("persist-transcript-file-sync-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let transcript_directory = storage.join("transcripts");
+        std::fs::create_dir_all(&transcript_directory).unwrap();
+        fail_directory_sync(&transcript_directory, 1);
+
+        let err = persistence
+            .persist_new(&[Message::user("durable creation")])
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot sync transcript file creation"));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+        {
+            let state = persistence.state.lock().await;
+            assert_eq!(state.persisted, 0);
+            assert!(state.last_uuid.is_none());
+            assert!(state.pending_index.is_empty());
+        }
+
+        persistence
+            .persist_new(&[Message::user("durable creation")])
+            .await
+            .unwrap();
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_list_reconciles_missing_index_from_transcript_uuid() {
+        let storage = test_storage("persist-restart-list-reconcile");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("before restart")];
+        fail_message_index_attempts(&storage, [true]);
+        persistence.persist_new(&messages).await.unwrap_err();
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        let (durable_uuid, _) = chain_uuid_and_parent(&entries[0]);
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].message_count, 1);
+
+        let (resumed, mut messages, _) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        messages.push(Message::assistant("after restart"));
+        resumed.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            chain_uuid_and_parent(&entries[0]),
+            (durable_uuid.clone(), None)
+        );
+        let (_, parent) = chain_uuid_and_parent(&entries[1]);
+        assert_eq!(parent.as_deref(), Some(durable_uuid.as_str()));
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+
+        drop(resumed);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_create_reconciles_existing_transcript_before_new_session() {
+        let storage = test_storage("persist-restart-create-reconcile");
+        let storage_str = storage.display().to_string();
+        let existing_id = uuid::Uuid::new_v4().to_string();
+        let persistence = SessionPersistence::create(
+            &storage_str,
+            existing_id.clone(),
+            "model".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        fail_message_index_attempts(&storage, [true]);
+        persistence
+            .persist_new(&[Message::user("before restart")])
+            .await
+            .unwrap_err();
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_persistence =
+            SessionPersistence::create(&storage_str, new_id, "model".to_string(), None)
+                .await
+                .unwrap();
+
+        assert_eq!(indexed_message_count(&storage, &existing_id), 1);
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &existing_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(new_persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_resume_reconciles_before_later_append() {
+        let storage = test_storage("persist-restart-resume-reconcile");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let initial_messages = vec![Message::user("before restart")];
+        fail_message_index_attempts(&storage, [true]);
+        persistence
+            .persist_new(&initial_messages)
+            .await
+            .unwrap_err();
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        let (durable_uuid, _) = chain_uuid_and_parent(&entries[0]);
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        let (resumed, mut messages, _) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+        messages.push(Message::assistant("after restart"));
+        resumed.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let (_, parent) = chain_uuid_and_parent(&entries[1]);
+        assert_eq!(parent.as_deref(), Some(durable_uuid.as_str()));
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+
+        drop(resumed);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_failure_is_explicit_and_retryable() {
+        let storage = test_storage("persist-reconcile-retry");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        let messages = vec![Message::user("recover me")];
+        fail_message_index_attempts(&storage, [true]);
+        persistence.persist_new(&messages).await.unwrap_err();
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+        fail_message_index_attempts(&storage, [true]);
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("reconciliation failure must be surfaced"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cannot reconcile message index"));
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(indexed_message_count(&storage, &session_id), 0);
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
     }
 
     #[cfg(unix)]
@@ -4483,13 +5882,20 @@ mod tests {
             }
             _ => panic!("first fork entry must be the source user message"),
         };
-        match &entries[1] {
+        let second_uuid = match &entries[1] {
             TranscriptEntry::Assistant(message) => {
                 assert_eq!(message.session_id, fork_id);
                 assert_eq!(message.parent_uuid.as_deref(), Some(first_uuid.as_str()));
+                message.uuid.clone().unwrap()
             }
             _ => panic!("second fork entry must be the source assistant message"),
-        }
+        };
+        assert_ne!(first_uuid, second_uuid);
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &fork_id),
+            [first_uuid, second_uuid]
+        );
+        assert_eq!(indexed_message_count(&storage, &fork_id), 2);
         let fork_sidecar = storage
             .join("metadata")
             .join(format!("{fork_id}.familiar.json"));
