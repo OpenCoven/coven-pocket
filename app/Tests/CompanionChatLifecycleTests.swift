@@ -86,6 +86,38 @@ final class CompanionChatLifecycleTests: XCTestCase {
         XCTAssertEqual(client.killedSessionIDs, ["session-1"])
     }
 
+    func testResetRestoresBlockedAvailabilityForSuspendedCleanupGate() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsGate = true
+        let model = CompanionChatModel(client: client)
+        let prior = CompanionChatModel.Availability.blocked(
+            reason: "Offline",
+            hint: "Reconnect."
+        )
+        model.availability = prior
+        let generation = model.operationGeneration
+
+        let cleanup = Task {
+            await model.cleanupPairing(
+                generation: generation,
+                session: remoteSession(),
+                completionText: nil
+            )
+        }
+        await fulfillment(of: [client.gateRequested], timeout: 1)
+
+        await model.reset()
+        client.resumeNextGate(
+            with: .blocked(reason: "Stale", hint: "Ignore.")
+        )
+        let verified = await cleanup.value
+
+        XCTAssertNil(verified)
+        XCTAssertEqual(model.availability, prior)
+        XCTAssertTrue(client.killedSessionIDs.isEmpty)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+    }
+
     func testInvalidatedLateLaunchKillFailureIsRetryable() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         client.suspendsLaunch = true

@@ -63,7 +63,7 @@ final class CompanionChatModel: ObservableObject {
     var retriesPolling = false
     var operationGeneration: UInt64 = 0
     var availabilityGeneration: UInt64 = 0
-    private var lastTerminalAvailability: Availability?
+    private(set) var lastTerminalAvailability: Availability?
     var launchInFlight = false
     var pendingCleanup: RemoteSession?
     var pendingCleanupPairing: DaemonPairing?

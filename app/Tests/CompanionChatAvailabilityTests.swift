@@ -33,6 +33,7 @@ final class CompanionChatAvailabilityTests: XCTestCase {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         client.suspendsGate = true
         let model = CompanionChatModel(client: client)
+        model.availability = .ready(pairedDaemon())
 
         let send = Task {
             await model.send(prompt: "first", projectRoot: "/srv/repo")
@@ -53,6 +54,104 @@ final class CompanionChatAvailabilityTests: XCTestCase {
             .blocked(reason: "Unavailable", hint: "Reconnect.")
         )
         XCTAssertTrue(client.launchedPrompts.isEmpty)
+    }
+
+    func testStopRestoresReadyAfterInvalidatingSuspendedSendGate() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsGate = true
+        let model = CompanionChatModel(client: client)
+        let prior = CompanionChatModel.Availability.ready(pairedDaemon())
+        model.availability = prior
+
+        let send = Task {
+            await model.send(prompt: "first", projectRoot: "/srv/repo")
+        }
+        await fulfillment(of: [client.gateRequested], timeout: 1)
+
+        await model.stop()
+        client.resumeNextGate(
+            with: .blocked(reason: "Stale", hint: "Ignore.")
+        )
+        await send.value
+
+        XCTAssertEqual(model.availability, prior)
+        XCTAssertTrue(client.launchedPrompts.isEmpty)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+    }
+
+    func testCancelledSendRestoresReadyWithoutPublishingGateFailure() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsGate = true
+        let model = CompanionChatModel(client: client)
+        let prior = CompanionChatModel.Availability.ready(pairedDaemon())
+        model.availability = prior
+
+        let send = Task {
+            await model.send(prompt: "first", projectRoot: "/srv/repo")
+        }
+        await fulfillment(of: [client.gateRequested], timeout: 1)
+
+        send.cancel()
+        client.resumeNextGate(
+            with: .blocked(reason: "Stale", hint: "Ignore.")
+        )
+        await send.value
+
+        XCTAssertEqual(model.availability, prior)
+        XCTAssertTrue(client.launchedPrompts.isEmpty)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+    }
+
+    func testInvalidatedInitialCheckSafelyRemainsChecking() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsGate = true
+        let model = CompanionChatModel(client: client)
+
+        let send = Task {
+            await model.send(prompt: "first", projectRoot: "/srv/repo")
+        }
+        await fulfillment(of: [client.gateRequested], timeout: 1)
+
+        await model.stop()
+        client.resumeNextGate(
+            with: .blocked(reason: "Stale", hint: "Ignore.")
+        )
+        await send.value
+
+        XCTAssertEqual(model.availability, .checking)
+        XCTAssertFalse(model.isAvailable)
+        XCTAssertTrue(client.launchedPrompts.isEmpty)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+    }
+
+    func testNewerRefreshSupersedesSuspendedPollingRetryGate() async {
+        let pairing = pairedDaemon()
+        let client = FakeCompanionSessionClient(gate: .ready(pairing))
+        client.suspendsGate = true
+        let model = CompanionChatModel(client: client)
+        model.availability = .ready(pairing)
+        model.pairing = pairing
+        model.session = remoteSession()
+        model.retriesPolling = true
+
+        let retry = Task { await model.retryPolling() }
+        await fulfillment(of: [client.gateRequested], timeout: 1)
+        let refresh = Task { await model.refreshAvailability() }
+        await fulfillment(of: [client.secondGateRequested], timeout: 1)
+
+        client.resumeLastGate(
+            with: .blocked(reason: "Unavailable", hint: "Reconnect.")
+        )
+        let refreshed = await refresh.value
+        client.resumeNextGate(with: .ready(pairing))
+        await retry.value
+
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(
+            model.availability,
+            .blocked(reason: "Unavailable", hint: "Reconnect.")
+        )
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
     }
 
     func testCancelledRefreshRestoresReadyAvailability() async {
