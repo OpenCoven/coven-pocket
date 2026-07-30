@@ -1,11 +1,15 @@
 import SwiftUI
 
+// swiftlint:disable file_length
+
 /// Multi-turn chat through either a verified companion daemon's Claude CLI
 /// or the on-device Codex engine.
 struct ChatView: View {
     @StateObject private var model = ChatModel()
     @StateObject private var client = EngineClient()
-    @StateObject private var companionModel = CompanionChatModel()
+    @StateObject private var companion: CompanionModel
+    @StateObject private var companionModel: CompanionChatModel
+    @StateObject private var familiarModel: FamiliarSelectionModel
     @ObservedObject private var router = AppRouter.shared
 
     @State private var settings = ChatSettings(
@@ -18,17 +22,18 @@ struct ChatView: View {
     @State private var showSessions = false
     @State private var showShare = false
 
-    private var activeItems: [ChatItem] {
-        settings.backend == .companionClaude ? companionModel.items : model.items
+    init() {
+        let sharedCompanion = CompanionModel()
+        _companion = StateObject(wrappedValue: sharedCompanion)
+        _companionModel = StateObject(wrappedValue: CompanionChatModel(companion: sharedCompanion))
+        _familiarModel = StateObject(wrappedValue: FamiliarSelectionModel(companion: sharedCompanion))
     }
 
-    private var activeIsBusy: Bool {
-        settings.backend == .companionClaude ? companionModel.isBusy : model.isBusy
-    }
+    private var activeItems: [ChatItem] { settings.backend == .companionClaude ? companionModel.items : model.items }
 
-    private var activeCanRetry: Bool {
-        settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry
-    }
+    private var activeIsBusy: Bool { settings.backend == .companionClaude ? companionModel.isBusy : model.isBusy }
+
+    private var activeCanRetry: Bool { settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry }
 
     private var canSend: Bool {
         guard !activeIsBusy,
@@ -54,8 +59,11 @@ struct ChatView: View {
             .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if settings.backend == .codex {
-                    ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    if let identitySeal {
+                        FamiliarIdentitySeal(value: identitySeal)
+                    }
+                    if settings.backend == .codex {
                         Menu {
                             Picker("Permission mode", selection: $model.permissionMode) {
                                 ForEach(ChatPermissionMode.all, id: \.self) { mode in
@@ -100,19 +108,20 @@ struct ChatView: View {
                     settings: $settings,
                     client: client,
                     model: model,
-                    companionModel: companionModel
+                    companionModel: companionModel,
+                    familiarModel: familiarModel
                 )
             }
             .sheet(isPresented: $showSessions) {
                 if settings.backend == .companionClaude {
                     NavigationStack {
                         RemoteSessionsView(
-                            companion: companionModel.companion,
+                            companion: companion,
                             showsDoneButton: true
                         )
                     }
                 } else {
-                    SessionsView(model: model, settings: settings)
+                    SessionsView(model: model, settings: $settings)
                 }
             }
             .sheet(isPresented: $showShare) {
@@ -129,9 +138,24 @@ struct ChatView: View {
             }
             .task(id: router.selectedTab) {
                 if router.selectedTab == .chat {
-                    await companionModel.refreshAvailability()
-                    normalizeBackendSelection()
+                    await refreshFamiliarContext()
                 }
+            }
+            .onChange(of: settings.backend) {
+                synchronizeFamiliarProfile(useActiveConversation: true)
+            }
+            .onChange(of: client.codexAccount?.profileId) {
+                synchronizeFamiliarProfile(preserveCurrent: false)
+            }
+            .onChange(of: companionModel.availability) {
+                normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            }
+            .onChange(of: familiarModel.selectedFamiliar?.id) { oldID, newID in
+                guard oldID != newID,
+                      familiarModel.activeProfile == activeFamiliarProfile
+                else { return }
+                synchronizeFamiliarProfile()
             }
             .task(id: router.pendingPrompt) { await consumeRouterPrompt() }
             .task(id: router.pendingSessionID) { await consumeRouterSession() }
@@ -144,13 +168,51 @@ struct ChatView: View {
 }
 
 private extension ChatView {
+    var activeFamiliarProfile: FamiliarProfileKey? {
+        ChatFamiliarProfile.active(
+            backend: settings.backend,
+            codexProfileID: client.codexAccount?.profileId,
+            companionAvailability: companionModel.availability,
+            previous: familiarModel.activeProfile
+        )
+    }
+
+    var identitySeal: FamiliarSealValue? {
+        switch settings.backend {
+        case .companionClaude:
+            return FamiliarSealResolver.companion(
+                sessionFamiliarID: companionModel.activeSessionFamiliarID,
+                hasActiveSession: companionModel.hasActiveSession,
+                selectedFamiliar: familiarModel.selectedFamiliar,
+                roster: familiarModel.roster
+            )
+        case .codex:
+            return FamiliarSealResolver.onDevice(
+                activeFamiliar: model.activeFamiliar,
+                hasActiveSession: model.hasActiveSession,
+                selectedFamiliar: familiarModel.selectedFamiliar,
+                roster: familiarModel.roster
+            )
+        }
+    }
+
+    var hasActiveConversation: Bool {
+        settings.backend == .companionClaude ? companionModel.hasActiveSession : model.hasActiveSession
+    }
+
+    var activeConversationFamiliarID: String? {
+        switch settings.backend {
+        case .companionClaude:
+            return companionModel.activeSessionFamiliarID
+        case .codex:
+            return model.activeFamiliar?.id
+        }
+    }
+
     // MARK: - Intent / Spotlight handoff
 
-    /// Run a prompt queued by `AskCovenIntent`: send it when the backend is
-    /// configured, otherwise leave it in the input bar for the user.
-    /// Consuming clears the published value (changing the task id), so the
-    /// actual work runs in a detached-lifetime `Task` that survives the
-    /// resulting cancellation.
+    /// Send a queued intent when configured; the nested task survives
+    /// cancellation caused by consuming the router value.
     private func consumeRouterPrompt() async {
         guard let queued = router.consumePrompt() else { return }
         prompt = queued
@@ -167,13 +229,18 @@ private extension ChatView {
         if settings.model.isEmpty {
             settings.model = client.defaultCodexModel
         }
-        let settings = settings
+        let currentSettings = settings
         Task {
             guard
                 let summary = await model.storedSessions()
                     .first(where: { $0.sessionId == sessionID })
             else { return }
-            await model.resume(summary, settings: settings)
+            if await model.resume(summary, settings: currentSettings) {
+                settings = ChatModel.settingsForResume(
+                    summary,
+                    current: settings
+                )
+            }
         }
     }
 
@@ -266,10 +333,15 @@ private extension ChatView {
         case .companionClaude:
             await companionModel.send(
                 prompt: text,
-                projectRoot: settings.daemonProjectRoot
+                projectRoot: settings.daemonProjectRoot,
+                familiarID: settings.familiarID
             )
         case .codex:
-            await model.send(prompt: text, settings: settings)
+            await model.send(
+                prompt: text,
+                settings: settings,
+                selectedFamiliar: familiarModel.selectedFamiliar
+            )
         }
     }
 
@@ -298,6 +370,7 @@ private extension ChatView {
         case .codex:
             model.reset()
         }
+        synchronizeFamiliarProfile()
     }
 
     private func normalizeBackendSelection() {
@@ -315,8 +388,30 @@ private extension ChatView {
             settings.model = client.defaultCodexModel
         }
     }
-}
 
+    private func synchronizeFamiliarProfile(
+        preserveCurrent: Bool? = nil,
+        useActiveConversation: Bool = false
+    ) {
+        let shouldPreserve = preserveCurrent ?? hasActiveConversation
+        settings.familiarID = ChatFamiliarProfile.synchronize(
+            activeFamiliarProfile,
+            model: familiarModel,
+            currentFamiliarID: useActiveConversation && shouldPreserve
+                ? activeConversationFamiliarID
+                : settings.familiarID,
+            preserveCurrent: shouldPreserve
+        )
+    }
+
+    private func refreshFamiliarContext() async {
+        await companionModel.refreshAvailability()
+        normalizeBackendSelection()
+        synchronizeFamiliarProfile()
+        await familiarModel.refresh()
+        synchronizeFamiliarProfile()
+    }
+}
 #Preview {
     ChatView()
 }

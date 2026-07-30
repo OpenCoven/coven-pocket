@@ -31,6 +31,48 @@ struct ChatSettings: Equatable {
     var backend: ChatBackend = .companionClaude
     var model: String = ""
     var daemonProjectRoot: String = ""
+    var familiarID: String?
+}
+
+enum ChatFamiliarProfile {
+    static func active(
+        backend: ChatBackend,
+        codexProfileID: String?,
+        companionAvailability: CompanionChatModel.Availability,
+        previous: FamiliarProfileKey?
+    ) -> FamiliarProfileKey? {
+        switch backend {
+        case .codex:
+            return codexProfileID.map(FamiliarProfileKey.codex(profileID:))
+        case .companionClaude:
+            switch companionAvailability {
+            case let .ready(pairing):
+                return .companion(pairing: pairing)
+            case .checking:
+                guard case .companion = previous else { return nil }
+                return previous
+            case .blocked:
+                return nil
+            }
+        }
+    }
+
+    @MainActor
+    static func synchronize(
+        _ profile: FamiliarProfileKey?,
+        model: FamiliarSelectionModel,
+        currentFamiliarID: String? = nil,
+        preserveCurrent: Bool = false
+    ) -> String? {
+        let profileChanged = model.activeProfile != profile?.normalized
+        if profileChanged {
+            model.activate(profile)
+        }
+        if preserveCurrent {
+            return currentFamiliarID
+        }
+        return model.selectedFamiliar?.id
+    }
 }
 
 /// Answer sink for one approval request. `ChatPermissionResponder` conforms;

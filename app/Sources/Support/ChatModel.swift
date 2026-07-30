@@ -1,5 +1,11 @@
 import Foundation
 
+private struct FamiliarUnavailableError: LocalizedError {
+    var errorDescription: String? {
+        "The selected familiar is no longer available."
+    }
+}
+
 // Session lifecycle state intentionally stays with the main-actor model.
 // swiftlint:disable file_length
 
@@ -47,8 +53,8 @@ struct ToolCallInfo {
 @MainActor
 // swiftlint:disable:next type_body_length
 final class ChatModel: ObservableObject {
-    enum SessionOperationKind {
-        case start
+    enum SessionOperationKind: Equatable {
+        case start(familiar: FamiliarIdentity?)
         case resume
     }
 
@@ -60,6 +66,7 @@ final class ChatModel: ObservableObject {
     @Published var items: [ChatItem] = []
     @Published var isBusy = false
     @Published var canRetry = false
+    @Published private(set) var activeFamiliar: FamiliarIdentity?
     /// The approval sheet currently on screen, if any.
     @Published var pendingApproval: PendingApproval?
     /// Applies to the live session immediately; changing it never restarts
@@ -146,7 +153,15 @@ final class ChatModel: ObservableObject {
         return Self.workspaceURL
     }
 
-    func send(prompt: String, settings: ChatSettings) async {
+    var hasActiveSession: Bool {
+        session != nil
+    }
+
+    func send(
+        prompt: String,
+        settings: ChatSettings,
+        selectedFamiliar: FamiliarIdentity? = nil
+    ) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let generation = claimOperation()
@@ -157,6 +172,7 @@ final class ChatModel: ObservableObject {
         do {
             guard let session = try await activeSession(
                 for: settings,
+                selectedFamiliar: selectedFamiliar,
                 generation: generation
             ), setOperationSession(session, generation: generation) else { return }
             items.append(ChatItem(kind: .user, text: trimmed))
@@ -169,7 +185,9 @@ final class ChatModel: ObservableObject {
             )
         } catch {
             guard isCurrentOperation(generation: generation) else { return }
+            let retryable = activeOperationSession != nil
             appendError(error.localizedDescription)
+            canRetry = retryable
         }
     }
 
@@ -219,6 +237,7 @@ final class ChatModel: ObservableObject {
         session = nil
         sessionSettings = nil
         sessionWorkspace = nil
+        activeFamiliar = nil
         items = []
         canRetry = false
         // Dropping unanswered responders denies their tool calls.
@@ -230,6 +249,7 @@ final class ChatModel: ObservableObject {
     /// otherwise start a fresh one bound to the effective workspace.
     private func activeSession(
         for settings: ChatSettings,
+        selectedFamiliar: FamiliarIdentity?,
         generation: UInt64
     ) async throws -> ChatSession? {
         guard isCurrentOperation(generation: generation) else { return nil }
@@ -237,11 +257,17 @@ final class ChatModel: ObservableObject {
         if let session, sessionSettings == settings, sessionWorkspace == workspace.path {
             return session
         }
+        let familiar = try Self.resolvedFamiliar(
+            for: settings,
+            selectedFamiliar: selectedFamiliar
+        )
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let permissionMode = permissionMode
         let injectContext = injectContext
         let engine = engine
-        let fresh = try await performSessionOperation(.start) {
+        let fresh = try await performSessionOperation(
+            .start(familiar: familiar)
+        ) {
             try await engine.startChat(
                 provider: .codex,
                 apiKey: "",
@@ -250,18 +276,35 @@ final class ChatModel: ObservableObject {
                 workspaceDir: workspace.path,
                 permissionMode: permissionMode,
                 storageDir: Self.sessionStoreURL.path,
-                familiar: nil,
+                familiar: familiar,
                 injectContext: injectContext
             )
         }
-        guard isCurrentOperation(generation: generation) else { return nil }
+        guard isCurrentOperation(generation: generation) else {
+            fresh.stop()
+            return nil
+        }
 
         transcriptGeneration &+= 1
         items = []
         session = fresh
         sessionSettings = settings
         sessionWorkspace = workspace.path
+        activeFamiliar = familiar
         return fresh
+    }
+
+    nonisolated static func resolvedFamiliar(
+        for settings: ChatSettings,
+        selectedFamiliar: FamiliarIdentity?
+    ) throws -> FamiliarIdentity? {
+        guard let familiarID = settings.familiarID else { return nil }
+        guard let selectedFamiliar,
+              familiarID.caseInsensitiveCompare(selectedFamiliar.id) == .orderedSame
+        else {
+            throw FamiliarUnavailableError()
+        }
+        return selectedFamiliar
     }
 
     // MARK: - Session browser
@@ -273,46 +316,86 @@ final class ChatModel: ObservableObject {
     }
 
     /// Swap the live conversation for a stored one, restoring its transcript.
-    func resume(_ summary: ChatSessionSummary, settings: ChatSettings) async {
-        guard let generation = claimOperation() else { return }
+    func resume(
+        _ summary: ChatSessionSummary,
+        settings: ChatSettings
+    ) async -> Bool {
+        guard let generation = claimOperation() else { return false }
         defer { finishOperation(generation: generation) }
 
         do {
+            let resumedSettings = Self.settingsForResume(
+                summary,
+                current: settings
+            )
             let workspace = effectiveWorkspaceURL
             try FileManager.default.createDirectory(
                 at: workspace, withIntermediateDirectories: true
             )
-            let permissionMode = permissionMode
-            let injectContext = injectContext
-            let engine = engine
-            let resumed = try await performSessionOperation(.resume) {
-                try await engine.resumeChat(
-                    provider: .codex,
-                    apiKey: "",
-                    model: settings.model,
-                    effort: nil,
-                    workspaceDir: workspace.path,
-                    permissionMode: permissionMode,
-                    storageDir: Self.sessionStoreURL.path,
-                    sessionId: summary.sessionId,
-                    injectContext: injectContext
-                )
+            let resumed = try await resumedSession(
+                summary,
+                settings: resumedSettings,
+                workspace: workspace
+            )
+            guard isCurrentOperation(generation: generation) else {
+                resumed.stop()
+                return false
             }
-            guard isCurrentOperation(generation: generation) else { return }
             let transcript = await resumed.transcript()
-            guard isCurrentOperation(generation: generation) else { return }
+            guard isCurrentOperation(generation: generation) else {
+                resumed.stop()
+                return false
+            }
 
             transcriptGeneration &+= 1
             session?.stop()
             clearSessionState()
             session = resumed
-            sessionSettings = settings
+            sessionSettings = resumedSettings
             sessionWorkspace = workspace.path
+            activeFamiliar = summary.familiar
             items = Self.items(fromTranscript: transcript)
+            return true
         } catch {
-            guard isCurrentOperation(generation: generation) else { return }
+            guard isCurrentOperation(generation: generation) else {
+                return false
+            }
             appendError(error.localizedDescription)
+            canRetry = false
+            return false
         }
+    }
+
+    private func resumedSession(
+        _ summary: ChatSessionSummary,
+        settings: ChatSettings,
+        workspace: URL
+    ) async throws -> ChatSession {
+        let permissionMode = permissionMode
+        let injectContext = injectContext
+        let engine = engine
+        return try await performSessionOperation(.resume) {
+            try await engine.resumeChat(
+                provider: .codex,
+                apiKey: "",
+                model: settings.model,
+                effort: nil,
+                workspaceDir: workspace.path,
+                permissionMode: permissionMode,
+                storageDir: Self.sessionStoreURL.path,
+                sessionId: summary.sessionId,
+                injectContext: injectContext
+            )
+        }
+    }
+
+    nonisolated static func settingsForResume(
+        _ summary: ChatSessionSummary,
+        current: ChatSettings
+    ) -> ChatSettings {
+        var settings = current
+        settings.familiarID = summary.familiar?.id
+        return settings
     }
 
     private func claimOperation(session: ChatSession? = nil) -> UInt64? {
@@ -447,7 +530,7 @@ final class ChatModel: ObservableObject {
     func appendError(_ message: String, generation: UInt64? = nil) {
         guard acceptsTranscriptCallback(generation: generation) else { return }
         items.append(ChatItem(kind: .error, text: message))
-        canRetry = true
+        canRetry = session != nil
     }
 
     private func acceptsTranscriptCallback(generation: UInt64?) -> Bool {

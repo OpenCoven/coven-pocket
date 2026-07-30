@@ -78,6 +78,7 @@ final class ChatSurfaceTests: XCTestCase {
         var suspendNextResume = false
         var startCallCount = 0
         var resumeCallCount = 0
+        var startFamiliars: [FamiliarIdentity?] = []
         var startSessions: [ChatSession] = []
         var resumeSessions: [ChatSession] = []
 
@@ -89,8 +90,9 @@ final class ChatSurfaceTests: XCTestCase {
             operation: @MainActor () async throws -> ChatSession
         ) async throws -> ChatSession {
             switch kind {
-            case .start:
+            case let .start(familiar):
                 startCallCount += 1
+                startFamiliars.append(familiar)
                 if suspendNextStart {
                     suspendNextStart = false
                     startRequested.fulfill()
@@ -143,6 +145,78 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertEqual(settings.backend, .companionClaude)
         XCTAssertEqual(settings.model, "")
         XCTAssertEqual(settings.daemonProjectRoot, "")
+        XCTAssertNil(settings.familiarID)
+    }
+
+    func testFamiliarSelectionChangesChatSettingsEquality() {
+        let base = ChatSettings(
+            backend: .codex,
+            model: "test",
+            daemonProjectRoot: "",
+            familiarID: nil
+        )
+        var selected = base
+        selected.familiarID = "sage"
+
+        XCTAssertNotEqual(base, selected)
+        XCTAssertEqual(selected, selected)
+    }
+
+    func testFamiliarResolverUsesCanonicalMatchingSnapshot() throws {
+        let sage = familiarIdentity(
+            id: "sage",
+            name: "Sage",
+            emoji: "⌁",
+            role: "Research"
+        )
+        let settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            daemonProjectRoot: "",
+            familiarID: "SAGE"
+        )
+
+        XCTAssertEqual(
+            try ChatModel.resolvedFamiliar(
+                for: settings,
+                selectedFamiliar: sage
+            ),
+            sage
+        )
+    }
+
+    func testFamiliarResolverNilRouteIgnoresSelectedSnapshot() throws {
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+
+        XCTAssertNil(
+            try ChatModel.resolvedFamiliar(
+                for: ChatSettings(backend: .codex, model: "test"),
+                selectedFamiliar: sage
+            )
+        )
+    }
+
+    func testFamiliarResolverRejectsMissingOrMismatchedSnapshot() {
+        let settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "sage"
+        )
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+
+        for selected in [nil, forge] {
+            XCTAssertThrowsError(
+                try ChatModel.resolvedFamiliar(
+                    for: settings,
+                    selectedFamiliar: selected
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error.localizedDescription,
+                    "The selected familiar is no longer available."
+                )
+            }
+        }
     }
 
     func testBackendChoicesGateCompanionOnVerifiedAvailability() {
@@ -198,6 +272,115 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertFalse(source.contains("Anthropic API key"))
         XCTAssertFalse(source.contains("settings.apiKey"))
         XCTAssertTrue(source.contains("Claude via Companion"))
+    }
+
+    func testChatViewSharesOneCompanionModelWithFamiliarSelection() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(
+            source.components(separatedBy: "CompanionModel()").count - 1,
+            1
+        )
+        XCTAssertTrue(
+            source.contains(
+                "CompanionChatModel(companion: sharedCompanion)"
+            )
+        )
+        XCTAssertTrue(
+            source.contains(
+                "FamiliarSelectionModel(companion: sharedCompanion)"
+            )
+        )
+    }
+
+    func testFamiliarPickerDoesNotOverrideToolsModelsOrPermissions() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/FamiliarPickerSection.swift"
+            ),
+            encoding: .utf8
+        )
+
+        for forbidden in [
+            "permissionMode",
+            "settings.model",
+            "apiKey",
+            "Sage",
+            "Forge",
+            "Raven",
+            "accessLevel",
+            "toolOverride"
+        ] {
+            XCTAssertFalse(source.contains(forbidden), forbidden)
+        }
+        XCTAssertTrue(
+            source.contains(
+                "Familiars shape identity. They never widen iOS tools or permissions."
+            )
+        )
+    }
+
+    func testSessionsViewOnlySynchronizesSettingsAfterSuccessfulResume() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/SessionsView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(source.contains("@Binding var settings: ChatSettings"))
+        XCTAssertTrue(source.contains("if await model.resume("))
+        XCTAssertTrue(source.contains("ChatModel.settingsForResume("))
+    }
+
+    func testBackendChangesAndClearUseCoherentFamiliarRouting() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let chat = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatView.swift"
+            ),
+            encoding: .utf8
+        )
+        let settings = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatSettingsView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(
+            chat.contains(
+                "synchronizeFamiliarProfile(useActiveConversation: true)"
+            )
+        )
+        XCTAssertTrue(
+            settings.contains(
+                "synchronizeFamiliarProfile(useActiveConversation: true)"
+            )
+        )
+        XCTAssertTrue(
+            settings.contains(
+                "model.reset()\n"
+                    + "                            synchronizeFamiliarProfile("
+                    + "preserveCurrent: false)"
+            )
+        )
     }
 
     func testStartChatCreatesIdleSession() async throws {
@@ -284,6 +467,161 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testStartSeamReceivesExactSelectedFamiliarSnapshot() async {
+        let boundary = SessionBoundary()
+        boundary.startSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let sage = familiarIdentity(
+            id: "sage",
+            name: "Sage",
+            emoji: "⌁",
+            role: "Research"
+        )
+        let settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "SAGE"
+        )
+
+        await model.send(
+            prompt: "hello",
+            settings: settings,
+            selectedFamiliar: sage
+        )
+
+        XCTAssertEqual(boundary.startFamiliars, [sage])
+        XCTAssertEqual(model.activeFamiliar, sage)
+    }
+
+    @MainActor
+    func testNilFamiliarRouteStartsWithoutIdentity() async {
+        let boundary = SessionBoundary()
+        boundary.startSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+
+        await model.send(
+            prompt: "hello",
+            settings: ChatSettings(backend: .codex, model: "test"),
+            selectedFamiliar: familiarIdentity(id: "sage", name: "Sage")
+        )
+
+        XCTAssertEqual(boundary.startFamiliars.count, 1)
+        XCTAssertNil(boundary.startFamiliars[0])
+        XCTAssertNil(model.activeFamiliar)
+    }
+
+    @MainActor
+    func testUnavailableFamiliarFailsVisiblyWithoutStartingSession() async {
+        let settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "sage"
+        )
+
+        for selected in [
+            nil,
+            familiarIdentity(id: "forge", name: "Forge")
+        ] {
+            let boundary = SessionBoundary()
+            let model = ChatModel(performSessionOperation: boundary.perform)
+            await model.send(
+                prompt: "hello",
+                settings: settings,
+                selectedFamiliar: selected
+            )
+
+            XCTAssertEqual(boundary.startCallCount, 0)
+            XCTAssertEqual(
+                model.items.last?.text,
+                "The selected familiar is no longer available."
+            )
+            XCTAssertNil(model.activeFamiliar)
+            XCTAssertFalse(model.canRetry)
+        }
+    }
+
+    @MainActor
+    func testChangingFamiliarStartsNewSessionAndPublishesValidIdentity() async {
+        let boundary = SessionBoundary()
+        boundary.startSessions = [StubChatSession(), StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+
+        await model.send(
+            prompt: "first",
+            settings: ChatSettings(
+                backend: .codex,
+                model: "test",
+                familiarID: "sage"
+            ),
+            selectedFamiliar: sage
+        )
+        XCTAssertEqual(model.activeFamiliar, sage)
+
+        await model.send(
+            prompt: "second",
+            settings: ChatSettings(
+                backend: .codex,
+                model: "test",
+                familiarID: "forge"
+            ),
+            selectedFamiliar: forge
+        )
+
+        XCTAssertEqual(boundary.startFamiliars, [sage, forge])
+        XCTAssertEqual(model.activeFamiliar, forge)
+    }
+
+    @MainActor
+    func testFailedFamiliarReplacementCannotRetryPreviousSession() async {
+        enum StartFailure: LocalizedError {
+            case failed
+
+            var errorDescription: String? { "Start failed." }
+        }
+
+        var starts = 0
+        let model = ChatModel { kind, _ in
+            switch kind {
+            case .resume:
+                return StubChatSession()
+            case .start:
+                starts += 1
+                if starts == 1 {
+                    return StubChatSession()
+                }
+                throw StartFailure.failed
+            }
+        }
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+        await model.send(
+            prompt: "first",
+            settings: ChatSettings(
+                backend: .codex,
+                model: "test",
+                familiarID: "sage"
+            ),
+            selectedFamiliar: sage
+        )
+
+        await model.send(
+            prompt: "second",
+            settings: ChatSettings(
+                backend: .codex,
+                model: "test",
+                familiarID: "forge"
+            ),
+            selectedFamiliar: forge
+        )
+
+        XCTAssertEqual(model.activeFamiliar, sage)
+        XCTAssertEqual(model.items.last?.text, "Start failed.")
+        XCTAssertFalse(model.canRetry)
+    }
+
+    @MainActor
     func testResetInvalidatesSuspendedSessionCreation() async {
         let boundary = SessionBoundary()
         boundary.suspendNextStart = true
@@ -301,11 +639,13 @@ final class ChatSurfaceTests: XCTestCase {
         model.reset()
         XCTAssertFalse(model.isBusy)
         XCTAssertTrue(model.items.isEmpty)
+        XCTAssertNil(model.activeFamiliar)
 
         boundary.finishStart(with: StubChatSession())
         await staleSend.value
         XCTAssertFalse(model.isBusy)
         XCTAssertTrue(model.items.isEmpty)
+        XCTAssertNil(model.activeFamiliar)
 
         await model.send(prompt: "fresh", settings: settings)
         XCTAssertEqual(boundary.startCallCount, 2)
@@ -377,7 +717,9 @@ final class ChatSurfaceTests: XCTestCase {
         let model = ChatModel(
             performSessionOperation: boundary.perform
         )
-        let summary = makeSummary()
+        let summary = makeSummary(
+            familiar: familiarIdentity(id: "sage", name: "Sage")
+        )
         let resumeSettings = ChatSettings(
             backend: .codex,
             model: "resume",
@@ -406,9 +748,11 @@ final class ChatSurfaceTests: XCTestCase {
         await fulfillment(of: [boundary.startRequested], timeout: 1)
 
         boundary.finishResume(with: resumedSession)
-        await resume.value
+        let staleResumeSucceeded = await resume.value
+        XCTAssertFalse(staleResumeSucceeded)
         XCTAssertTrue(model.isBusy, "a stale resume must not finish the newer send")
         XCTAssertTrue(model.items.isEmpty, "a stale resume must not restore its transcript")
+        XCTAssertNil(model.activeFamiliar)
 
         boundary.finishStart(with: StubChatSession())
         await freshSend.value
@@ -416,6 +760,68 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertEqual(boundary.resumeCallCount, 1)
         XCTAssertEqual(boundary.startCallCount, 1)
         XCTAssertEqual(model.items.map(\.text), ["fresh"])
+    }
+
+    @MainActor
+    func testResumePublishesSummaryFamiliarAndPinsSettings() async {
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let summary = makeSummary(familiar: sage)
+        let current = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "forge"
+        )
+
+        let resumed = await model.resume(summary, settings: current)
+        XCTAssertTrue(resumed)
+
+        XCTAssertEqual(model.activeFamiliar, sage)
+        XCTAssertEqual(
+            ChatModel.settingsForResume(summary, current: current).familiarID,
+            "sage"
+        )
+        var latest = current
+        latest.model = "new-model"
+        latest.daemonProjectRoot = "/new/root"
+        let updated = ChatModel.settingsForResume(summary, current: latest)
+        XCTAssertEqual(updated.model, "new-model")
+        XCTAssertEqual(updated.daemonProjectRoot, "/new/root")
+    }
+
+    @MainActor
+    func testFailedResumeReturnsFalseWithoutPublishingFamiliar() async {
+        enum ResumeFailure: LocalizedError {
+            case failed
+
+            var errorDescription: String? { "Resume failed." }
+        }
+
+        let model = ChatModel { kind, _ in
+            switch kind {
+            case .resume:
+                throw ResumeFailure.failed
+            case .start:
+                return StubChatSession()
+            }
+        }
+        let summary = makeSummary(
+            familiar: familiarIdentity(id: "sage", name: "Sage")
+        )
+
+        let resumed = await model.resume(
+            summary,
+            settings: ChatSettings(
+                backend: .codex,
+                model: "test",
+                familiarID: "forge"
+            )
+        )
+        XCTAssertFalse(resumed)
+        XCTAssertNil(model.activeFamiliar)
+        XCTAssertEqual(model.items.last?.text, "Resume failed.")
     }
 
     @MainActor
@@ -552,7 +958,8 @@ final class ChatSurfaceTests: XCTestCase {
 
     private func makeSummary(
         title: String = "t",
-        updatedAt: String = "2026-01-02T03:04:05+00:00"
+        updatedAt: String = "2026-01-02T03:04:05+00:00",
+        familiar: FamiliarIdentity? = nil
     ) -> ChatSessionSummary {
         ChatSessionSummary(
             sessionId: UUID().uuidString.lowercased(),
@@ -560,7 +967,8 @@ final class ChatSurfaceTests: XCTestCase {
             model: "claude-test",
             createdAt: "2026-01-01T00:00:00+00:00",
             updatedAt: updatedAt,
-            messageCount: 2, familiar: nil
+            messageCount: 2,
+            familiar: familiar
         )
     }
 
@@ -573,6 +981,20 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertEqual(nano.updatedDate?.timeIntervalSince1970.rounded(),
                        plain.updatedDate?.timeIntervalSince1970.rounded())
         XCTAssertNil(makeSummary(updatedAt: "not a date").updatedDate)
+    }
+
+    private func familiarIdentity(
+        id: String,
+        name: String,
+        emoji: String? = nil,
+        role: String? = nil
+    ) -> FamiliarIdentity {
+        FamiliarIdentity(
+            id: id,
+            displayName: name,
+            emoji: emoji,
+            role: role
+        )
     }
 
     func testSummaryDisplayTitleFallsBack() {

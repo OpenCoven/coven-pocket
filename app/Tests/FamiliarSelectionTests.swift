@@ -11,6 +11,28 @@ private enum FakeFamiliarRosterError: LocalizedError {
     }
 }
 
+private final class PersistentlyCorruptFamiliarDefaults: UserDefaults {
+    override func object(forKey defaultName: String) -> Any? {
+        guard defaultName == FamiliarSelectionStore.storageKey else {
+            return super.object(forKey: defaultName)
+        }
+        return Data([0xFF])
+    }
+
+    override func data(forKey defaultName: String) -> Data? {
+        guard defaultName == FamiliarSelectionStore.storageKey else {
+            return super.data(forKey: defaultName)
+        }
+        return Data([0xFF])
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        if defaultName != FamiliarSelectionStore.storageKey {
+            super.removeObject(forKey: defaultName)
+        }
+    }
+}
+
 @MainActor
 private final class FakeFamiliarRosterClient: FamiliarRosterClient {
     var gateResult: CompanionModel.SessionGate
@@ -89,6 +111,299 @@ private final class FakeFamiliarRosterClient: FamiliarRosterClient {
 @MainActor
 // swiftlint:disable:next type_body_length
 final class FamiliarSelectionTests: XCTestCase {
+    func testCodexProfileDerivationRequiresSignedInProfile() {
+        let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .codex,
+                codexProfileID: "profile-a",
+                companionAvailability: .checking,
+                previous: nil
+            ),
+            .codex(profileID: "profile-a")
+        )
+        XCTAssertNil(
+            ChatFamiliarProfile.active(
+                backend: .codex,
+                codexProfileID: nil,
+                companionAvailability: .ready(pairing),
+                previous: nil
+            )
+        )
+    }
+
+    func testCompanionProfileDerivationPreservesCheckingAndSwitchesEndpoint() {
+        let firstPairing = daemonPairing(host: "Mac.Local", port: 7001)
+        let secondPairing = daemonPairing(host: "other.local", port: 7002)
+        let companion = FamiliarProfileKey.companion(pairing: firstPairing)
+
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .ready(firstPairing),
+                previous: nil
+            ),
+            companion
+        )
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .checking,
+                previous: companion
+            ),
+            companion
+        )
+        XCTAssertNil(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .blocked(
+                    reason: "Unavailable",
+                    hint: "Retry."
+                ),
+                previous: companion
+            )
+        )
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .ready(secondPairing),
+                previous: companion
+            ),
+            .companion(host: "other.local", port: 7002)
+        )
+    }
+
+    func testProfileSynchronizationRestoresPerProfileSelection() throws {
+        try withDefaults { defaults in
+            let store = FamiliarSelectionStore(defaults: defaults)
+            let first = FamiliarProfileKey.codex(profileID: "profile-a")
+            let second = FamiliarProfileKey.codex(profileID: "profile-b")
+            try store.save(
+                familiarIdentity(id: "sage", name: "Sage"),
+                for: first
+            )
+            try store.save(
+                familiarIdentity(id: "forge", name: "Forge"),
+                for: second
+            )
+            let client = FakeFamiliarRosterClient(gate: .notPaired)
+            let model = FamiliarSelectionModel(client: client, store: store)
+
+            XCTAssertEqual(
+                ChatFamiliarProfile.synchronize(first, model: model),
+                "sage"
+            )
+            XCTAssertEqual(model.activeProfile, first)
+            XCTAssertEqual(
+                ChatFamiliarProfile.synchronize(second, model: model),
+                "forge"
+            )
+            XCTAssertEqual(model.activeProfile, second)
+        }
+    }
+
+    func testSameProfileSyncPreservesPinnedLiveSessionSetting() throws {
+        try withDefaults { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "profile-a")
+            let store = FamiliarSelectionStore(defaults: defaults)
+            try store.save(
+                familiarIdentity(id: "forge", name: "Forge"),
+                for: profile
+            )
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+            model.activate(profile)
+
+            XCTAssertEqual(
+                ChatFamiliarProfile.synchronize(
+                    profile,
+                    model: model,
+                    currentFamiliarID: "sage",
+                    preserveCurrent: true
+                ),
+                "sage"
+            )
+
+            let other = FamiliarProfileKey.codex(profileID: "profile-b")
+            try store.save(
+                familiarIdentity(id: "owl", name: "Owl"),
+                for: other
+            )
+            XCTAssertEqual(
+                ChatFamiliarProfile.synchronize(
+                    other,
+                    model: model,
+                    currentFamiliarID: "sage",
+                    preserveCurrent: true
+                ),
+                "sage"
+            )
+            XCTAssertEqual(model.activeProfile, other)
+        }
+    }
+
+    func testFamiliarPresentationUsesLiteralIconEmojiAndFallback() {
+        let literal = FamiliarPresentation(
+            remote: remoteFamiliar(
+                id: "literal",
+                name: "Literal",
+                role: "  Review  ",
+                icon: "⌁"
+            )
+        )
+        let emoji = FamiliarPresentation(
+            remote: remoteFamiliar(
+                id: "emoji",
+                name: "Emoji",
+                emoji: "🦉",
+                icon: "ph:owl"
+            )
+        )
+        let fallback = FamiliarPresentation(
+            remote: remoteFamiliar(
+                id: "fallback",
+                name: "Fallback",
+                role: " ",
+                icon: "ph:sparkle"
+            )
+        )
+        let remoteAsset = FamiliarPresentation(
+            remote: remoteFamiliar(
+                id: "remote",
+                name: "Remote",
+                icon: "https://example.invalid/icon.png"
+            )
+        )
+
+        XCTAssertEqual(literal.glyph, "⌁")
+        XCTAssertEqual(literal.role, "Review")
+        XCTAssertEqual(emoji.glyph, "🦉")
+        XCTAssertEqual(fallback.glyph, "✦")
+        XCTAssertEqual(remoteAsset.glyph, "✦")
+        XCTAssertNil(fallback.role)
+    }
+
+    func testPickerReconcilesUnknownSelectionToActualSelection() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "profile-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "sage", name: "Sage")
+            ])
+            let model = FamiliarSelectionModel(
+                client: client,
+                store: FamiliarSelectionStore(defaults: defaults)
+            )
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "sage", for: profile)
+            var settings = ChatSettings(familiarID: "sage")
+
+            FamiliarPickerSection.reconcileSelection(
+                "removed",
+                settings: &settings,
+                model: model,
+                profile: profile
+            )
+
+            XCTAssertEqual(settings.familiarID, "sage")
+        }
+    }
+
+    func testPickerReconcilesStoreFailureToActualSelection() async throws {
+        let suiteName = "familiar-corrupt-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            PersistentlyCorruptFamiliarDefaults(suiteName: suiteName)
+        )
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let profile = FamiliarProfileKey.codex(profileID: "profile-a")
+        let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+        client.familiarResult = .success([
+            remoteFamiliar(id: "forge", name: "Forge")
+        ])
+        let model = FamiliarSelectionModel(
+            client: client,
+            store: FamiliarSelectionStore(defaults: defaults)
+        )
+        model.activate(profile)
+        await model.refresh()
+        var settings = ChatSettings(familiarID: "stale")
+
+        FamiliarPickerSection.reconcileSelection(
+            "forge",
+            settings: &settings,
+            model: model,
+            profile: profile
+        )
+
+        XCTAssertNil(settings.familiarID)
+        XCTAssertEqual(
+            model.state,
+            .failed(reason: "Saved familiar selections could not be read.")
+        )
+    }
+
+    func testCachedFailedRosterKeepsPickerSelectable() {
+        XCTAssertFalse(
+            FamiliarPickerSection.isPickerDisabled(
+                profile: .codex(profileID: "profile-a"),
+                roster: [remoteFamiliar(id: "sage", name: "Sage")],
+                state: .failed(reason: "Offline")
+            )
+        )
+        XCTAssertTrue(
+            FamiliarPickerSection.isPickerDisabled(
+                profile: .codex(profileID: "profile-a"),
+                roster: [],
+                state: .failed(reason: "Offline")
+            )
+        )
+    }
+
+    func testIdentitySealKeepsActiveConversationAheadOfNextSelection() {
+        let sage = familiarIdentity(
+            id: "sage",
+            name: "Sage",
+            role: "Research"
+        )
+        let forge = familiarIdentity(
+            id: "forge",
+            name: "Forge",
+            role: "Implementation"
+        )
+
+        let seal = FamiliarSealResolver.onDevice(
+            activeFamiliar: sage,
+            hasActiveSession: true,
+            selectedFamiliar: forge,
+            roster: []
+        )
+
+        XCTAssertEqual(seal?.displayName, "Sage")
+        XCTAssertEqual(seal?.role, "Research")
+        XCTAssertEqual(seal?.binding, .activeConversation)
+    }
+
+    func testCompanionIdentitySealFallsBackToBoundID() {
+        let seal = FamiliarSealResolver.companion(
+            sessionFamiliarID: "archived-familiar",
+            hasActiveSession: true,
+            selectedFamiliar: nil,
+            roster: []
+        )
+
+        XCTAssertEqual(seal?.displayName, "archived-familiar")
+        XCTAssertEqual(seal?.glyph, "✦")
+        XCTAssertEqual(seal?.binding, .activeConversation)
+    }
+
     func testCodexSelectionRoundTripsExactSnapshot() throws {
         try withDefaults { defaults in
             let store = FamiliarSelectionStore(defaults: defaults)
@@ -882,7 +1197,8 @@ private func remoteFamiliar(
     id: String,
     name: String,
     emoji: String? = nil,
-    role: String? = nil
+    role: String? = nil,
+    icon: String? = nil
 ) -> RemoteFamiliar {
     RemoteFamiliar(
         id: id,
@@ -891,7 +1207,7 @@ private func remoteFamiliar(
         role: role,
         description: nil,
         pronouns: nil,
-        icon: nil
+        icon: icon
     )
 }
 

@@ -69,6 +69,14 @@ final class CompanionChatModel: ObservableObject {
         return false
     }
 
+    var activeSessionFamiliarID: String? {
+        sessionFamiliarID
+    }
+
+    var hasActiveSession: Bool {
+        session != nil
+    }
+
     var hasPendingCleanup: Bool {
         pendingCleanup != nil
     }
