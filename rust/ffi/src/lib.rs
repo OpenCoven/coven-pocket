@@ -241,7 +241,7 @@ impl PocketEngine {
     /// persists on device and shows up in [`Self::list_chat_sessions`];
     /// `None` keeps the session in memory only.
     #[allow(clippy::too_many_arguments)]
-    pub fn start_chat(
+    pub async fn start_chat(
         &self,
         provider: PocketProvider,
         api_key: String,
@@ -264,6 +264,7 @@ impl PocketEngine {
             familiar,
             inject_context,
         )
+        .await
     }
 
     /// Resume a stored session at its head: the full transcript is restored

@@ -556,7 +556,7 @@ fn uuid_like_suffix() -> String {
 /// Create a new chat session. Exposed as a free function so `PocketEngine`
 /// stays the single app-facing entry point (see `PocketEngine::start_chat`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_session(
+pub(crate) async fn start_session(
     provider: PocketProvider,
     api_key: String,
     model: String,
@@ -574,8 +574,9 @@ pub(crate) fn start_session(
             storage_dir,
             session_id.clone(),
             model.clone(),
-        )?;
-        crate::sessions::save_familiar_metadata(storage_dir, &session_id, familiar.as_ref())?;
+            familiar.as_ref(),
+        )
+        .await?;
         Some(persistence)
     } else {
         None
@@ -615,15 +616,12 @@ pub(crate) async fn resume_session(
     inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = resolve_workspace(&workspace_dir)?;
-    let (messages, last_uuid, familiar) =
-        crate::sessions::load_session_snapshot(&storage_dir, &session_id).await?;
-    let persistence = crate::sessions::SessionPersistence::resumed(
+    let (persistence, messages, familiar) = crate::sessions::SessionPersistence::resume(
         &storage_dir,
         session_id.clone(),
         model.clone(),
-        messages.len(),
-        last_uuid,
-    )?;
+    )
+    .await?;
     Ok(Arc::new(ChatSession {
         config: SessionConfig {
             provider,
@@ -1175,8 +1173,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn session_rejects_relative_workspace() {
+    #[tokio::test]
+    async fn session_rejects_relative_workspace() {
         let err = start_session(
             PocketProvider::Anthropic,
             "key".to_string(),
@@ -1187,7 +1185,8 @@ mod tests {
             None,
             None,
             false,
-        );
+        )
+        .await;
         assert!(err.is_err());
     }
 
@@ -1257,6 +1256,7 @@ mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
 
         let delegate = Arc::new(RecordingDelegate::default());
@@ -1284,8 +1284,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn familiar_preamble_uses_exact_role_and_no_role_forms() {
+    #[tokio::test]
+    async fn familiar_preamble_uses_exact_role_and_no_role_forms() {
         let workspace = std::env::current_dir().unwrap();
         let with_role = start_session(
             PocketProvider::Anthropic,
@@ -1298,6 +1298,7 @@ mod tests {
             Some(test_familiar(Some("repository guide"))),
             false,
         )
+        .await
         .unwrap();
         assert_eq!(
             with_role.append_system_prompt(),
@@ -1319,6 +1320,7 @@ mod tests {
                 Some(test_familiar(role)),
                 false,
             )
+            .await
             .unwrap();
             assert_eq!(
                 without_role.append_system_prompt(),
@@ -1330,8 +1332,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn familiar_keeps_plan_mode_platform_note_and_memory_order() {
+    #[tokio::test]
+    async fn familiar_keeps_plan_mode_platform_note_and_memory_order() {
         let guard = crate::memory::tests::setup("chat-familiar");
         std::fs::write(guard.workspace.join("AGENTS.md"), "Pinned project memory.").unwrap();
         let session = start_session(
@@ -1345,6 +1347,7 @@ mod tests {
             Some(test_familiar(Some("planner"))),
             true,
         )
+        .await
         .unwrap();
 
         let prompt = session.append_system_prompt();
@@ -1360,8 +1363,8 @@ mod tests {
     }
 
     /// The workspace AGENTS.md must reach the model iff the toggle is on.
-    #[test]
-    fn inject_context_gates_agents_md_in_system_prompt() {
+    #[tokio::test]
+    async fn inject_context_gates_agents_md_in_system_prompt() {
         let guard = crate::memory::tests::setup("chat-inject");
         let workspace = guard.workspace.clone();
         std::fs::write(
@@ -1381,6 +1384,7 @@ mod tests {
             None,
             true,
         )
+        .await
         .unwrap();
         assert!(
             with_context
@@ -1400,6 +1404,7 @@ mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
         assert!(
             !without_context
@@ -1456,7 +1461,7 @@ mod tests {
         serde_json::json!({ "file_path": path, "content": "hello" })
     }
 
-    fn test_ctx() -> ToolContext {
+    async fn test_ctx() -> ToolContext {
         // Only fields the stub path touches matter; reuse the session builder
         // for a fully-populated context.
         let session = start_session(
@@ -1470,6 +1475,7 @@ mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
         let (_client, _config, ctx) = session.build_loop_inputs().unwrap();
         ctx
@@ -1480,7 +1486,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Allow));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Plan, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst), "plan mode must not execute");
@@ -1492,7 +1498,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::AcceptEdits, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(!result.is_error);
         assert!(ran.load(Ordering::SeqCst));
@@ -1504,7 +1510,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst));
@@ -1516,7 +1522,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Allow));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(!result.is_error);
         assert!(ran.load(Ordering::SeqCst));
@@ -1532,7 +1538,7 @@ mod tests {
             ChatPermissionDecision::AllowSession,
         ));
         let (tool, ran, perms) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
-        let ctx = test_ctx();
+        let ctx = test_ctx().await;
 
         assert!(!tool.execute(write_input(), &ctx).await.is_error);
         ran.store(false, Ordering::SeqCst);
@@ -1553,7 +1559,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::default());
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst));
@@ -1574,7 +1580,10 @@ mod tests {
         std::fs::write(&target, "content").unwrap();
 
         let result = read
-            .execute(serde_json::json!({ "file_path": target }), &test_ctx())
+            .execute(
+                serde_json::json!({ "file_path": target }),
+                &test_ctx().await,
+            )
             .await;
 
         assert!(!result.is_error);
@@ -1633,6 +1642,7 @@ mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
         let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
         {
@@ -1647,8 +1657,8 @@ mod tests {
         session
     }
 
-    #[test]
-    fn persisted_new_session_saves_familiar_before_returning() {
+    #[tokio::test]
+    async fn persisted_new_session_saves_familiar_before_returning() {
         let storage = temp_dir("store-familiar");
         let workspace = temp_dir("ws-familiar");
         let identity = test_familiar(Some("repository guide"));
@@ -1663,6 +1673,7 @@ mod tests {
             Some(identity.clone()),
             false,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1759,6 +1770,7 @@ mod tests {
             Some(identity.clone()),
             false,
         )
+        .await
         .unwrap();
         let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
         {
@@ -1903,7 +1915,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        let err = resume_session(
+        let err = match resume_session(
             PocketProvider::Anthropic,
             "key".to_string(),
             "claude-test".to_string(),
@@ -1914,8 +1926,12 @@ mod tests {
             session.session_id(),
             false,
         )
-        .await;
-        assert!(err.is_err());
+        .await
+        {
+            Ok(_) => panic!("deleted session must not resume"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("was deleted"));
 
         let _ = std::fs::remove_dir_all(&storage);
         let _ = std::fs::remove_dir_all(&workspace);
@@ -1937,6 +1953,7 @@ mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
         assert!(uuid::Uuid::parse_str(&session.session_id()).is_ok());
 
