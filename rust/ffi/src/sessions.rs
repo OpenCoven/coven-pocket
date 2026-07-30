@@ -103,6 +103,12 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), PocketError> {
         })
 }
 
+fn validate_indexed_session_ids<'a>(
+    session_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), PocketError> {
+    session_ids.into_iter().try_for_each(validate_session_id)
+}
+
 fn storage_root(storage_dir: &str) -> Result<PathBuf, PocketError> {
     let root = PathBuf::from(storage_dir);
     if !root.is_absolute() {
@@ -161,15 +167,15 @@ fn fail_fork_publication_after_row_if_requested(root: &Path) -> Result<(), Pocke
 }
 
 fn indexed_session_model(root: &Path, session_id: &str) -> Result<String, PocketError> {
-    index_store(root)?
+    let rows = index_store(root)?
         .list_sessions()
-        .map_err(|e| engine_err("cannot list sessions", e))
-        .map(|rows| {
-            rows.into_iter()
-                .find(|row| row.id == session_id)
-                .map(|row| row.model)
-                .unwrap_or_default()
-        })
+        .map_err(|e| engine_err("cannot list sessions", e))?;
+    validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
+    Ok(rows
+        .into_iter()
+        .find(|row| row.id == session_id)
+        .map(|row| row.model)
+        .unwrap_or_default())
 }
 
 fn transcript_file(root: &Path, session_id: &str) -> PathBuf {
@@ -850,6 +856,7 @@ fn list_sessions_unlocked(
     let rows = store
         .list_sessions()
         .map_err(|e| engine_err("cannot list sessions", e))?;
+    validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
     rows.into_iter()
         .filter(|session| {
             !matches!(
@@ -1731,6 +1738,48 @@ mod tests {
         };
         assert!(err.to_string().contains("cannot parse familiar metadata"));
 
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_rejects_path_shaped_index_id_before_sidecar_access() {
+        let storage = test_storage("list-invalid-index-id");
+        let storage_str = storage.display().to_string();
+        let sentinel_name = format!("escaped-{}", uuid::Uuid::new_v4());
+        let malformed_id = format!("../../{sentinel_name}");
+        index_store(&storage)
+            .unwrap()
+            .save_session(&malformed_id, Some("Corrupt"), "model")
+            .unwrap();
+
+        std::fs::create_dir_all(storage.join("metadata")).unwrap();
+        let escaped_sidecar = storage
+            .parent()
+            .unwrap()
+            .join(format!("{sentinel_name}.familiar.json"));
+        let sentinel = b"not familiar metadata";
+        std::fs::write(&escaped_sidecar, sentinel).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(familiar_file(&storage, &malformed_id)).unwrap(),
+            std::fs::canonicalize(&escaped_sidecar).unwrap()
+        );
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("path-shaped indexed session id must fail the list"),
+            Err(err) => err,
+        };
+        match err {
+            PocketError::Engine { message } => {
+                assert_eq!(message, format!("invalid session id: {malformed_id}"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(std::fs::read(&escaped_sidecar).unwrap(), sentinel);
+        assert!(!storage.join("transcripts").exists());
+        assert!(!storage.join(".fork-staging").exists());
+        assert!(!storage.join(".session-lifecycle").exists());
+
+        std::fs::remove_file(escaped_sidecar).unwrap();
         std::fs::remove_dir_all(storage).unwrap();
     }
 
