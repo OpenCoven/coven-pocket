@@ -375,6 +375,164 @@ final class FamiliarSelectionTests: XCTestCase {
         }
     }
 
+    func testTransportFailureRemainsVisibleAfterSelectingCachedFamiliar() async throws {
+        try await withDefaultsAsync { defaults in
+            let pairing = daemonPairing(host: "mac.local", port: 7001)
+            let profile = FamiliarProfileKey.companion(
+                host: pairing.host,
+                port: pairing.port
+            )
+            let client = FakeFamiliarRosterClient(gate: .ready(pairing))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven"),
+                remoteFamiliar(id: "owl", name: "Owl")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "raven", for: profile)
+
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+            model.select(
+                id: "owl",
+                for: .companion(host: " MAC.LOCAL ", port: 7001)
+            )
+
+            XCTAssertEqual(model.activeProfile, profile)
+            XCTAssertEqual(model.selectedFamiliar?.id, "owl")
+            XCTAssertEqual(try model.selection(for: profile)?.id, "owl")
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Roster transport failed.")
+            )
+        }
+    }
+
+    func testTransportFailureRemainsVisibleAfterClearingSelection() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "raven", for: profile)
+
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+            model.select(id: nil, for: profile)
+
+            XCTAssertNil(model.selectedFamiliar)
+            XCTAssertNil(try model.selection(for: profile))
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Roster transport failed.")
+            )
+        }
+    }
+
+    func testUnavailableGateFailuresSurviveSelectionAndClear() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven"),
+                remoteFamiliar(id: "owl", name: "Owl")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "raven", for: profile)
+
+            client.gateResult = .notPaired
+            await model.refresh()
+            model.select(id: "owl", for: profile)
+
+            XCTAssertEqual(model.selectedFamiliar?.id, "owl")
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Pair with a daemon to load familiars.")
+            )
+
+            client.gateResult = .blocked(
+                reason: "Daemon unavailable",
+                hint: "Reconnect the tunnel."
+            )
+            await model.refresh()
+            model.select(id: nil, for: profile)
+
+            XCTAssertNil(model.selectedFamiliar)
+            XCTAssertNil(try model.selection(for: profile))
+            XCTAssertEqual(
+                model.state,
+                .failed(
+                    reason: "Daemon unavailable Reconnect the tunnel."
+                )
+            )
+        }
+    }
+
+    func testSelectionForDifferentProfileDoesNotInheritRefreshFailure() async throws {
+        try await withDefaultsAsync { defaults in
+            let firstProfile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let secondProfile = FamiliarProfileKey.codex(profileID: "codex-b")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(firstProfile)
+            await model.refresh()
+
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+            model.select(id: "raven", for: secondProfile)
+
+            XCTAssertEqual(model.activeProfile, secondProfile)
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(try model.selection(for: secondProfile)?.id, "raven")
+            XCTAssertEqual(model.state, .loaded)
+        }
+    }
+
+    func testSuccessfulRefreshClearsFailureAfterCachedSelection() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven"),
+                remoteFamiliar(id: "owl", name: "Owl")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+            model.select(id: "owl", for: profile)
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Roster transport failed.")
+            )
+
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven"),
+                remoteFamiliar(id: "owl", name: "Updated Owl")
+            ])
+            await model.refresh()
+
+            XCTAssertEqual(model.state, .loaded)
+            XCTAssertEqual(model.selectedFamiliar?.displayName, "Updated Owl")
+            XCTAssertEqual(
+                try model.selection(for: profile)?.displayName,
+                "Updated Owl"
+            )
+        }
+    }
+
     func testUnavailableGatesRetainCachedSelectionWithActionableFailure() async throws {
         try await withDefaultsAsync { defaults in
             let profile = FamiliarProfileKey.codex(profileID: "codex-a")
@@ -547,6 +705,57 @@ final class FamiliarSelectionTests: XCTestCase {
             XCTAssertEqual(model.selectedFamiliar?.id, "raven")
             XCTAssertEqual(try model.selection(for: profile)?.id, "raven")
             XCTAssertEqual(model.remoteFamiliar(for: "RAVEN")?.id, "raven")
+        }
+    }
+
+    func testUnknownSelectionTakesPrecedenceOverRefreshFailure() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+            model.select(id: "removed", for: profile)
+
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "The selected familiar is no longer available.")
+            )
+        }
+    }
+
+    func testSuccessfulSelectionRepairsStoreFailureWithoutHidingRefreshFailure() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+            defaults.set(
+                Data([0xFF]),
+                forKey: FamiliarSelectionStore.storageKey
+            )
+
+            model.select(id: "raven", for: profile)
+
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(try model.selection(for: profile)?.id, "raven")
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Roster transport failed.")
+            )
         }
     }
 

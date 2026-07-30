@@ -158,6 +158,11 @@ final class FamiliarSelectionModel: ObservableObject {
         case failed(reason: String)
     }
 
+    private struct RefreshFailure {
+        let profile: FamiliarProfileKey
+        let reason: String
+    }
+
     @Published private(set) var roster: [RemoteFamiliar] = []
     @Published private(set) var state: State = .idle
     @Published private(set) var selectedFamiliar: FamiliarIdentity?
@@ -173,6 +178,7 @@ final class FamiliarSelectionModel: ObservableObject {
     ] = [:]
     private var latestValidatedRoster: [RemoteFamiliar]?
     private var storeFailureReason: String?
+    private var lastRefreshFailure: RefreshFailure?
 
     init(
         client: any FamiliarRosterClient,
@@ -198,17 +204,22 @@ final class FamiliarSelectionModel: ObservableObject {
             activeProfile = nil
             selectedFamiliar = nil
             storeFailureReason = nil
+            lastRefreshFailure = nil
             state = .idle
             return
         }
 
         let normalizedProfile = profile.normalized
+        if activeProfile != normalizedProfile {
+            lastRefreshFailure = nil
+        }
         activeProfile = normalizedProfile
         publishCachedRoster(for: normalizedProfile)
         restoreSelection(
             for: normalizedProfile,
             clearPreviousFailure: true
         )
+        restoreRefreshFailure(for: normalizedProfile)
     }
 
     func refresh() async {
@@ -218,11 +229,11 @@ final class FamiliarSelectionModel: ObservableObject {
 
         switch gate {
         case .notPaired:
-            failUnlessStoreFailed(
+            publishRefreshFailure(
                 "Pair with a daemon to load familiars."
             )
         case let .blocked(reason, hint):
-            failUnlessStoreFailed("\(reason) \(hint)")
+            publishRefreshFailure("\(reason) \(hint)")
         case let .ready(pairing):
             await refresh(
                 pairing: pairing,
@@ -240,7 +251,10 @@ final class FamiliarSelectionModel: ObservableObject {
                 try store.save(nil, for: profile)
                 selectedFamiliar = nil
                 storeFailureReason = nil
-                state = hasValidatedRoster(for: profile) ? .loaded : .idle
+                publishSuccessfulSelectionState(
+                    for: profile,
+                    fallback: hasValidatedRoster(for: profile) ? .loaded : .idle
+                )
             } catch {
                 publishStoreFailure(error)
             }
@@ -259,7 +273,10 @@ final class FamiliarSelectionModel: ObservableObject {
             try store.save(selection, for: profile)
             selectedFamiliar = selection
             storeFailureReason = nil
-            state = .loaded
+            publishSuccessfulSelectionState(
+                for: profile,
+                fallback: .loaded
+            )
         } catch {
             publishStoreFailure(error)
         }
@@ -290,6 +307,9 @@ final class FamiliarSelectionModel: ObservableObject {
         let endpoint = FamiliarProfileKey.companion(pairing: pairing)
         companionProfile = endpoint
         if case .companion = activeProfile {
+            if activeProfile != endpoint {
+                lastRefreshFailure = nil
+            }
             activeProfile = endpoint
         }
         publishRosterForReadyEndpoint(endpoint)
@@ -298,6 +318,7 @@ final class FamiliarSelectionModel: ObservableObject {
         do {
             let fetched = try await client.familiars(pairing: pairing)
             guard refreshGeneration == generation else { return }
+            lastRefreshFailure = nil
             let sorted = Self.sorted(fetched)
             endpointRosterCache[endpoint] = sorted
             latestValidatedRoster = sorted
@@ -305,7 +326,7 @@ final class FamiliarSelectionModel: ObservableObject {
             reconcileActiveSelection(with: sorted)
         } catch {
             guard refreshGeneration == generation else { return }
-            failUnlessStoreFailed(error.localizedDescription)
+            publishRefreshFailure(error.localizedDescription)
         }
     }
 
@@ -405,8 +426,35 @@ final class FamiliarSelectionModel: ObservableObject {
         }
     }
 
-    private func failUnlessStoreFailed(_ reason: String) {
+    private func publishRefreshFailure(_ reason: String) {
+        if let activeProfile {
+            lastRefreshFailure = RefreshFailure(
+                profile: activeProfile,
+                reason: reason
+            )
+        }
         state = .failed(reason: storeFailureReason ?? reason)
+    }
+
+    private func restoreRefreshFailure(for profile: FamiliarProfileKey) {
+        guard storeFailureReason == nil,
+              let lastRefreshFailure,
+              lastRefreshFailure.profile == profile else {
+            return
+        }
+        state = .failed(reason: lastRefreshFailure.reason)
+    }
+
+    private func publishSuccessfulSelectionState(
+        for profile: FamiliarProfileKey,
+        fallback: State
+    ) {
+        guard let lastRefreshFailure,
+              lastRefreshFailure.profile == profile else {
+            state = fallback
+            return
+        }
+        state = .failed(reason: lastRefreshFailure.reason)
     }
 
     private func publishStoreFailure(_ error: Error) {
