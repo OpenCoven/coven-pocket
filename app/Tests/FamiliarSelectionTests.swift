@@ -391,6 +391,38 @@ final class FamiliarSelectionTests: XCTestCase {
         XCTAssertEqual(seal?.binding, .activeConversation)
     }
 
+    func testIdentitySealDoesNotUseNextSelectionForIdentityLessActiveConversation() {
+        let seal = FamiliarSealResolver.onDevice(
+            activeFamiliar: nil,
+            hasActiveSession: true,
+            selectedFamiliar: familiarIdentity(
+                id: "forge",
+                name: "Forge",
+                role: "Implementation"
+            ),
+            roster: []
+        )
+
+        XCTAssertNil(seal)
+    }
+
+    func testIdentitySealUsesSelectionForNextConversation() {
+        let seal = FamiliarSealResolver.onDevice(
+            activeFamiliar: nil,
+            hasActiveSession: false,
+            selectedFamiliar: familiarIdentity(
+                id: "forge",
+                name: "Forge",
+                role: "Implementation"
+            ),
+            roster: []
+        )
+
+        XCTAssertEqual(seal?.displayName, "Forge")
+        XCTAssertEqual(seal?.role, "Implementation")
+        XCTAssertEqual(seal?.binding, .nextSession)
+    }
+
     func testCompanionIdentitySealFallsBackToBoundID() {
         let seal = FamiliarSealResolver.companion(
             sessionFamiliarID: "archived-familiar",
@@ -402,6 +434,38 @@ final class FamiliarSelectionTests: XCTestCase {
         XCTAssertEqual(seal?.displayName, "archived-familiar")
         XCTAssertEqual(seal?.glyph, "✦")
         XCTAssertEqual(seal?.binding, .activeConversation)
+    }
+
+    func testCompanionIdentitySealDoesNotUseNextSelectionForIdentityLessActiveConversation() {
+        let seal = FamiliarSealResolver.companion(
+            sessionFamiliarID: nil,
+            hasActiveSession: true,
+            selectedFamiliar: familiarIdentity(
+                id: "forge",
+                name: "Forge",
+                role: "Implementation"
+            ),
+            roster: []
+        )
+
+        XCTAssertNil(seal)
+    }
+
+    func testCompanionIdentitySealUsesSelectionForNextConversation() {
+        let seal = FamiliarSealResolver.companion(
+            sessionFamiliarID: nil,
+            hasActiveSession: false,
+            selectedFamiliar: familiarIdentity(
+                id: "forge",
+                name: "Forge",
+                role: "Implementation"
+            ),
+            roster: []
+        )
+
+        XCTAssertEqual(seal?.displayName, "Forge")
+        XCTAssertEqual(seal?.role, "Implementation")
+        XCTAssertEqual(seal?.binding, .nextSession)
     }
 
     func testCodexSelectionRoundTripsExactSnapshot() throws {

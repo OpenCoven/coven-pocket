@@ -88,7 +88,8 @@ enum FamiliarSealResolver {
         selectedFamiliar: FamiliarIdentity?,
         roster: [RemoteFamiliar]
     ) -> FamiliarSealValue? {
-        if let activeFamiliar {
+        if hasActiveSession {
+            guard let activeFamiliar else { return nil }
             return seal(
                 FamiliarPresentation(
                     identity: activeFamiliar,
@@ -98,7 +99,6 @@ enum FamiliarSealResolver {
             )
         }
         guard let selectedFamiliar else { return nil }
-        _ = hasActiveSession
         return seal(
             FamiliarPresentation(
                 identity: selectedFamiliar,
@@ -114,7 +114,8 @@ enum FamiliarSealResolver {
         selectedFamiliar: FamiliarIdentity?,
         roster: [RemoteFamiliar]
     ) -> FamiliarSealValue? {
-        if hasActiveSession, let sessionFamiliarID {
+        if hasActiveSession {
+            guard let sessionFamiliarID else { return nil }
             let presentation: FamiliarPresentation
             if let remote = roster.first(where: {
                 $0.id.caseInsensitiveCompare(sessionFamiliarID) == .orderedSame
