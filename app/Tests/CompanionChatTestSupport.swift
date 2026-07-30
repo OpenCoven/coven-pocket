@@ -31,6 +31,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     var eventError: FakeCompanionError?
     var sendInputError: FakeCompanionError?
     var killError: FakeCompanionError?
+    var killChecksCancellation = false
     var launchError: FakeCompanionError?
     var launchedProjectRoot: String?
     var echoesRequestedFamiliarID = true
@@ -38,17 +39,20 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     var suspendsEvents = false
     var suspendsGate = false
     var suspendsLaunch = false
+    var suspendsSendInput = false
     var suspendsKill = false
     let eventsRequested = XCTestExpectation(description: "events requested")
     let gateRequested = XCTestExpectation(description: "session gate requested")
     let secondGateRequested = XCTestExpectation(description: "second session gate requested")
     let launchRequested = XCTestExpectation(description: "session launch requested")
+    let sendInputRequested = XCTestExpectation(description: "session input requested")
     let killRequested = XCTestExpectation(description: "session kill requested")
     private var eventsContinuation: CheckedContinuation<RemoteEventBatch, Never>?
     private var gateContinuations: [
         CheckedContinuation<CompanionModel.SessionGate, Never>
     ] = []
     private var launchContinuation: CheckedContinuation<RemoteSession, Error>?
+    private var sendInputContinuation: CheckedContinuation<Void, Never>?
     private var killContinuation: CheckedContinuation<Void, Never>?
     private var suspendedLaunchFamiliarID: String?
 
@@ -131,6 +135,12 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             throw sendInputError
         }
         sentInputs.append(data)
+        if suspendsSendInput {
+            sendInputRequested.fulfill()
+            await withCheckedContinuation { continuation in
+                sendInputContinuation = continuation
+            }
+        }
     }
 
     func kill(pairing: DaemonPairing, sessionID: String) async throws {
@@ -140,6 +150,9 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             await withCheckedContinuation { continuation in
                 killContinuation = continuation
             }
+        }
+        if killChecksCancellation {
+            try Task.checkCancellation()
         }
         if let killError {
             throw killError
@@ -188,6 +201,13 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
                 )
             )
         }
+    }
+
+    func resumeSendInput() {
+        suspendsSendInput = false
+        let continuation = sendInputContinuation
+        sendInputContinuation = nil
+        continuation?.resume()
     }
 
     func resumeKill() {

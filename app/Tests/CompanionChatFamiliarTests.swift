@@ -365,6 +365,36 @@ final class CompanionChatFamiliarAuthorityTests: XCTestCase {
         XCTAssertTrue(client.sentInputs.isEmpty)
     }
 
+    func testCancelledFamiliarMismatchCleanupEscapesSendCancellation() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.echoesRequestedFamiliarID = false
+        client.suspendsKill = true
+        client.killChecksCancellation = true
+        let model = CompanionChatModel(client: client)
+
+        let send = Task {
+            await model.send(
+                prompt: "first",
+                projectRoot: "/srv/repo",
+                familiarID: "sage"
+            )
+        }
+        await fulfillment(of: [client.killRequested], timeout: 1)
+
+        send.cancel()
+        client.resumeKill()
+        await send.value
+
+        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertNil(model.session)
+        XCTAssertNil(model.sessionFamiliarID)
+        XCTAssertFalse(model.hasPendingCleanup)
+        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+    }
+
     func testNilFamiliarEchoIsValidForNilRequest() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         let model = CompanionChatModel(client: client)

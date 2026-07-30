@@ -2,6 +2,7 @@ import XCTest
 @testable import CovenPocket
 
 @MainActor
+// swiftlint:disable:next type_body_length
 final class CompanionChatLifecycleTests: XCTestCase {
     func testStopUsesDaemonKill() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
@@ -149,6 +150,136 @@ final class CompanionChatLifecycleTests: XCTestCase {
         await model.retry()
         XCTAssertFalse(model.hasPendingCleanup)
         XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+    }
+
+    func testCancelledLateLaunchCleansWithoutAdoptingAndLaterSendRecovers() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsLaunch = true
+        let model = CompanionChatModel(client: client)
+
+        let send = Task {
+            await model.send(
+                prompt: "first",
+                projectRoot: "/srv/repo",
+                familiarID: "sage"
+            )
+        }
+        await fulfillment(of: [client.launchRequested], timeout: 1)
+
+        send.cancel()
+        client.resumeLaunch()
+        await send.value
+
+        XCTAssertEqual(client.launchedPrompts, ["first"])
+        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertNil(model.session)
+        XCTAssertNil(model.sessionFamiliarID)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertFalse(model.hasPendingCleanup)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+
+        await model.send(
+            prompt: "second",
+            projectRoot: "/srv/repo",
+            familiarID: "forge"
+        )
+
+        XCTAssertEqual(client.launchedPrompts, ["first", "second"])
+        XCTAssertEqual(model.sessionFamiliarID, "forge")
+        XCTAssertTrue(model.hasActivePollTask)
+    }
+
+    func testResetDoesNotDuplicateSuspendedCancelledLaunchCleanup() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        client.suspendsLaunch = true
+        client.suspendsKill = true
+        let model = CompanionChatModel(client: client)
+
+        let send = Task {
+            await model.send(prompt: "first", projectRoot: "/srv/repo")
+        }
+        await fulfillment(of: [client.launchRequested], timeout: 1)
+        send.cancel()
+        client.resumeLaunch()
+        await fulfillment(of: [client.killRequested], timeout: 1)
+
+        client.suspendsKill = false
+        await model.reset()
+
+        XCTAssertEqual(
+            client.operationLog.filter { $0 == "kill:session-1" }.count,
+            1
+        )
+
+        client.resumeKill()
+        await send.value
+
+        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertFalse(model.hasPendingCleanup)
+        XCTAssertFalse(model.isBusy)
+    }
+
+    func testCancellationBeforeActiveSessionInputPreventsRequest() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        completeTurn(on: model)
+        var send: Task<Void, Never>?
+        let observation = model.$availability
+            .dropFirst()
+            .sink { availability in
+                if case .ready = availability {
+                    send?.cancel()
+                }
+            }
+
+        send = Task {
+            await model.send(prompt: "second", projectRoot: "/srv/repo")
+        }
+        guard let send else {
+            XCTFail("Expected send task")
+            return
+        }
+        await send.value
+
+        XCTAssertTrue(client.sentInputs.isEmpty)
+        XCTAssertNotNil(model.session)
+        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+        withExtendedLifetime(observation) {}
+    }
+
+    func testCancellationDuringActiveSessionInputDoesNotRestartPolling() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        completeTurn(on: model)
+        client.suspendsSendInput = true
+
+        let send = Task {
+            await model.send(prompt: "second", projectRoot: "/srv/repo")
+        }
+        await fulfillment(of: [client.sendInputRequested], timeout: 1)
+
+        send.cancel()
+        client.resumeSendInput()
+        await send.value
+
+        XCTAssertEqual(client.sentInputs, ["second"])
+        XCTAssertNotNil(model.session)
+        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+
+        await model.send(prompt: "third", projectRoot: "/srv/repo")
+
+        XCTAssertEqual(client.sentInputs, ["second", "third"])
+        XCTAssertTrue(model.hasActivePollTask)
     }
 
     func testInvalidatedLaunchFailureClearsBusyState() async {

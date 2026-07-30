@@ -6,29 +6,54 @@ extension CompanionChatModel {
         pairing verified: DaemonPairing,
         generation: UInt64
     ) async throws {
+        guard canContinueSend(generation: generation) else { return }
         guard try await replaceSessionIfNeeded(
             context: context,
             pairing: verified,
             generation: generation
-        ) else { return }
-        guard generation == operationGeneration else { return }
+        ) else {
+            if Task.isCancelled {
+                finishCancelledSend(generation: generation)
+            }
+            return
+        }
+        guard generation == operationGeneration, !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
 
+        var launchedSession: RemoteSession?
         if let session {
+            guard canContinueSend(generation: generation) else { return }
             try await client.sendInput(
                 pairing: verified,
                 sessionID: session.id,
                 data: context.prompt
             )
+            guard generation == operationGeneration, !Task.isCancelled else {
+                finishCancelledSend(generation: generation)
+                return
+            }
         } else {
             try await prepareAndLaunch(
                 context: context,
                 pairing: verified,
                 generation: generation
             )
+            launchedSession = session
         }
-        guard generation == operationGeneration else { return }
-        pairing = verified
-        startPolling()
+        if await finishInvalidatedSendIfNeeded(
+            generation: generation,
+            pairing: verified,
+            launchedSession: launchedSession
+        ) {
+            return
+        }
+        await finalizeSend(
+            verified,
+            generation: generation,
+            launchedSession: launchedSession
+        )
     }
 
     func replaceSessionIfNeeded(
@@ -42,6 +67,7 @@ extension CompanionChatModel {
             return true
         }
         guard Self.isSameDaemonEndpoint(sessionPairing, pairing) else {
+            guard canContinueSend(generation: generation) else { return false }
             abandonSession()
             await beginCleanup(
                 of: activeSession,
@@ -56,13 +82,15 @@ extension CompanionChatModel {
         }
         guard sessionProjectRoot != context.projectRoot
                 || sessionFamiliarID != context.familiarID else { return true }
+        guard canContinueSend(generation: generation) else { return false }
         abandonSession()
         let cleaned = await beginCleanup(
             of: activeSession,
             pairing: sessionPairing,
             completionText: nil
         )
-        guard generation == operationGeneration else { return false }
+        guard generation == operationGeneration,
+              !Task.isCancelled else { return false }
         guard cleaned else {
             setRetryContext(
                 context
@@ -142,6 +170,10 @@ extension CompanionChatModel {
         generation: UInt64
     ) async throws {
         prepareForNewSession()
+        guard generation == operationGeneration, !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
         launchInFlight = true
         do {
             let launched = try await client.launch(
@@ -152,43 +184,80 @@ extension CompanionChatModel {
                 familiarID: context.familiarID
             )
             launchInFlight = false
-            guard generation == operationGeneration else {
-                await beginCleanup(
-                    of: launched,
+            if await discardReturnedLaunchIfNeeded(
+                launched,
+                pairing: pairing,
+                generation: generation
+            ) {
+                return
+            }
+            guard try await confirmLaunchedFamiliar(
+                launched,
+                context: context,
+                pairing: pairing,
+                generation: generation
+            ) else { return }
+            guard generation == operationGeneration,
+                  !Task.isCancelled else {
+                _ = await discardReturnedLaunchIfNeeded(
+                    launched,
                     pairing: pairing,
-                    completionText: nil
+                    generation: generation
                 )
                 return
             }
-            guard launched.familiarId == context.familiarID else {
-                await beginCleanup(
-                    of: launched,
-                    pairing: pairing,
-                    completionText: nil
-                )
-                guard generation == operationGeneration else { return }
-                throw FamiliarConfirmationError()
-            }
-            session = launched
-            sessionProjectRoot = context.projectRoot
-            pinSessionFamiliar(
-                id: context.familiarID,
-                presentation: context.familiarPresentation,
+            adoptLaunchedSession(
+                launched,
+                context: context,
                 pairing: pairing
             )
-            initialPrompt = context.prompt
-            initialPromptID = "companion-initial-\(launched.id)"
-            items = [
-                ChatItem(
-                    id: initialPromptID ?? "companion-initial",
-                    kind: .user,
-                    text: context.prompt
-                )
-            ]
         } catch {
             launchInFlight = false
             throw error
         }
+    }
+
+    func adoptLaunchedSession(
+        _ launched: RemoteSession,
+        context: CompanionSendContext,
+        pairing: DaemonPairing
+    ) {
+        session = launched
+        sessionProjectRoot = context.projectRoot
+        pinSessionFamiliar(
+            id: context.familiarID,
+            presentation: context.familiarPresentation,
+            pairing: pairing
+        )
+        initialPrompt = context.prompt
+        initialPromptID = "companion-initial-\(launched.id)"
+        items = [
+            ChatItem(
+                id: initialPromptID ?? "companion-initial",
+                kind: .user,
+                text: context.prompt
+            )
+        ]
+    }
+
+    func confirmLaunchedFamiliar(
+        _ launched: RemoteSession,
+        context: CompanionSendContext,
+        pairing: DaemonPairing,
+        generation: UInt64
+    ) async throws -> Bool {
+        guard launched.familiarId != context.familiarID else { return true }
+        await cleanupReturnedLaunch(
+            of: launched,
+            pairing: pairing,
+            revalidatePairing: false
+        )
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return false
+        }
+        throw FamiliarConfirmationError()
     }
 
     func handleSendFailure(
@@ -200,6 +269,10 @@ extension CompanionChatModel {
             if pendingCleanup == nil {
                 isBusy = false
             }
+            return
+        }
+        guard !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
             return
         }
         isBusy = false
@@ -230,9 +303,13 @@ extension CompanionChatModel {
         reportFailure: Bool,
         generation: UInt64
     ) async -> DaemonPairing? {
+        guard generation == operationGeneration,
+              !Task.isCancelled else { return nil }
         guard let gate = await availabilityGate(
             while: { generation == operationGeneration }
         ) else { return nil }
+        guard generation == operationGeneration,
+              !Task.isCancelled else { return nil }
         switch gate {
         case let .ready(pairing):
             return pairing
@@ -252,7 +329,7 @@ extension CompanionChatModel {
     }
 
     func startPolling() {
-        guard pollTask == nil else { return }
+        guard pollTask == nil, !Task.isCancelled else { return }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refreshOnce()
@@ -285,6 +362,26 @@ extension CompanionChatModel {
         retryFamiliarID = context.familiarID
         retryFamiliarPresentation = context.familiarPresentation
         canRetry = true
+    }
+
+    func finishCancelledSend(generation: UInt64) {
+        guard generation == operationGeneration else { return }
+        retryPrompt = nil
+        retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
+        retriesPolling = false
+        guard pendingCleanup == nil else { return }
+        isBusy = false
+        canRetry = false
+    }
+
+    func canContinueSend(generation: UInt64) -> Bool {
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return false
+        }
+        return true
     }
 }
 

@@ -101,6 +101,38 @@ final class CompanionChatInitialAvailabilityTests: XCTestCase {
         XCTAssertFalse(model.items.contains { $0.kind == .error })
     }
 
+    func testCancellationAfterReadyPublicationPreventsLaunch() async {
+        let pairing = pairedDaemon()
+        let client = FakeCompanionSessionClient(gate: .ready(pairing))
+        let model = CompanionChatModel(client: client)
+        var send: Task<Void, Never>?
+        let observation = model.$availability
+            .dropFirst()
+            .sink { availability in
+                if case .ready = availability {
+                    send?.cancel()
+                }
+            }
+
+        send = Task {
+            await model.send(prompt: "first", projectRoot: "/srv/repo")
+        }
+        guard let send else {
+            XCTFail("Expected send task")
+            return
+        }
+        await send.value
+
+        XCTAssertEqual(model.availability, .ready(pairing))
+        XCTAssertEqual(client.gateCallCount, 1)
+        XCTAssertTrue(client.launchedPrompts.isEmpty)
+        XCTAssertTrue(model.items.isEmpty)
+        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+        withExtendedLifetime(observation) {}
+    }
+
     func testCancelledInitialCleanupGateRestoresIdleWithoutKillOrError() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         client.suspendsGate = true

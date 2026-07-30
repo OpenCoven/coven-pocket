@@ -10,10 +10,114 @@ extension CompanionChatModel {
         )
     }
 
+    func discardReturnedLaunchIfNeeded(
+        _ launched: RemoteSession,
+        pairing: DaemonPairing,
+        generation: UInt64
+    ) async -> Bool {
+        let operationInvalidated = generation != operationGeneration
+        guard operationInvalidated || Task.isCancelled else { return false }
+        await cleanupReturnedLaunch(
+            of: launched,
+            pairing: pairing,
+            revalidatePairing: operationInvalidated
+        )
+        if Task.isCancelled {
+            finishCancelledSend(generation: generation)
+        }
+        return true
+    }
+
+    func finishInvalidatedSendIfNeeded(
+        generation: UInt64,
+        pairing: DaemonPairing,
+        launchedSession: RemoteSession?
+    ) async -> Bool {
+        guard generation != operationGeneration
+                || Task.isCancelled else { return false }
+        if let launchedSession {
+            await discardAdoptedLaunch(
+                launchedSession,
+                pairing: pairing,
+                generation: generation
+            )
+        }
+        finishCancelledSend(generation: generation)
+        return true
+    }
+
+    func finalizeSend(
+        _ verified: DaemonPairing,
+        generation: UInt64,
+        launchedSession: RemoteSession?
+    ) async {
+        pairing = verified
+        startPolling()
+        _ = await finishPollingIfCancelled(
+            generation: generation,
+            pairing: verified,
+            launchedSession: launchedSession
+        )
+    }
+
+    func finishPollingIfCancelled(
+        generation: UInt64,
+        pairing: DaemonPairing,
+        launchedSession: RemoteSession?
+    ) async -> Bool {
+        guard Task.isCancelled else { return false }
+        pollTask?.cancel()
+        pollTask = nil
+        if let launchedSession {
+            await discardAdoptedLaunch(
+                launchedSession,
+                pairing: pairing,
+                generation: generation
+            )
+        }
+        finishCancelledSend(generation: generation)
+        return true
+    }
+
+    func discardAdoptedLaunch(
+        _ launched: RemoteSession,
+        pairing: DaemonPairing,
+        generation: UInt64
+    ) async {
+        if session?.id == launched.id {
+            abandonSession()
+            prepareForNewSession()
+        }
+        guard pendingCleanup?.id != launched.id else { return }
+        await cleanupReturnedLaunch(
+            of: launched,
+            pairing: pairing,
+            revalidatePairing: generation != operationGeneration
+        )
+    }
+
+    func cleanupReturnedLaunch(
+        of launched: RemoteSession,
+        pairing: DaemonPairing,
+        revalidatePairing: Bool
+    ) async {
+        let cleanup = Task { @MainActor in
+            await beginCleanup(
+                of: launched,
+                pairing: pairing,
+                completionText: nil,
+                verifiedPairing: revalidatePairing ? nil : pairing
+            )
+        }
+        _ = await cleanup.value
+    }
+
+    @discardableResult
     func beginCleanup(
         of sessionToClean: RemoteSession,
         pairing knownPairing: DaemonPairing?,
-        completionText: String?
+        completionText: String?,
+        verifiedPairing: DaemonPairing? = nil
     ) async -> Bool {
         let generation = operationGeneration
         let retainedRetryContext = retryPrompt.map {
@@ -41,31 +145,83 @@ extension CompanionChatModel {
         canRetry = false
         retriesPolling = false
 
-        guard let verified = await cleanupPairing(
+        guard let verified = await resolveCleanupPairing(
+            verifiedPairing,
             generation: generation,
             session: sessionToClean,
             completionText: completionText
         ) else { return false }
 
+        guard canStartCleanupKill(generation: generation) else { return false }
+        guard cleanupKillInFlightSessionID == nil else { return false }
+        cleanupKillInFlightSessionID = sessionToClean.id
+        defer { cleanupKillInFlightSessionID = nil }
         do {
             try await client.kill(pairing: verified, sessionID: sessionToClean.id)
-            guard generation == operationGeneration else { return false }
+            guard pendingCleanup?.id == sessionToClean.id else { return false }
             completeCleanup(of: sessionToClean, message: completionText)
             return true
         } catch {
-            guard generation == operationGeneration else { return false }
-            if Self.isSessionNotLive(error) {
-                completeCleanup(
-                    of: sessionToClean,
-                    message: completionText ?? "Session already stopped."
-                )
-                return true
+            return handleCleanupFailure(
+                error,
+                session: sessionToClean,
+                completionText: completionText,
+                generation: generation
+            )
+        }
+    }
+
+    func canStartCleanupKill(generation: UInt64) -> Bool {
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            if generation == operationGeneration {
+                isBusy = false
+                canRetry = true
             }
+            return false
+        }
+        return true
+    }
+
+    func handleCleanupFailure(
+        _ error: Error,
+        session: RemoteSession,
+        completionText: String?,
+        generation: UInt64
+    ) -> Bool {
+        guard pendingCleanup?.id == session.id else { return false }
+        if Self.isSessionNotLive(error) {
+            completeCleanup(
+                of: session,
+                message: completionText ?? "Session already stopped."
+            )
+            return true
+        }
+        guard generation == operationGeneration else {
             isBusy = false
-            fail(error.localizedDescription, retryPrompt: nil)
             canRetry = true
             return false
         }
+        isBusy = false
+        fail(error.localizedDescription, retryPrompt: nil)
+        canRetry = true
+        return false
+    }
+
+    func resolveCleanupPairing(
+        _ verifiedPairing: DaemonPairing?,
+        generation: UInt64,
+        session: RemoteSession,
+        completionText: String?
+    ) async -> DaemonPairing? {
+        if let verifiedPairing {
+            return verifiedPairing
+        }
+        return await cleanupPairing(
+            generation: generation,
+            session: session,
+            completionText: completionText
+        )
     }
 
     func cleanupPairing(

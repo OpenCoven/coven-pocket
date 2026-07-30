@@ -69,6 +69,7 @@ final class CompanionChatModel: ObservableObject {
     var pendingCleanup: RemoteSession?
     var pendingCleanupPairing: DaemonPairing?
     var pendingCleanupCompletionText: String?
+    var cleanupKillInFlightSessionID: String?
 
     convenience init() {
         self.init(companion: CompanionModel())
@@ -142,6 +143,7 @@ final class CompanionChatModel: ObservableObject {
             )
         }
         return await withTaskCancellationHandler {
+            guard isOperationCurrent(), !Task.isCancelled else { return nil }
             let gate = await client.sessionGate()
             guard generation == availabilityGeneration,
                   isOperationCurrent(),
@@ -190,7 +192,10 @@ final class CompanionChatModel: ObservableObject {
             familiarID: normalizedFamiliarID,
             familiarPresentation: presentation
         )
-        guard !trimmedPrompt.isEmpty, !isBusy, pendingCleanup == nil else { return }
+        guard !Task.isCancelled,
+              !trimmedPrompt.isEmpty,
+              !isBusy,
+              pendingCleanup == nil else { return }
         guard Self.isAbsoluteHostPath(trimmedRoot) else {
             retryFamiliarID = nil
             retryFamiliarPresentation = .empty
@@ -208,14 +213,26 @@ final class CompanionChatModel: ObservableObject {
         retryProjectRoot = trimmedRoot
         retryFamiliarID = normalizedFamiliarID
         retryFamiliarPresentation = presentation
+        guard !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
         guard let verified = await verifiedPairing(
             reportFailure: true,
             generation: generation
         ) else {
             guard generation == operationGeneration else { return }
+            guard !Task.isCancelled else {
+                finishCancelledSend(generation: generation)
+                return
+            }
             isBusy = false
             retryPrompt = trimmedPrompt
             canRetry = true
+            return
+        }
+        guard generation == operationGeneration, !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
             return
         }
 
@@ -236,6 +253,9 @@ final class CompanionChatModel: ObservableObject {
                 context: context,
                 generation: generation
             )
+        }
+        if Task.isCancelled {
+            finishCancelledSend(generation: generation)
         }
     }
 }
