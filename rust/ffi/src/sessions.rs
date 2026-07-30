@@ -111,6 +111,25 @@ fn persistence_err(path: &Path, reason: impl std::fmt::Display) -> PocketError {
     }
 }
 
+fn normalize_storage_root(root: &Path) -> Result<PathBuf, PocketError> {
+    let mut normalized = PathBuf::new();
+    for component in root.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(persistence_err(
+                    root,
+                    "configured storage root contains a parent component",
+                ));
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 /// Reject anything that is not a bare UUID before it touches a path.
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), PocketError> {
     uuid::Uuid::parse_str(session_id)
@@ -142,6 +161,7 @@ impl CheckedStorage {
                 message: format!("storage_dir must be absolute, got {display_path}"),
             });
         }
+        let root = normalize_storage_root(&root)?;
         match std::fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(persistence_err(
@@ -2304,6 +2324,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_external_sentinel_only(directory: &Path, sentinel: &Path) {
+        assert_external_sentinel(sentinel);
+        let entries = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [sentinel.file_name().unwrap().to_os_string()],
+            "storage artifacts were created in {}",
+            directory.display()
+        );
+    }
+
+    #[cfg(unix)]
     fn assert_unsafe_storage_path<T>(result: Result<T, PocketError>, path: &Path, reason: &str) {
         let err = match result {
             Ok(_) => panic!("unsafe storage path was accepted: {}", path.display()),
@@ -2394,6 +2429,65 @@ mod tests {
 
         remove_symlink_if_present(&storage);
         std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_root_symlink_with_trailing_separator_is_rejected_before_artifact_creation() {
+        use std::os::unix::fs::symlink;
+
+        let (external, sentinel) = external_sentinel("unsafe-root-slash-target");
+        let storage = test_storage("unsafe-root-slash-link");
+        std::fs::remove_dir(&storage).unwrap();
+        symlink(&external, &storage).unwrap();
+        let configured = format!("{}/", storage.display());
+
+        let result = list_sessions(&configured).await;
+
+        assert_external_sentinel_only(&external, &sentinel);
+        assert_unsafe_storage_path(result, &storage, "symlink");
+
+        remove_symlink_if_present(&storage);
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_root_symlink_with_trailing_dot_is_rejected_before_artifact_creation() {
+        use std::os::unix::fs::symlink;
+
+        let (external, sentinel) = external_sentinel("unsafe-root-dot-target");
+        let storage = test_storage("unsafe-root-dot-link");
+        std::fs::remove_dir(&storage).unwrap();
+        symlink(&external, &storage).unwrap();
+        let configured = storage.join(".").display().to_string();
+
+        let result = list_sessions(&configured).await;
+
+        assert_external_sentinel_only(&external, &sentinel);
+        assert_unsafe_storage_path(result, &storage, "symlink");
+
+        remove_symlink_if_present(&storage);
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn storage_root_parent_component_is_rejected() {
+        let storage = test_storage("unsafe-root-parent");
+        let child = storage.join("child");
+        std::fs::create_dir(&child).unwrap();
+        let configured = child.join("..");
+
+        let err = CheckedStorage::open(&configured.display().to_string()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("persistence error"), "{message}");
+        assert!(
+            message.contains(&configured.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("parent"), "{message}");
+
+        std::fs::remove_dir_all(storage).unwrap();
     }
 
     #[cfg(unix)]
@@ -3220,11 +3314,7 @@ mod tests {
     async fn deleted_session_permanently_rejects_a_surviving_persistence_handle() {
         let storage = test_storage("delete-invalidates-persistence");
         let storage_str = storage.display().to_string();
-        let storage_alias = storage
-            .join("..")
-            .join(storage.file_name().unwrap())
-            .display()
-            .to_string();
+        let storage_alias = storage.join(".").display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
         let persistence = SessionPersistence::create(
             &storage_alias,
