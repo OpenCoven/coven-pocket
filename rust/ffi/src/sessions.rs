@@ -102,6 +102,15 @@ fn engine_err(context: &str, err: impl std::fmt::Display) -> PocketError {
     }
 }
 
+fn persistence_err(path: &Path, reason: impl std::fmt::Display) -> PocketError {
+    PocketError::Engine {
+        message: format!(
+            "persistence error: unsafe storage path {}: {reason}",
+            path.display()
+        ),
+    }
+}
+
 /// Reject anything that is not a bare UUID before it touches a path.
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), PocketError> {
     uuid::Uuid::parse_str(session_id)
@@ -117,29 +126,319 @@ fn validate_indexed_session_ids<'a>(
     session_ids.into_iter().try_for_each(validate_session_id)
 }
 
-fn storage_root(storage_dir: &str) -> Result<PathBuf, PocketError> {
-    let root = PathBuf::from(storage_dir);
-    if !root.is_absolute() {
-        return Err(PocketError::Engine {
-            message: format!("storage_dir must be absolute, got {storage_dir}"),
-        });
+#[derive(Clone, Debug)]
+struct CheckedStorage {
+    root: PathBuf,
+}
+
+impl CheckedStorage {
+    fn open(storage_dir: &str) -> Result<Self, PocketError> {
+        Self::open_path(PathBuf::from(storage_dir), storage_dir)
     }
-    std::fs::create_dir_all(&root).map_err(|e| engine_err("cannot create storage dir", e))?;
-    std::fs::canonicalize(&root).map_err(|e| engine_err("cannot canonicalize storage dir", e))
+
+    fn open_path(root: PathBuf, display_path: &str) -> Result<Self, PocketError> {
+        if !root.is_absolute() {
+            return Err(PocketError::Engine {
+                message: format!("storage_dir must be absolute, got {display_path}"),
+            });
+        }
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(persistence_err(
+                    &root,
+                    "configured storage root is a symlink",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(persistence_err(
+                    &root,
+                    "configured storage root is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&root)
+                    .map_err(|create_err| engine_err("cannot create storage dir", create_err))?;
+            }
+            Err(err) => return Err(engine_err("cannot inspect storage dir", err)),
+        }
+        let metadata = std::fs::symlink_metadata(&root)
+            .map_err(|err| engine_err("cannot inspect created storage dir", err))?;
+        if metadata.file_type().is_symlink() {
+            return Err(persistence_err(
+                &root,
+                "configured storage root is a symlink",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(persistence_err(
+                &root,
+                "configured storage root is not a directory",
+            ));
+        }
+        let canonical_root = std::fs::canonicalize(&root)
+            .map_err(|err| engine_err("cannot canonicalize storage dir", err))?;
+        let storage = Self {
+            root: canonical_root,
+        };
+        storage.validate_root()?;
+        storage.validate_fixed_layout()?;
+        Ok(storage)
+    }
+
+    #[cfg(test)]
+    fn from_root(root: &Path) -> Result<Self, PocketError> {
+        Self::open_path(root.to_path_buf(), &root.display().to_string())
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn validate_root(&self) -> Result<(), PocketError> {
+        let metadata = std::fs::symlink_metadata(&self.root)
+            .map_err(|err| engine_err("cannot inspect storage root", err))?;
+        if metadata.file_type().is_symlink() {
+            return Err(persistence_err(&self.root, "storage root became a symlink"));
+        }
+        if !metadata.is_dir() {
+            return Err(persistence_err(
+                &self.root,
+                "storage root is not a directory",
+            ));
+        }
+        let canonical = std::fs::canonicalize(&self.root)
+            .map_err(|err| engine_err("cannot canonicalize storage root", err))?;
+        if canonical != self.root {
+            return Err(persistence_err(
+                &self.root,
+                format!(
+                    "storage root resolves to unexpected path {}",
+                    canonical.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn child_path(&self, parent: &Path, component: &str) -> Result<PathBuf, PocketError> {
+        let mut components = Path::new(component).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(persistence_err(
+                parent,
+                format!("invalid storage path component {component:?}"),
+            ));
+        }
+        if parent != self.root && !parent.starts_with(&self.root) {
+            return Err(persistence_err(
+                parent,
+                format!("parent is outside storage root {}", self.root.display()),
+            ));
+        }
+        Ok(parent.join(component))
+    }
+
+    fn ensure_lexical_descendant(&self, path: &Path) -> Result<(), PocketError> {
+        if path == self.root || !path.starts_with(&self.root) {
+            return Err(persistence_err(
+                path,
+                format!(
+                    "path is not a strict descendant of storage root {}",
+                    self.root.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_canonical_descendant(&self, path: &Path) -> Result<(), PocketError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|err| engine_err("cannot canonicalize storage path", err))?;
+        if canonical == self.root || !canonical.starts_with(&self.root) {
+            return Err(persistence_err(
+                path,
+                format!(
+                    "path resolves outside storage root {} to {}",
+                    self.root.display(),
+                    canonical.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_directory(&self, path: &Path, allow_missing: bool) -> Result<bool, PocketError> {
+        self.validate_root()?;
+        self.ensure_lexical_descendant(path)?;
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            persistence_err(
+                path,
+                format!("path is outside storage root {}", self.root.display()),
+            )
+        })?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(persistence_err(
+                    path,
+                    "path contains a non-normal component",
+                ));
+            };
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(persistence_err(&current, "directory is a symlink"));
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(persistence_err(&current, "expected a directory"));
+                }
+                Ok(_) => self.validate_canonical_descendant(&current)?,
+                Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(false);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(persistence_err(&current, "required directory is missing"));
+                }
+                Err(err) => return Err(engine_err("cannot inspect storage directory", err)),
+            }
+        }
+        Ok(true)
+    }
+
+    fn validate_regular_file(&self, path: &Path, allow_missing: bool) -> Result<bool, PocketError> {
+        self.validate_root()?;
+        self.ensure_lexical_descendant(path)?;
+        let parent = path.parent().ok_or_else(|| {
+            persistence_err(path, "regular-file path has no containing directory")
+        })?;
+        if parent != self.root && !self.validate_directory(parent, true)? {
+            return if allow_missing {
+                Ok(false)
+            } else {
+                Err(persistence_err(
+                    parent,
+                    "required parent directory is missing",
+                ))
+            };
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(persistence_err(path, "regular file is a symlink"))
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                Err(persistence_err(path, "expected a regular file"))
+            }
+            Ok(_) => {
+                self.validate_canonical_descendant(path)?;
+                Ok(true)
+            }
+            Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(persistence_err(path, "required regular file is missing"))
+            }
+            Err(err) => Err(engine_err("cannot inspect storage file", err)),
+        }
+    }
+
+    fn metadata_dir(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.root, "metadata")
+    }
+
+    fn transcripts_dir(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.root, "transcripts")
+    }
+
+    fn lifecycle_dir(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.root, ".session-lifecycle")
+    }
+
+    fn pending_forks_dir(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.lifecycle_dir()?, "pending-forks")
+    }
+
+    fn fork_staging_root(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.root, ".fork-staging")
+    }
+
+    fn fork_staging_dir(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(&self.fork_staging_root()?, session_id)
+    }
+
+    fn transcript_file(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(&self.transcripts_dir()?, &format!("{session_id}.jsonl"))
+    }
+
+    fn familiar_file(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(
+            &self.metadata_dir()?,
+            &format!("{session_id}.familiar.json"),
+        )
+    }
+
+    fn pending_fork_marker(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(&self.pending_forks_dir()?, &format!("{session_id}.pending"))
+    }
+
+    fn index_file(&self, suffix: &str) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.root, &format!("index.sqlite{suffix}"))
+    }
+
+    fn validate_sqlite_files(&self) -> Result<(), PocketError> {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path = self.index_file(suffix)?;
+            self.validate_regular_file(&path, true)?;
+        }
+        Ok(())
+    }
+
+    fn validate_fixed_layout(&self) -> Result<(), PocketError> {
+        for directory in [
+            self.metadata_dir()?,
+            self.transcripts_dir()?,
+            self.lifecycle_dir()?,
+            self.fork_staging_root()?,
+        ] {
+            self.validate_directory(&directory, true)?;
+        }
+        let lifecycle = self.lifecycle_dir()?;
+        if self.validate_directory(&lifecycle, true)? {
+            let pending = self.pending_forks_dir()?;
+            self.validate_directory(&pending, true)?;
+        }
+        self.validate_sqlite_files()
+    }
 }
 
+fn checked_index_store(storage: &CheckedStorage) -> Result<SqliteSessionStore, PocketError> {
+    storage.validate_sqlite_files()?;
+    let index = storage.index_file("")?;
+    storage.validate_regular_file(&index, true)?;
+    SqliteSessionStore::open(&index).map_err(|err| engine_err("cannot open session index", err))
+}
+
+#[cfg(test)]
 fn index_store(root: &Path) -> Result<SqliteSessionStore, PocketError> {
-    SqliteSessionStore::open(&root.join("index.sqlite"))
-        .map_err(|e| engine_err("cannot open session index", e))
+    checked_index_store(&CheckedStorage::from_root(root)?)
 }
 
-fn delete_index_session(root: &Path, session_id: &str, context: &str) -> Result<(), PocketError> {
+fn delete_index_session(
+    storage: &CheckedStorage,
+    session_id: &str,
+    context: &str,
+) -> Result<(), PocketError> {
+    storage.validate_sqlite_files()?;
     #[cfg(test)]
     {
         let mut faults = SESSION_TEST_FAULTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(faults) = faults.get_mut(root) {
+        if let Some(faults) = faults.get_mut(storage.root()) {
             if faults.fail_index_delete_remaining > 0 {
                 faults.fail_index_delete_remaining -= 1;
                 return Err(engine_err(
@@ -150,7 +449,7 @@ fn delete_index_session(root: &Path, session_id: &str, context: &str) -> Result<
         }
     }
 
-    index_store(root).and_then(|store| {
+    checked_index_store(storage).and_then(|store| {
         store
             .delete_session(session_id)
             .map_err(|err| engine_err(context, err))
@@ -158,11 +457,13 @@ fn delete_index_session(root: &Path, session_id: &str, context: &str) -> Result<
 }
 
 #[cfg(test)]
-fn fail_fork_publication_after_row_if_requested(root: &Path) -> Result<(), PocketError> {
+fn fail_fork_publication_after_row_if_requested(
+    storage: &CheckedStorage,
+) -> Result<(), PocketError> {
     let mut faults = SESSION_TEST_FAULTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(faults) = faults.get_mut(root) {
+    if let Some(faults) = faults.get_mut(storage.root()) {
         if faults.fail_fork_publication_after_row_once {
             faults.fail_fork_publication_after_row_once = false;
             return Err(engine_err(
@@ -174,10 +475,13 @@ fn fail_fork_publication_after_row_if_requested(root: &Path) -> Result<(), Pocke
     Ok(())
 }
 
-fn indexed_session_model(root: &Path, session_id: &str) -> Result<String, PocketError> {
-    let rows = index_store(root)?
+fn indexed_session_model(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<String, PocketError> {
+    let rows = checked_index_store(storage)?
         .list_sessions()
-        .map_err(|e| engine_err("cannot list sessions", e))?;
+        .map_err(|err| engine_err("cannot list sessions", err))?;
     validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
     Ok(rows
         .into_iter()
@@ -186,26 +490,38 @@ fn indexed_session_model(root: &Path, session_id: &str) -> Result<String, Pocket
         .unwrap_or_default())
 }
 
+#[cfg(test)]
 fn transcript_file(root: &Path, session_id: &str) -> PathBuf {
     root.join("transcripts").join(format!("{session_id}.jsonl"))
 }
 
+#[cfg(test)]
 fn familiar_file(root: &Path, session_id: &str) -> PathBuf {
     root.join("metadata")
         .join(format!("{session_id}.familiar.json"))
 }
 
+#[cfg(test)]
 fn pending_forks_dir(root: &Path) -> PathBuf {
     root.join(".session-lifecycle").join("pending-forks")
 }
 
+#[cfg(test)]
 fn pending_fork_marker(root: &Path, session_id: &str) -> PathBuf {
     pending_forks_dir(root).join(format!("{session_id}.pending"))
 }
 
+#[cfg(test)]
 fn fork_staging_dir(root: &Path, session_id: &str) -> PathBuf {
     root.join(".fork-staging").join(session_id)
 }
+
+/*
+ * Persistence remains path-based because std does not expose portable
+ * descriptor-relative filesystem operations. Every operation below rechecks
+ * symlink/type/containment immediately before use, but a hostile concurrent
+ * filesystem actor can still race those checks.
+ */
 
 fn session_key(root: &Path, session_id: &str) -> SessionKey {
     SessionKey {
@@ -255,7 +571,12 @@ fn ensure_persistence_active(
     }
 }
 
-fn sync_directory(path: &Path, context: &str) -> Result<(), PocketError> {
+fn sync_directory(storage: &CheckedStorage, path: &Path, context: &str) -> Result<(), PocketError> {
+    if path == storage.root() {
+        storage.validate_root()?;
+    } else {
+        storage.validate_directory(path, false)?;
+    }
     #[cfg(test)]
     {
         DIRECTORY_SYNC_EVENTS
@@ -281,46 +602,63 @@ fn sync_directory(path: &Path, context: &str) -> Result<(), PocketError> {
         .map_err(|err| engine_err(context, err))
 }
 
-fn sync_directory_if_present(path: &Path, context: &str) -> Result<(), PocketError> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => sync_directory(path, context),
-        Ok(_) => Err(PocketError::Engine {
-            message: format!("{} is not a directory", path.display()),
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(engine_err(context, err)),
+fn sync_directory_if_present(
+    storage: &CheckedStorage,
+    path: &Path,
+    context: &str,
+) -> Result<(), PocketError> {
+    if path == storage.root() {
+        return sync_directory(storage, path, context);
+    }
+    if storage.validate_directory(path, true)? {
+        sync_directory(storage, path, context)
+    } else {
+        Ok(())
     }
 }
 
 fn ensure_durable_directory(
+    storage: &CheckedStorage,
     parent: &Path,
     directory: &Path,
     create_context: &str,
     sync_context: &str,
 ) -> Result<(), PocketError> {
+    if parent == storage.root() {
+        storage.validate_root()?;
+    } else {
+        storage.validate_directory(parent, false)?;
+    }
+    if storage.validate_directory(directory, true)? {
+        return sync_directory(storage, parent, sync_context);
+    }
     match std::fs::create_dir(directory) {
-        Ok(()) => sync_directory(parent, sync_context),
+        Ok(()) => {
+            storage.validate_directory(directory, false)?;
+            sync_directory(storage, parent, sync_context)
+        }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::metadata(directory)
-                .map_err(|metadata_err| engine_err(create_context, metadata_err))?;
-            if metadata.is_dir() {
-                sync_directory(parent, sync_context)
-            } else {
-                Err(PocketError::Engine {
-                    message: format!("{} is not a directory", directory.display()),
-                })
-            }
+            storage.validate_directory(directory, false)?;
+            sync_directory(storage, parent, sync_context)
         }
         Err(err) => Err(engine_err(create_context, err)),
     }
 }
 
 fn remove_file_durably_if_present(
+    storage: &CheckedStorage,
     path: &Path,
     directory: &Path,
     remove_context: &str,
     sync_context: &str,
 ) -> Result<(), PocketError> {
+    if !storage.validate_directory(directory, true)? {
+        return Ok(());
+    }
+    if !storage.validate_regular_file(path, true)? {
+        return sync_directory(storage, directory, sync_context);
+    }
+    storage.validate_regular_file(path, false)?;
     #[cfg(test)]
     let remove_result = {
         let mut failures = FILE_REMOVE_FAILURES
@@ -338,107 +676,226 @@ fn remove_file_durably_if_present(
     let remove_result = std::fs::remove_file(path);
 
     match remove_result {
-        Ok(()) => sync_directory(directory, sync_context),
+        Ok(()) => sync_directory(storage, directory, sync_context),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            sync_directory_if_present(directory, sync_context)
+            sync_directory_if_present(storage, directory, sync_context)
         }
         Err(err) => Err(engine_err(remove_context, err)),
     }
 }
 
 fn remove_dir_durably_if_present(
+    storage: &CheckedStorage,
     path: &Path,
     parent: &Path,
     remove_context: &str,
     sync_context: &str,
 ) -> Result<(), PocketError> {
+    if !storage.validate_directory(path, true)? {
+        return sync_directory_if_present(storage, parent, sync_context);
+    }
+    storage.validate_directory(path, false)?;
     match std::fs::remove_dir(path) {
-        Ok(()) => sync_directory(parent, sync_context),
+        Ok(()) => sync_directory(storage, parent, sync_context),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            sync_directory_if_present(parent, sync_context)
+            sync_directory_if_present(storage, parent, sync_context)
         }
         Err(err) => Err(engine_err(remove_context, err)),
     }
 }
 
-fn remove_dir_all_durably_if_present(
+#[derive(Default)]
+struct RemovalPlan {
+    files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+}
+
+fn collect_removal_plan(
+    storage: &CheckedStorage,
+    directory: &Path,
+    plan: &mut RemovalPlan,
+) -> Result<(), PocketError> {
+    storage.validate_directory(directory, false)?;
+    let entries = std::fs::read_dir(directory)
+        .map_err(|err| engine_err("cannot inspect storage cleanup directory", err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| engine_err("cannot inspect storage cleanup entry", err))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| engine_err("cannot inspect storage cleanup path", err))?;
+        if metadata.file_type().is_symlink() {
+            return Err(persistence_err(&path, "cleanup entry is a symlink"));
+        }
+        if metadata.is_dir() {
+            storage.validate_directory(&path, false)?;
+            collect_removal_plan(storage, &path, plan)?;
+        } else if metadata.is_file() {
+            storage.validate_regular_file(&path, false)?;
+            plan.files.push(path);
+        } else {
+            return Err(persistence_err(
+                &path,
+                "cleanup entry is not a regular file or directory",
+            ));
+        }
+    }
+    plan.directories.push(directory.to_path_buf());
+    Ok(())
+}
+
+fn preflight_removal_tree(
+    storage: &CheckedStorage,
+    directory: &Path,
+) -> Result<Option<RemovalPlan>, PocketError> {
+    if !storage.validate_directory(directory, true)? {
+        return Ok(None);
+    }
+    let mut plan = RemovalPlan::default();
+    collect_removal_plan(storage, directory, &mut plan)?;
+    Ok(Some(plan))
+}
+
+fn remove_tree_durably_if_present(
+    storage: &CheckedStorage,
     path: &Path,
     parent: &Path,
     remove_context: &str,
     sync_context: &str,
 ) -> Result<(), PocketError> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => sync_directory(parent, sync_context),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            sync_directory_if_present(parent, sync_context)
-        }
-        Err(err) => Err(engine_err(remove_context, err)),
+    let Some(plan) = preflight_removal_tree(storage, path)? else {
+        return sync_directory_if_present(storage, parent, sync_context);
+    };
+    for file in plan.files {
+        storage.validate_regular_file(&file, false)?;
+        std::fs::remove_file(&file).map_err(|err| engine_err(remove_context, err))?;
     }
+    for directory in plan.directories {
+        storage.validate_directory(&directory, false)?;
+        std::fs::remove_dir(&directory).map_err(|err| engine_err(remove_context, err))?;
+    }
+    sync_directory(storage, parent, sync_context)
 }
 
-fn remove_empty_fork_staging_root(root: &Path) -> Result<(), PocketError> {
-    let stage_root = root.join(".fork-staging");
+fn remove_empty_fork_staging_root(storage: &CheckedStorage) -> Result<(), PocketError> {
+    let stage_root = storage.fork_staging_root()?;
+    if !storage.validate_directory(&stage_root, true)? {
+        return sync_directory(
+            storage,
+            storage.root(),
+            "cannot sync absent fork staging root",
+        );
+    }
+    storage.validate_directory(&stage_root, false)?;
     match std::fs::remove_dir(&stage_root) {
-        Ok(()) => sync_directory(root, "cannot sync fork staging root removal"),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            sync_directory(root, "cannot sync absent fork staging root")
-        }
+        Ok(()) => sync_directory(
+            storage,
+            storage.root(),
+            "cannot sync fork staging root removal",
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => sync_directory(
+            storage,
+            storage.root(),
+            "cannot sync absent fork staging root",
+        ),
         Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
         Err(err) => Err(engine_err("cannot remove fork staging root", err)),
     }
 }
 
-fn remove_fork_staging_artifacts(root: &Path, session_id: &str) -> Result<(), PocketError> {
-    let stage_root = root.join(".fork-staging");
-    remove_dir_all_durably_if_present(
-        &fork_staging_dir(root, session_id),
+fn remove_fork_staging_artifacts(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let stage_root = storage.fork_staging_root()?;
+    let stage_directory = storage.fork_staging_dir(session_id)?;
+    remove_tree_durably_if_present(
+        storage,
+        &stage_directory,
         &stage_root,
         "cannot delete fork staging artifacts",
         "cannot sync fork staging artifact removal",
     )?;
-    remove_empty_fork_staging_root(root)
+    remove_empty_fork_staging_root(storage)
 }
 
-fn write_new_file(path: &Path, bytes: &[u8], context: &str) -> Result<(), PocketError> {
+fn write_new_file(
+    storage: &CheckedStorage,
+    path: &Path,
+    bytes: &[u8],
+    context: &str,
+) -> Result<(), PocketError> {
+    storage.validate_regular_file(path, true)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|err| engine_err(&format!("cannot create {context}"), err))?;
+    storage.validate_regular_file(path, false)?;
     file.write_all(bytes)
         .map_err(|err| engine_err(&format!("cannot write {context}"), err))?;
     file.sync_all()
         .map_err(|err| engine_err(&format!("cannot sync {context}"), err))
 }
 
-fn create_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), PocketError> {
-    let lifecycle_directory = root.join(".session-lifecycle");
-    let directory = pending_forks_dir(root);
+fn rename_checked_file(
+    storage: &CheckedStorage,
+    source: &Path,
+    destination: &Path,
+    context: &str,
+) -> Result<(), PocketError> {
+    storage
+        .validate_regular_file(source, false)
+        .map_err(|err| engine_err(context, err))?;
+    storage
+        .validate_regular_file(destination, true)
+        .map_err(|err| engine_err(context, err))?;
+    std::fs::rename(source, destination).map_err(|err| engine_err(context, err))?;
+    storage
+        .validate_regular_file(destination, false)
+        .map(|_| ())
+        .map_err(|err| engine_err(context, err))
+}
+
+fn create_pending_fork_marker_checked(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let lifecycle_directory = storage.lifecycle_dir()?;
+    let directory = storage.pending_forks_dir()?;
     ensure_durable_directory(
-        root,
+        storage,
+        storage.root(),
         &lifecycle_directory,
         "cannot create pending fork lifecycle directory",
         "cannot sync pending fork lifecycle directory creation",
     )?;
     ensure_durable_directory(
+        storage,
         &lifecycle_directory,
         &directory,
         "cannot create pending fork marker directory",
         "cannot sync pending fork marker directory creation",
     )?;
-    let marker = pending_fork_marker(root, session_id);
+    let marker = storage.pending_fork_marker(session_id)?;
+    storage.validate_regular_file(&marker, true)?;
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&marker)
         .map_err(|err| engine_err("cannot create pending fork marker", err))?;
+    storage.validate_regular_file(&marker, false)?;
     let create_result = (|| -> Result<(), PocketError> {
         file.sync_all()
             .map_err(|err| engine_err("cannot sync pending fork marker", err))?;
-        sync_directory(&directory, "cannot sync pending fork marker directory")
+        sync_directory(
+            storage,
+            &directory,
+            "cannot sync pending fork marker directory",
+        )
     })();
     if let Err(create_err) = create_result {
         return match remove_file_durably_if_present(
+            storage,
             &marker,
             &directory,
             "cannot clean pending fork marker",
@@ -453,87 +910,95 @@ fn create_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), Pocke
     Ok(())
 }
 
-fn ensure_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), PocketError> {
-    let marker = pending_fork_marker(root, session_id);
-    match std::fs::metadata(&marker) {
-        Ok(metadata) if metadata.is_file() => {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open(&marker)
-                .and_then(|file| file.sync_all())
-                .map_err(|err| engine_err("cannot sync pending fork marker", err))?;
-            sync_directory(
-                &pending_forks_dir(root),
-                "cannot sync pending fork marker directory",
-            )
-        }
-        Ok(_) => Err(PocketError::Engine {
-            message: format!("pending fork marker is not a file: {}", marker.display()),
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            create_pending_fork_marker(root, session_id)
-        }
-        Err(err) => Err(engine_err("cannot inspect pending fork marker", err)),
+fn ensure_pending_fork_marker_checked(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let marker = storage.pending_fork_marker(session_id)?;
+    if storage.validate_regular_file(&marker, true)? {
+        storage.validate_regular_file(&marker, false)?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&marker)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| engine_err("cannot sync pending fork marker", err))?;
+        sync_directory(
+            storage,
+            &storage.pending_forks_dir()?,
+            "cannot sync pending fork marker directory",
+        )
+    } else {
+        create_pending_fork_marker_checked(storage, session_id)
     }
 }
 
-fn remove_pending_fork_marker(
-    root: &Path,
+fn remove_pending_fork_marker_checked(
+    storage: &CheckedStorage,
     session_id: &str,
     missing_ok: bool,
 ) -> Result<(), PocketError> {
-    let marker = pending_fork_marker(root, session_id);
+    let directory = storage.pending_forks_dir()?;
+    let marker = storage.pending_fork_marker(session_id)?;
+    if !storage.validate_regular_file(&marker, true)? {
+        if missing_ok {
+            return sync_directory_if_present(
+                storage,
+                &directory,
+                "cannot sync absent pending fork marker",
+            );
+        }
+        return Err(engine_err(
+            "cannot remove pending fork marker",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+    }
+    storage.validate_regular_file(&marker, false)?;
     match std::fs::remove_file(&marker) {
         Ok(()) => {}
         Err(err) if missing_ok && err.kind() == std::io::ErrorKind::NotFound => {
-            return sync_directory(
-                &pending_forks_dir(root),
+            return sync_directory_if_present(
+                storage,
+                &directory,
                 "cannot sync absent pending fork marker",
             );
         }
         Err(err) => return Err(engine_err("cannot remove pending fork marker", err)),
     }
     sync_directory(
-        &pending_forks_dir(root),
+        storage,
+        &directory,
         "cannot sync pending fork marker removal",
     )
 }
 
-fn pending_fork_ids(root: &Path) -> Result<Vec<String>, PocketError> {
-    let directory = pending_forks_dir(root);
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(engine_err("cannot read pending fork markers", err)),
-    };
+fn pending_fork_ids_checked(storage: &CheckedStorage) -> Result<Vec<String>, PocketError> {
+    let directory = storage.pending_forks_dir()?;
+    if !storage.validate_directory(&directory, true)? {
+        return Ok(Vec::new());
+    }
+    storage.validate_directory(&directory, false)?;
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|err| engine_err("cannot read pending fork markers", err))?;
     let mut session_ids = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| engine_err("cannot read pending fork marker", err))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
-        if !file_type.is_file() {
-            return Err(PocketError::Engine {
-                message: format!(
-                    "pending fork marker is not a file: {}",
-                    entry.path().display()
-                ),
-            });
-        }
+        let path = entry.path();
+        storage.validate_regular_file(&path, false)?;
         let file_name = entry.file_name();
-        let file_name = file_name.to_str().ok_or_else(|| PocketError::Engine {
-            message: format!(
-                "pending fork marker name is not valid UTF-8: {}",
-                entry.path().display()
-            ),
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| persistence_err(&path, "pending fork marker name is not valid UTF-8"))?;
+        let session_id = file_name.strip_suffix(".pending").ok_or_else(|| {
+            persistence_err(
+                &path,
+                format!("invalid pending fork marker name {file_name:?}"),
+            )
         })?;
-        let session_id = file_name
-            .strip_suffix(".pending")
-            .ok_or_else(|| PocketError::Engine {
-                message: format!("invalid pending fork marker name: {file_name}"),
-            })?;
-        validate_session_id(session_id).map_err(|err| PocketError::Engine {
-            message: format!("invalid pending fork marker {file_name}: {err}"),
+        validate_session_id(session_id).map_err(|err| {
+            persistence_err(
+                &path,
+                format!("invalid pending fork marker {file_name:?}: {err}"),
+            )
         })?;
         session_ids.push(session_id.to_string());
     }
@@ -541,16 +1006,52 @@ fn pending_fork_ids(root: &Path) -> Result<Vec<String>, PocketError> {
     Ok(session_ids)
 }
 
-fn save_familiar_metadata_at_root(
-    root: &Path,
+fn preflight_fork_staging_entries(storage: &CheckedStorage) -> Result<(), PocketError> {
+    let stage_root = storage.fork_staging_root()?;
+    if !storage.validate_directory(&stage_root, true)? {
+        return Ok(());
+    }
+    storage.validate_directory(&stage_root, false)?;
+    let entries = std::fs::read_dir(&stage_root)
+        .map_err(|err| engine_err("cannot read fork staging directory", err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| engine_err("cannot read fork staging entry", err))?;
+        let path = entry.path();
+        storage.validate_directory(&path, false)?;
+        let file_name = entry.file_name();
+        let session_id = file_name
+            .to_str()
+            .ok_or_else(|| persistence_err(&path, "fork staging ID is not valid UTF-8"))?;
+        validate_session_id(session_id).map_err(|err| {
+            persistence_err(&path, format!("invalid fork staging session ID: {err}"))
+        })?;
+        preflight_removal_tree(storage, &path)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn create_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), PocketError> {
+    create_pending_fork_marker_checked(&CheckedStorage::from_root(root)?, session_id)
+}
+
+#[cfg(test)]
+fn pending_fork_ids(root: &Path) -> Result<Vec<String>, PocketError> {
+    pending_fork_ids_checked(&CheckedStorage::from_root(root)?)
+}
+
+fn save_familiar_metadata_at_storage(
+    storage: &CheckedStorage,
     session_id: &str,
     familiar: Option<&FamiliarIdentity>,
 ) -> Result<(), PocketError> {
-    let destination = familiar_file(root, session_id);
+    let destination = storage.familiar_file(session_id)?;
+    let metadata_dir = storage.metadata_dir()?;
     let Some(familiar) = familiar else {
         return remove_file_durably_if_present(
+            storage,
             &destination,
-            &root.join("metadata"),
+            &metadata_dir,
             "cannot delete familiar metadata",
             "cannot sync familiar metadata removal",
         );
@@ -558,33 +1059,44 @@ fn save_familiar_metadata_at_root(
 
     let bytes = serde_json::to_vec(familiar)
         .map_err(|err| engine_err("cannot serialize familiar metadata", err))?;
-    let metadata_dir = root.join("metadata");
     ensure_durable_directory(
-        root,
+        storage,
+        storage.root(),
         &metadata_dir,
         "cannot create metadata dir",
         "cannot sync metadata directory creation",
     )?;
-    let temporary = metadata_dir.join(format!(
-        ".{session_id}.familiar.{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
+    let temporary = storage.child_path(
+        &metadata_dir,
+        &format!(".{session_id}.familiar.{}.tmp", uuid::Uuid::new_v4()),
+    )?;
 
     let mut destination_installed = false;
     let write_result = (|| -> Result<(), PocketError> {
+        storage
+            .validate_regular_file(&temporary, true)
+            .map_err(|err| engine_err("cannot create temporary familiar metadata", err))?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
             .map_err(|err| engine_err("cannot create temporary familiar metadata", err))?;
+        storage
+            .validate_regular_file(&temporary, false)
+            .map_err(|err| engine_err("cannot create temporary familiar metadata", err))?;
         file.write_all(&bytes)
             .map_err(|err| engine_err("cannot write temporary familiar metadata", err))?;
         file.sync_all()
             .map_err(|err| engine_err("cannot sync temporary familiar metadata", err))?;
-        std::fs::rename(&temporary, &destination)
-            .map_err(|err| engine_err("cannot install familiar metadata", err))?;
+        rename_checked_file(
+            storage,
+            &temporary,
+            &destination,
+            "cannot install familiar metadata",
+        )?;
         destination_installed = true;
         sync_directory(
+            storage,
             &metadata_dir,
             "cannot sync installed familiar metadata directory",
         )
@@ -605,6 +1117,7 @@ fn save_familiar_metadata_at_root(
             )
         };
         return match remove_file_durably_if_present(
+            storage,
             rollback_path,
             &metadata_dir,
             remove_context,
@@ -619,6 +1132,15 @@ fn save_familiar_metadata_at_root(
     Ok(())
 }
 
+#[cfg(test)]
+fn save_familiar_metadata_at_root(
+    root: &Path,
+    session_id: &str,
+    familiar: Option<&FamiliarIdentity>,
+) -> Result<(), PocketError> {
+    save_familiar_metadata_at_storage(&CheckedStorage::from_root(root)?, session_id, familiar)
+}
+
 /// Atomically save a pinned familiar snapshot, or remove it when absent.
 #[cfg(test)]
 pub(crate) fn save_familiar_metadata(
@@ -627,15 +1149,15 @@ pub(crate) fn save_familiar_metadata(
     familiar: Option<&FamiliarIdentity>,
 ) -> Result<(), PocketError> {
     validate_session_id(session_id)?;
-    let root = storage_root(storage_dir)?;
-    save_familiar_metadata_at_root(&root, session_id, familiar)
+    let storage = CheckedStorage::open(storage_dir)?;
+    save_familiar_metadata_at_storage(&storage, session_id, familiar)
 }
 
-fn load_familiar_metadata_at_root(
-    root: &Path,
+fn load_familiar_metadata_at_storage(
+    storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<Option<FamiliarIdentity>, PocketError> {
-    let Some(bytes) = familiar_metadata_bytes_at_root(root, session_id)? else {
+    let Some(bytes) = familiar_metadata_bytes_at_storage(storage, session_id)? else {
         return Ok(None);
     };
     serde_json::from_slice(&bytes)
@@ -643,11 +1165,16 @@ fn load_familiar_metadata_at_root(
         .map_err(|err| engine_err("cannot parse familiar metadata", err))
 }
 
-fn familiar_metadata_bytes_at_root(
-    root: &Path,
+fn familiar_metadata_bytes_at_storage(
+    storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<Option<Vec<u8>>, PocketError> {
-    let bytes = match std::fs::read(familiar_file(root, session_id)) {
+    let path = storage.familiar_file(session_id)?;
+    if !storage.validate_regular_file(&path, true)? {
+        return Ok(None);
+    }
+    storage.validate_regular_file(&path, false)?;
+    let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(engine_err("cannot read familiar metadata", err)),
@@ -664,8 +1191,8 @@ pub(crate) fn load_familiar_metadata(
     session_id: &str,
 ) -> Result<Option<FamiliarIdentity>, PocketError> {
     validate_session_id(session_id)?;
-    let root = storage_root(storage_dir)?;
-    load_familiar_metadata_at_root(&root, session_id)
+    let storage = CheckedStorage::open(storage_dir)?;
+    load_familiar_metadata_at_storage(&storage, session_id)
 }
 
 /// First line of the first user message, for the browser row.
@@ -691,6 +1218,7 @@ fn derive_title(messages: &[Message]) -> String {
 /// surfaced so the caller can decide to ignore them — a full disk must not
 /// take the conversation down.
 pub(crate) struct SessionPersistence {
+    storage: CheckedStorage,
     key: SessionKey,
     generation: uuid::Uuid,
     _writer_lease: Arc<SessionWriterLease>,
@@ -711,10 +1239,10 @@ impl SessionPersistence {
         familiar: Option<&FamiliarIdentity>,
     ) -> Result<Self, PocketError> {
         validate_session_id(&session_id)?;
-        let root = storage_root(storage_dir)?;
-        let key = session_key(&root, &session_id);
+        let storage = CheckedStorage::open(storage_dir)?;
+        let key = session_key(storage.root(), &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-        recover_pending_forks_unlocked(&root, &mut lifecycle)?;
+        recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
         match lifecycle.sessions.get(&key) {
             Some(SessionLifecycleState::Active { .. }) => {
                 return Err(PocketError::Engine {
@@ -722,7 +1250,7 @@ impl SessionPersistence {
                 });
             }
             Some(SessionLifecycleState::Tombstoned) => {
-                cleanup_session_artifacts(&root, &session_id).map_err(|err| {
+                cleanup_session_artifacts(&storage, &session_id).map_err(|err| {
                     PocketError::Engine {
                         message: format!("cannot clear deleted session before UUID reuse: {err}"),
                     }
@@ -735,7 +1263,7 @@ impl SessionPersistence {
             }
             None => {}
         }
-        save_familiar_metadata_at_root(&root, &session_id, familiar)?;
+        save_familiar_metadata_at_storage(&storage, &session_id, familiar)?;
         let generation = uuid::Uuid::new_v4();
         let writer_lease = Arc::new(SessionWriterLease);
         lifecycle.sessions.insert(
@@ -746,6 +1274,7 @@ impl SessionPersistence {
             },
         );
         Ok(Self {
+            storage,
             key,
             generation,
             _writer_lease: writer_lease,
@@ -763,10 +1292,10 @@ impl SessionPersistence {
         model: String,
     ) -> Result<(Self, Vec<Message>, Option<FamiliarIdentity>), PocketError> {
         validate_session_id(&session_id)?;
-        let root = storage_root(storage_dir)?;
-        let key = session_key(&root, &session_id);
+        let storage = CheckedStorage::open(storage_dir)?;
+        let key = session_key(storage.root(), &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-        recover_pending_forks_unlocked(&root, &mut lifecycle)?;
+        recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
         ensure_session_available(&lifecycle, &key)?;
         if matches!(
             lifecycle.sessions.get(&key),
@@ -776,8 +1305,8 @@ impl SessionPersistence {
                 message: format!("session {session_id} is already open for writing"),
             });
         }
-        let (messages, last_uuid) = load_session_messages_at_root(&root, &session_id).await?;
-        let familiar = load_familiar_metadata_at_root(&root, &session_id)?;
+        let (messages, last_uuid) = load_session_messages_at_storage(&storage, &session_id).await?;
+        let familiar = load_familiar_metadata_at_storage(&storage, &session_id)?;
         let generation = uuid::Uuid::new_v4();
         let writer_lease = Arc::new(SessionWriterLease);
         lifecycle.sessions.insert(
@@ -788,6 +1317,7 @@ impl SessionPersistence {
             },
         );
         let persistence = Self {
+            storage,
             key,
             generation,
             _writer_lease: writer_lease,
@@ -810,8 +1340,18 @@ impl SessionPersistence {
             return Ok(());
         }
 
-        let path = transcript_file(&self.key.root, &self.key.session_id);
-        let store = index_store(&self.key.root)?;
+        let transcript_directory = self.storage.transcripts_dir()?;
+        ensure_durable_directory(
+            &self.storage,
+            self.storage.root(),
+            &transcript_directory,
+            "cannot create transcript dir",
+            "cannot sync transcript directory creation",
+        )?;
+        let path = self.storage.transcript_file(&self.key.session_id)?;
+        self.storage.validate_regular_file(&path, true)?;
+        let store = checked_index_store(&self.storage)?;
+        self.storage.validate_sqlite_files()?;
         store
             .save_session(
                 &self.key.session_id,
@@ -828,9 +1368,12 @@ impl SessionPersistence {
                 state.last_uuid.as_deref(),
                 &self.key.session_id,
             );
+            self.storage.validate_regular_file(&path, true)?;
             write_transcript_entry(&path, &entry)
                 .await
                 .map_err(|e| engine_err("cannot write transcript", e))?;
+            self.storage.validate_regular_file(&path, false)?;
+            self.storage.validate_sqlite_files()?;
             store
                 .save_message(
                     &self.key.session_id,
@@ -866,16 +1409,17 @@ fn build_entry(
     }
 }
 
-async fn load_session_messages_at_root(
-    root: &Path,
+async fn load_session_messages_at_storage(
+    storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<(Vec<Message>, Option<String>), PocketError> {
-    let path = transcript_file(root, session_id);
-    if !path.exists() {
+    let path = storage.transcript_file(session_id)?;
+    if !storage.validate_regular_file(&path, true)? {
         return Err(PocketError::Engine {
             message: format!("no stored session {session_id}"),
         });
     }
+    storage.validate_regular_file(&path, false)?;
     let entries = load_transcript(&path)
         .await
         .map_err(|e| engine_err("cannot load transcript", e))?;
@@ -886,19 +1430,28 @@ async fn load_session_messages_at_root(
     Ok((messages_from_transcript(&entries), last_uuid))
 }
 
+#[cfg(test)]
+async fn load_session_messages_at_root(
+    root: &Path,
+    session_id: &str,
+) -> Result<(Vec<Message>, Option<String>), PocketError> {
+    load_session_messages_at_storage(&CheckedStorage::from_root(root)?, session_id).await
+}
+
 /// Newest-first summaries for the browser.
 pub async fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
-    let root = storage_root(storage_dir)?;
+    let storage = CheckedStorage::open(storage_dir)?;
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_forks_unlocked(&root, &mut lifecycle)?;
-    list_sessions_unlocked(&root, &lifecycle)
+    recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
+    list_sessions_unlocked(&storage, &lifecycle)
 }
 
 fn list_sessions_unlocked(
-    root: &Path,
+    storage: &CheckedStorage,
     lifecycle: &SessionLifecycle,
 ) -> Result<Vec<ChatSessionSummary>, PocketError> {
-    let store = index_store(root)?;
+    let store = checked_index_store(storage)?;
+    storage.validate_sqlite_files()?;
     let rows = store
         .list_sessions()
         .map_err(|e| engine_err("cannot list sessions", e))?;
@@ -906,12 +1459,14 @@ fn list_sessions_unlocked(
     rows.into_iter()
         .filter(|session| {
             !matches!(
-                lifecycle.sessions.get(&session_key(root, &session.id)),
+                lifecycle
+                    .sessions
+                    .get(&session_key(storage.root(), &session.id)),
                 Some(SessionLifecycleState::Tombstoned | SessionLifecycleState::PendingFork)
             )
         })
         .map(|s| {
-            let familiar = load_familiar_metadata_at_root(root, &s.id)?;
+            let familiar = load_familiar_metadata_at_storage(storage, &s.id)?;
             Ok(ChatSessionSummary {
                 session_id: s.id,
                 title: s.title.unwrap_or_default(),
@@ -928,18 +1483,17 @@ fn list_sessions_unlocked(
 /// Drop a session from the index and delete its transcript file.
 pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
     validate_session_id(session_id)?;
-    let root = storage_root(storage_dir)?;
-    let key = session_key(&root, session_id);
+    let storage = CheckedStorage::open(storage_dir)?;
+    let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
     let in_memory_pending = matches!(
         lifecycle.sessions.get(&key),
         Some(SessionLifecycleState::PendingFork)
     );
-    let mut is_pending = pending_fork_marker(&root, session_id)
-        .try_exists()
-        .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
+    let mut is_pending = preflight_session_artifacts(&storage, session_id)?.marker_exists;
     if in_memory_pending && !is_pending {
-        ensure_pending_fork_marker(&root, session_id)?;
+        ensure_pending_fork_marker_checked(&storage, session_id)?;
+        preflight_session_artifacts(&storage, session_id)?;
         is_pending = true;
     }
     lifecycle.sessions.insert(
@@ -950,7 +1504,7 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
             SessionLifecycleState::Tombstoned
         },
     );
-    match cleanup_session_artifacts(&root, session_id) {
+    match cleanup_session_artifacts(&storage, session_id) {
         Ok(()) => {
             lifecycle
                 .sessions
@@ -961,31 +1515,55 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
     }
 }
 
-fn cleanup_session_artifacts(root: &Path, session_id: &str) -> Result<(), PocketError> {
-    delete_index_session(root, session_id, "cannot delete session index")?;
+struct SessionArtifactPreflight {
+    marker_exists: bool,
+}
 
-    let marker_exists = pending_fork_marker(root, session_id)
-        .try_exists()
-        .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
+fn preflight_session_artifacts(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<SessionArtifactPreflight, PocketError> {
+    validate_session_id(session_id)?;
+    storage.validate_fixed_layout()?;
+    storage.validate_sqlite_files()?;
+    storage.validate_regular_file(&storage.transcript_file(session_id)?, true)?;
+    storage.validate_regular_file(&storage.familiar_file(session_id)?, true)?;
+    let marker = storage.pending_fork_marker(session_id)?;
+    let marker_exists = storage.validate_regular_file(&marker, true)?;
+    let stage_directory = storage.fork_staging_dir(session_id)?;
+    preflight_removal_tree(storage, &stage_directory)?;
+    Ok(SessionArtifactPreflight { marker_exists })
+}
+
+fn cleanup_session_artifacts(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let preflight = preflight_session_artifacts(storage, session_id)?;
+    delete_index_session(storage, session_id, "cannot delete session index")?;
+
     let mut errors = Vec::new();
+    let transcript_directory = storage.transcripts_dir()?;
+    let transcript = storage.transcript_file(session_id)?;
     if let Err(err) = remove_file_durably_if_present(
-        &transcript_file(root, session_id),
-        &root.join("transcripts"),
+        storage,
+        &transcript,
+        &transcript_directory,
         "cannot delete transcript",
         "cannot sync transcript removal",
     ) {
         errors.push(err.to_string());
     }
-    if let Err(err) = save_familiar_metadata_at_root(root, session_id, None) {
+    if let Err(err) = save_familiar_metadata_at_storage(storage, session_id, None) {
         errors.push(err.to_string());
     }
-    if let Err(err) = remove_fork_staging_artifacts(root, session_id) {
+    if let Err(err) = remove_fork_staging_artifacts(storage, session_id) {
         errors.push(err.to_string());
     }
-    if errors.is_empty() && marker_exists {
-        if let Err(err) = remove_pending_fork_marker(root, session_id, true) {
+    if errors.is_empty() && preflight.marker_exists {
+        if let Err(err) = remove_pending_fork_marker_checked(storage, session_id, true) {
             errors.push(err.to_string());
-            if let Err(restore_err) = ensure_pending_fork_marker(root, session_id) {
+            if let Err(restore_err) = ensure_pending_fork_marker_checked(storage, session_id) {
                 errors.push(restore_err.to_string());
             }
         }
@@ -1000,12 +1578,16 @@ fn cleanup_session_artifacts(root: &Path, session_id: &str) -> Result<(), Pocket
 }
 
 fn recover_pending_forks_unlocked(
-    root: &Path,
+    storage: &CheckedStorage,
     lifecycle: &mut SessionLifecycle,
 ) -> Result<(), PocketError> {
-    let pending_ids = pending_fork_ids(root)?;
+    let pending_ids = pending_fork_ids_checked(storage)?;
+    preflight_fork_staging_entries(storage)?;
+    for session_id in &pending_ids {
+        preflight_session_artifacts(storage, session_id)?;
+    }
     if let Some(key) = lifecycle.sessions.keys().find(|key| {
-        key.root == root
+        key.root == storage.root()
             && matches!(
                 lifecycle.sessions.get(*key),
                 Some(SessionLifecycleState::PendingFork)
@@ -1021,11 +1603,11 @@ fn recover_pending_forks_unlocked(
     }
 
     for session_id in &pending_ids {
-        let key = session_key(root, session_id);
+        let key = session_key(storage.root(), session_id);
         lifecycle
             .sessions
             .insert(key.clone(), SessionLifecycleState::PendingFork);
-        if let Err(err) = cleanup_session_artifacts(root, session_id) {
+        if let Err(err) = cleanup_session_artifacts(storage, session_id) {
             return Err(PocketError::Engine {
                 message: format!("cannot recover pending fork {session_id}: {err}"),
             });
@@ -1044,12 +1626,12 @@ fn recover_pending_forks_unlocked(
 /// Returns the new session id.
 pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String, PocketError> {
     validate_session_id(session_id)?;
-    let root = storage_root(storage_dir)?;
-    let key = session_key(&root, session_id);
+    let storage = CheckedStorage::open(storage_dir)?;
+    let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_forks_unlocked(&root, &mut lifecycle)?;
+    recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
     ensure_session_available(&lifecycle, &key)?;
-    fork_session_unlocked(&root, session_id, &mut lifecycle, None).await
+    fork_session_unlocked(&storage, session_id, &mut lifecycle, None).await
 }
 
 #[cfg(test)]
@@ -1065,16 +1647,16 @@ async fn fork_session_with_stage_pause(
     stage_pause: ForkStagePause,
 ) -> Result<String, PocketError> {
     validate_session_id(session_id)?;
-    let root = storage_root(storage_dir)?;
-    let key = session_key(&root, session_id);
+    let storage = CheckedStorage::open(storage_dir)?;
+    let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_forks_unlocked(&root, &mut lifecycle)?;
+    recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
     ensure_session_available(&lifecycle, &key)?;
-    fork_session_unlocked(&root, session_id, &mut lifecycle, Some(stage_pause)).await
+    fork_session_unlocked(&storage, session_id, &mut lifecycle, Some(stage_pause)).await
 }
 
 struct ForkStage {
-    root: PathBuf,
+    storage: CheckedStorage,
     session_id: String,
     directory: PathBuf,
     transcript: PathBuf,
@@ -1088,18 +1670,18 @@ struct ForkStage {
 }
 
 impl ForkStage {
-    fn begin(root: &Path, new_id: &str) -> Result<Self, PocketError> {
-        let directory = fork_staging_dir(root, new_id);
-        create_pending_fork_marker(root, new_id)?;
+    fn begin(storage: &CheckedStorage, new_id: &str) -> Result<Self, PocketError> {
+        let directory = storage.fork_staging_dir(new_id)?;
+        create_pending_fork_marker_checked(storage, new_id)?;
         Ok(Self {
-            root: root.to_path_buf(),
+            storage: storage.clone(),
             session_id: new_id.to_string(),
-            transcript: directory.join(format!("{new_id}.jsonl")),
+            transcript: storage.child_path(&directory, &format!("{new_id}.jsonl"))?,
             metadata: None,
             directory,
             published_transcript: None,
             published_metadata: None,
-            pending_marker: Some(pending_fork_marker(root, new_id)),
+            pending_marker: Some(storage.pending_fork_marker(new_id)?),
             index_may_exist: false,
             staging_may_exist: false,
             armed: true,
@@ -1107,27 +1689,30 @@ impl ForkStage {
     }
 
     fn create_staging_directory(&mut self) -> Result<(), PocketError> {
-        let stage_root = self.directory.parent().ok_or_else(|| PocketError::Engine {
-            message: format!(
-                "fork staging directory has no parent: {}",
-                self.directory.display()
-            ),
-        })?;
+        let stage_root = self.storage.fork_staging_root()?;
         ensure_durable_directory(
-            &self.root,
-            stage_root,
+            &self.storage,
+            self.storage.root(),
+            &stage_root,
             "cannot create fork staging root",
             "cannot sync fork staging root creation",
         )?;
+        self.storage.validate_directory(&self.directory, true)?;
         self.staging_may_exist = true;
         std::fs::create_dir(&self.directory)
             .map_err(|err| engine_err("cannot create fork staging directory", err))?;
-        sync_directory(stage_root, "cannot sync fork staging directory creation")
+        self.storage.validate_directory(&self.directory, false)?;
+        sync_directory(
+            &self.storage,
+            &stage_root,
+            "cannot sync fork staging directory creation",
+        )
     }
 
     #[cfg(test)]
     fn create(root: &Path, new_id: &str) -> Result<Self, PocketError> {
-        let mut stage = Self::begin(root, new_id)?;
+        let storage = CheckedStorage::from_root(root)?;
+        let mut stage = Self::begin(&storage, new_id)?;
         if let Err(err) = stage.create_staging_directory() {
             return Err(fork_stage_error(
                 "cannot initialize fork staging",
@@ -1139,7 +1724,10 @@ impl ForkStage {
     }
 
     fn stage_metadata(&mut self, bytes: &[u8]) -> Result<(), PocketError> {
-        self.stage_metadata_with(bytes, write_new_file)
+        let storage = self.storage.clone();
+        self.stage_metadata_with(bytes, |path, bytes, context| {
+            write_new_file(&storage, path, bytes, context)
+        })
     }
 
     fn stage_metadata_with(
@@ -1147,15 +1735,21 @@ impl ForkStage {
         bytes: &[u8],
         write: impl FnOnce(&Path, &[u8], &str) -> Result<(), PocketError>,
     ) -> Result<(), PocketError> {
-        let metadata = self
-            .directory
-            .join(format!("{}.familiar.json", self.session_id));
+        let metadata = self.storage.child_path(
+            &self.directory,
+            &format!("{}.familiar.json", self.session_id),
+        )?;
+        self.storage.validate_regular_file(&metadata, true)?;
         self.metadata = Some(metadata.clone());
-        write(&metadata, bytes, "staged fork familiar metadata")
+        let result = write(&metadata, bytes, "staged fork familiar metadata");
+        if result.is_ok() {
+            self.storage.validate_regular_file(&metadata, false)?;
+        }
+        result
     }
 
     fn remove_pending_marker_for_commit(&mut self) -> Result<(), PocketError> {
-        remove_pending_fork_marker(&self.root, &self.session_id, false)?;
+        remove_pending_fork_marker_checked(&self.storage, &self.session_id, false)?;
         self.pending_marker = None;
         Ok(())
     }
@@ -1164,14 +1758,17 @@ impl ForkStage {
         if !self.armed {
             return Ok(());
         }
+        preflight_session_artifacts(&self.storage, &self.session_id)?;
         let mut errors = Vec::new();
         if self.index_may_exist {
             if self.pending_marker.is_some() {
-                if let Err(err) = ensure_pending_fork_marker(&self.root, &self.session_id) {
+                if let Err(err) =
+                    ensure_pending_fork_marker_checked(&self.storage, &self.session_id)
+                {
                     errors.push(err.to_string());
                 }
             }
-            match delete_index_session(&self.root, &self.session_id, "cannot clean fork index") {
+            match delete_index_session(&self.storage, &self.session_id, "cannot clean fork index") {
                 Ok(()) => self.index_may_exist = false,
                 Err(err) => {
                     errors.push(err.to_string());
@@ -1185,45 +1782,51 @@ impl ForkStage {
                 }
             }
         }
+        let metadata_directory = self.storage.metadata_dir()?;
+        let transcript_directory = self.storage.transcripts_dir()?;
         for (path, directory, remove_context, sync_context) in [
             (
                 self.published_metadata.take(),
-                self.root.join("metadata"),
+                metadata_directory,
                 "cannot clean published fork metadata",
                 "cannot sync published fork metadata cleanup",
             ),
             (
                 self.published_transcript.take(),
-                self.root.join("transcripts"),
+                transcript_directory,
                 "cannot clean published fork transcript",
                 "cannot sync published fork transcript cleanup",
             ),
         ] {
             if let Some(path) = path {
-                if let Err(err) =
-                    remove_file_durably_if_present(&path, &directory, remove_context, sync_context)
-                {
+                if let Err(err) = remove_file_durably_if_present(
+                    &self.storage,
+                    &path,
+                    &directory,
+                    remove_context,
+                    sync_context,
+                ) {
                     errors.push(err.to_string());
                 }
             }
         }
         self.metadata = None;
         if self.staging_may_exist {
-            if let Err(err) = remove_fork_staging_artifacts(&self.root, &self.session_id) {
+            if let Err(err) = remove_fork_staging_artifacts(&self.storage, &self.session_id) {
                 errors.push(err.to_string());
             } else {
                 self.staging_may_exist = false;
             }
-        } else if let Err(err) = remove_empty_fork_staging_root(&self.root) {
+        } else if let Err(err) = remove_empty_fork_staging_root(&self.storage) {
             errors.push(err.to_string());
         }
         if errors.is_empty() && self.pending_marker.is_some() {
-            match remove_pending_fork_marker(&self.root, &self.session_id, true) {
+            match remove_pending_fork_marker_checked(&self.storage, &self.session_id, true) {
                 Ok(()) => self.pending_marker = None,
                 Err(err) => {
                     errors.push(err.to_string());
                     if let Err(restore_err) =
-                        ensure_pending_fork_marker(&self.root, &self.session_id)
+                        ensure_pending_fork_marker_checked(&self.storage, &self.session_id)
                     {
                         errors.push(restore_err.to_string());
                     }
@@ -1244,19 +1847,15 @@ impl ForkStage {
     }
 
     fn remove_empty_staging_dirs(&self) -> Result<(), PocketError> {
-        let stage_root = self.directory.parent().ok_or_else(|| PocketError::Engine {
-            message: format!(
-                "fork staging directory has no parent: {}",
-                self.directory.display()
-            ),
-        })?;
+        let stage_root = self.storage.fork_staging_root()?;
         remove_dir_durably_if_present(
+            &self.storage,
             &self.directory,
-            stage_root,
+            &stage_root,
             "cannot remove empty fork staging dir",
             "cannot sync empty fork staging directory removal",
         )?;
-        remove_empty_fork_staging_root(&self.root)
+        remove_empty_fork_staging_root(&self.storage)
     }
 }
 
@@ -1310,13 +1909,13 @@ fn fork_publication_error(
 }
 
 async fn fork_session_unlocked(
-    root: &Path,
+    storage: &CheckedStorage,
     session_id: &str,
     lifecycle: &mut SessionLifecycle,
     #[cfg(test)] mut stage_pause: Option<ForkStagePause>,
     #[cfg(not(test))] _stage_pause: Option<()>,
 ) -> Result<String, PocketError> {
-    let (messages, _) = load_session_messages_at_root(root, session_id).await?;
+    let (messages, _) = load_session_messages_at_storage(storage, session_id).await?;
     if messages.is_empty() {
         return Err(PocketError::Engine {
             message: format!("session {session_id} has no messages to fork"),
@@ -1324,10 +1923,10 @@ async fn fork_session_unlocked(
     }
 
     // Model comes from the source's index row; the transcript doesn't carry it.
-    let model = indexed_session_model(root, session_id)?;
+    let model = indexed_session_model(storage, session_id)?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    let key = session_key(root, &new_id);
+    let key = session_key(storage.root(), &new_id);
     if matches!(
         lifecycle.sessions.get(&key),
         Some(SessionLifecycleState::Active { .. } | SessionLifecycleState::PendingFork)
@@ -1340,14 +1939,14 @@ async fn fork_session_unlocked(
         lifecycle.sessions.get(&key),
         Some(SessionLifecycleState::Tombstoned)
     ) {
-        cleanup_session_artifacts(root, &new_id).map_err(|err| PocketError::Engine {
+        cleanup_session_artifacts(storage, &new_id).map_err(|err| PocketError::Engine {
             message: format!("cannot clear deleted fork UUID collision: {err}"),
         })?;
         lifecycle.sessions.remove(&key);
     }
 
-    let familiar_bytes = familiar_metadata_bytes_at_root(root, session_id)?;
-    let mut stage = ForkStage::begin(root, &new_id)?;
+    let familiar_bytes = familiar_metadata_bytes_at_storage(storage, session_id)?;
+    let mut stage = ForkStage::begin(storage, &new_id)?;
     if let Err(err) = stage.create_staging_directory() {
         return Err(fork_stage_error(
             "cannot initialize fork staging",
@@ -1370,6 +1969,12 @@ async fn fork_session_unlocked(
     for message in &messages {
         let uuid = uuid::Uuid::new_v4().to_string();
         let entry = build_entry(message.clone(), &uuid, parent.as_deref(), &new_id);
+        stage
+            .storage
+            .validate_regular_file(&stage.transcript, true)
+            .map_err(|err| {
+                fork_stage_error("cannot preflight staged fork transcript", err, &mut stage)
+            })?;
         if let Err(err) = write_transcript_entry(&stage.transcript, &entry).await {
             return Err(fork_stage_error(
                 "cannot stage fork transcript",
@@ -1377,6 +1982,12 @@ async fn fork_session_unlocked(
                 &mut stage,
             ));
         }
+        stage
+            .storage
+            .validate_regular_file(&stage.transcript, false)
+            .map_err(|err| {
+                fork_stage_error("cannot validate staged fork transcript", err, &mut stage)
+            })?;
         indexed_messages.push((uuid.clone(), message));
         parent = Some(uuid);
 
@@ -1387,6 +1998,16 @@ async fn fork_session_unlocked(
         }
     }
 
+    stage
+        .storage
+        .validate_regular_file(&stage.transcript, false)
+        .map_err(|err| {
+            fork_stage_error(
+                "cannot preflight staged fork transcript sync",
+                err,
+                &mut stage,
+            )
+        })?;
     if let Err(err) = std::fs::OpenOptions::new()
         .read(true)
         .open(&stage.transcript)
@@ -1399,19 +2020,30 @@ async fn fork_session_unlocked(
         ));
     }
 
-    let transcript_destination = transcript_file(root, &new_id);
-    let transcript_directory = root.join("transcripts");
+    let transcript_destination = storage
+        .transcript_file(&new_id)
+        .map_err(|err| fork_stage_error("cannot prepare fork transcript path", err, &mut stage))?;
+    let transcript_directory = storage
+        .transcripts_dir()
+        .map_err(|err| fork_stage_error("cannot prepare transcript dir", err, &mut stage))?;
     ensure_durable_directory(
-        root,
+        storage,
+        storage.root(),
         &transcript_directory,
         "cannot create transcript dir",
         "cannot sync transcript directory creation",
     )
     .map_err(|err| fork_stage_error("cannot prepare transcript dir", err, &mut stage))?;
-    std::fs::rename(&stage.transcript, &transcript_destination)
-        .map_err(|err| fork_stage_error("cannot publish fork transcript", err, &mut stage))?;
+    rename_checked_file(
+        storage,
+        &stage.transcript,
+        &transcript_destination,
+        "cannot publish fork transcript",
+    )
+    .map_err(|err| fork_stage_error("cannot publish fork transcript", err, &mut stage))?;
     stage.published_transcript = Some(transcript_destination);
     sync_directory(
+        storage,
         &transcript_directory,
         "cannot sync published fork transcript directory",
     )
@@ -1424,20 +2056,31 @@ async fn fork_session_unlocked(
     })?;
 
     if let Some(metadata) = stage.metadata.clone() {
-        let metadata_destination = familiar_file(root, &new_id);
-        let metadata_directory = root.join("metadata");
+        let metadata_destination = storage.familiar_file(&new_id).map_err(|err| {
+            fork_stage_error("cannot prepare fork metadata path", err, &mut stage)
+        })?;
+        let metadata_directory = storage
+            .metadata_dir()
+            .map_err(|err| fork_stage_error("cannot prepare metadata dir", err, &mut stage))?;
         ensure_durable_directory(
-            root,
+            storage,
+            storage.root(),
             &metadata_directory,
             "cannot create metadata dir",
             "cannot sync metadata directory creation",
         )
         .map_err(|err| fork_stage_error("cannot prepare metadata dir", err, &mut stage))?;
-        std::fs::rename(&metadata, &metadata_destination)
-            .map_err(|err| fork_stage_error("cannot publish fork metadata", err, &mut stage))?;
+        rename_checked_file(
+            storage,
+            &metadata,
+            &metadata_destination,
+            "cannot publish fork metadata",
+        )
+        .map_err(|err| fork_stage_error("cannot publish fork metadata", err, &mut stage))?;
         stage.metadata = None;
         stage.published_metadata = Some(metadata_destination);
         sync_directory(
+            storage,
             &metadata_directory,
             "cannot sync published fork metadata directory",
         )
@@ -1457,7 +2100,16 @@ async fn fork_session_unlocked(
         .sessions
         .insert(key.clone(), SessionLifecycleState::PendingFork);
 
-    let store = match index_store(root) {
+    if let Err(err) = preflight_session_artifacts(storage, &new_id) {
+        return Err(fork_publication_error(
+            "cannot preflight fork publication",
+            err,
+            &mut stage,
+            lifecycle,
+            &key,
+        ));
+    }
+    let store = match checked_index_store(storage) {
         Ok(store) => store,
         Err(err) => {
             return Err(fork_publication_error(
@@ -1470,6 +2122,15 @@ async fn fork_session_unlocked(
         }
     };
     stage.index_may_exist = true;
+    if let Err(err) = storage.validate_sqlite_files() {
+        return Err(fork_publication_error(
+            "cannot preflight fork index",
+            err,
+            &mut stage,
+            lifecycle,
+            &key,
+        ));
+    }
     if let Err(err) = store.save_session(&new_id, Some(&derive_title(&messages)), &model) {
         return Err(fork_publication_error(
             "cannot publish fork index",
@@ -1480,7 +2141,7 @@ async fn fork_session_unlocked(
         ));
     }
     #[cfg(test)]
-    if let Err(err) = fail_fork_publication_after_row_if_requested(root) {
+    if let Err(err) = fail_fork_publication_after_row_if_requested(storage) {
         return Err(fork_publication_error(
             "cannot publish fork index",
             err,
@@ -1490,6 +2151,15 @@ async fn fork_session_unlocked(
         ));
     }
     for (uuid, message) in indexed_messages {
+        if let Err(err) = storage.validate_sqlite_files() {
+            return Err(fork_publication_error(
+                "cannot preflight fork message index",
+                err,
+                &mut stage,
+                lifecycle,
+                &key,
+            ));
+        }
         if let Err(err) = store.save_message(
             &new_id,
             &uuid,
@@ -1617,6 +2287,75 @@ mod tests {
             .id
     }
 
+    #[cfg(unix)]
+    const EXTERNAL_SENTINEL: &[u8] = b"external-session-storage-sentinel";
+
+    #[cfg(unix)]
+    fn external_sentinel(label: &str) -> (PathBuf, PathBuf) {
+        let directory = test_storage(label);
+        let sentinel = directory.join("sentinel");
+        std::fs::write(&sentinel, EXTERNAL_SENTINEL).unwrap();
+        (directory, sentinel)
+    }
+
+    #[cfg(unix)]
+    fn assert_external_sentinel(sentinel: &Path) {
+        assert_eq!(std::fs::read(sentinel).unwrap(), EXTERNAL_SENTINEL);
+    }
+
+    #[cfg(unix)]
+    fn assert_unsafe_storage_path<T>(result: Result<T, PocketError>, path: &Path, reason: &str) {
+        let err = match result {
+            Ok(_) => panic!("unsafe storage path was accepted: {}", path.display()),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("persistence error"),
+            "expected persistence error, got: {message}"
+        );
+        assert!(
+            message.contains(&path.display().to_string()),
+            "error did not identify {}: {message}",
+            path.display()
+        );
+        assert!(
+            message.contains(reason),
+            "error did not identify reason {reason:?}: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn remove_symlink_if_present(path: &Path) {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                std::fs::remove_file(path).unwrap();
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("cannot inspect test symlink {}: {err}", path.display()),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn create_persisted_test_session(storage: &Path) -> String {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence = SessionPersistence::create(
+            &storage.display().to_string(),
+            session_id.clone(),
+            "model".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        persistence
+            .persist_new(&[Message::user("stored session")])
+            .await
+            .unwrap();
+        drop(persistence);
+        session_id
+    }
+
     #[test]
     fn session_id_validation_rejects_path_shapes() {
         assert!(validate_session_id(&uuid::Uuid::new_v4().to_string()).is_ok());
@@ -1636,6 +2375,435 @@ mod tests {
         assert_eq!(title.chars().count(), 60);
         assert!(!title.contains('\n'));
         assert_eq!(derive_title(&[]), "");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_root_symlink_is_rejected_without_touching_external_sentinel() {
+        use std::os::unix::fs::symlink;
+
+        let (external, sentinel) = external_sentinel("unsafe-root-target");
+        let storage = test_storage("unsafe-root-link");
+        std::fs::remove_dir(&storage).unwrap();
+        symlink(&external, &storage).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &storage, "symlink");
+
+        remove_symlink_if_present(&storage);
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_symlink_is_rejected_by_session_start() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-metadata-start");
+        let (external, sentinel) = external_sentinel("unsafe-metadata-start-target");
+        let metadata = storage.join("metadata");
+        symlink(&external, &metadata).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let result = SessionPersistence::create(
+            &storage.display().to_string(),
+            session_id,
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &metadata, "symlink");
+
+        remove_symlink_if_present(&metadata);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_symlink_is_rejected_by_list_resume_and_delete() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-metadata-lifecycle");
+        let storage_str = storage.display().to_string();
+        let session_id = create_persisted_test_session(&storage).await;
+        let (external, sentinel) = external_sentinel("unsafe-metadata-lifecycle-target");
+        let metadata = storage.join("metadata");
+        symlink(&external, &metadata).unwrap();
+
+        let list_result = list_sessions(&storage_str).await;
+        let resume_result =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string()).await;
+        let delete_result = delete_session(&storage_str, &session_id).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(list_result, &metadata, "symlink");
+        assert_unsafe_storage_path(resume_result, &metadata, "symlink");
+        assert_unsafe_storage_path(delete_result, &metadata, "symlink");
+
+        remove_symlink_if_present(&metadata);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcripts_symlink_is_rejected_by_session_start() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-transcripts");
+        let (external, sentinel) = external_sentinel("unsafe-transcripts-target");
+        let transcripts = storage.join("transcripts");
+        symlink(&external, &transcripts).unwrap();
+
+        let result = SessionPersistence::create(
+            &storage.display().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            "model".to_string(),
+            None,
+        )
+        .await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &transcripts, "symlink");
+
+        remove_symlink_if_present(&transcripts);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_symlink_is_rejected_during_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-lifecycle");
+        let (external, sentinel) = external_sentinel("unsafe-lifecycle-target");
+        let lifecycle = storage.join(".session-lifecycle");
+        symlink(&external, &lifecycle).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &lifecycle, "symlink");
+
+        remove_symlink_if_present(&lifecycle);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_forks_directory_symlink_is_rejected_during_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-pending-directory");
+        let lifecycle = storage.join(".session-lifecycle");
+        std::fs::create_dir(&lifecycle).unwrap();
+        let (external, sentinel) = external_sentinel("unsafe-pending-directory-target");
+        let pending = lifecycle.join("pending-forks");
+        symlink(&external, &pending).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &pending, "symlink");
+
+        remove_symlink_if_present(&pending);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_staging_symlink_is_rejected_during_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-fork-staging");
+        let (external, sentinel) = external_sentinel("unsafe-fork-staging-target");
+        let staging = storage.join(".fork-staging");
+        symlink(&external, &staging).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &staging, "symlink");
+
+        remove_symlink_if_present(&staging);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_symlink_is_rejected_before_sqlite_touches_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-index");
+        let (external, sentinel) = external_sentinel("unsafe-index-target");
+        let index = storage.join("index.sqlite");
+        symlink(&sentinel, &index).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &index, "symlink");
+
+        remove_symlink_if_present(&index);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn assert_sqlite_sidecar_symlink_is_rejected(suffix: &str) {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage(&format!("unsafe-index-{suffix}"));
+        let storage_str = storage.display().to_string();
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        let (external, sentinel) = external_sentinel(&format!("unsafe-index-{suffix}-target"));
+        let sidecar = storage.join(format!("index.sqlite-{suffix}"));
+        symlink(&sentinel, &sidecar).unwrap();
+
+        let result = list_sessions(&storage_str).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &sidecar, "symlink");
+
+        remove_symlink_if_present(&sidecar);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_wal_symlink_is_rejected_before_sqlite_open() {
+        assert_sqlite_sidecar_symlink_is_rejected("wal").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn index_shm_symlink_is_rejected_before_sqlite_open() {
+        assert_sqlite_sidecar_symlink_is_rejected("shm").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn familiar_sidecar_symlink_is_rejected_without_reading_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-familiar-leaf");
+        let storage_str = storage.display().to_string();
+        let session_id = create_persisted_test_session(&storage).await;
+        let metadata = storage.join("metadata");
+        std::fs::create_dir(&metadata).unwrap();
+        let external = test_storage("unsafe-familiar-leaf-target");
+        let sentinel = external.join("sentinel");
+        let sentinel_bytes = serde_json::to_vec(&familiar()).unwrap();
+        std::fs::write(&sentinel, &sentinel_bytes).unwrap();
+        let sidecar = familiar_file(&storage, &session_id);
+        symlink(&sentinel, &sidecar).unwrap();
+
+        let result = list_sessions(&storage_str).await;
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+        assert_unsafe_storage_path(result, &sidecar, "symlink");
+
+        remove_symlink_if_present(&sidecar);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcript_leaf_symlink_is_rejected_without_reading_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-transcript-leaf");
+        let storage_str = storage.display().to_string();
+        let session_id = create_persisted_test_session(&storage).await;
+        let transcript = transcript_file(&storage, &session_id);
+        let external = test_storage("unsafe-transcript-leaf-target");
+        let sentinel = external.join("sentinel.jsonl");
+        std::fs::rename(&transcript, &sentinel).unwrap();
+        let sentinel_bytes = std::fs::read(&sentinel).unwrap();
+        symlink(&sentinel, &transcript).unwrap();
+
+        let result =
+            SessionPersistence::resume(&storage_str, session_id, "model".to_string()).await;
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+        assert_unsafe_storage_path(result, &transcript, "symlink");
+
+        remove_symlink_if_present(&transcript);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_fork_marker_symlink_is_rejected_during_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-pending-marker");
+        let lifecycle = storage.join(".session-lifecycle");
+        let pending = lifecycle.join("pending-forks");
+        std::fs::create_dir_all(&pending).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let (external, sentinel) = external_sentinel("unsafe-pending-marker-target");
+        let marker = pending.join(format!("{session_id}.pending"));
+        symlink(&sentinel, &marker).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &marker, "symlink");
+
+        remove_symlink_if_present(&marker);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_session_directory_symlink_is_rejected_during_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-stage-directory");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        create_pending_fork_marker(&storage, &session_id).unwrap();
+        let stage_root = storage.join(".fork-staging");
+        std::fs::create_dir(&stage_root).unwrap();
+        let (external, sentinel) = external_sentinel("unsafe-stage-directory-target");
+        let stage = stage_root.join(&session_id);
+        symlink(&external, &stage).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &stage, "symlink");
+
+        remove_symlink_if_present(&stage);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_transcript_symlink_is_rejected_during_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-staged-transcript");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        create_pending_fork_marker(&storage, &session_id).unwrap();
+        let stage = fork_staging_dir(&storage, &session_id);
+        std::fs::create_dir_all(&stage).unwrap();
+        let (external, sentinel) = external_sentinel("unsafe-staged-transcript-target");
+        let staged_transcript = stage.join(format!("{session_id}.jsonl"));
+        symlink(&sentinel, &staged_transcript).unwrap();
+
+        let result = list_sessions(&storage.display().to_string()).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &staged_transcript, "symlink");
+
+        remove_symlink_if_present(&staged_transcript);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_preflight_failure_preserves_index_row_and_external_sentinel() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-delete-preflight");
+        let storage_str = storage.display().to_string();
+        let session_id = create_persisted_test_session(&storage).await;
+        let transcript = transcript_file(&storage, &session_id);
+        let external = test_storage("unsafe-delete-preflight-target");
+        let sentinel = external.join("sentinel.jsonl");
+        std::fs::rename(&transcript, &sentinel).unwrap();
+        let sentinel_bytes = std::fs::read(&sentinel).unwrap();
+        symlink(&sentinel, &transcript).unwrap();
+
+        let result = delete_session(&storage_str, &session_id).await;
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+        assert!(
+            index_store(&storage)
+                .unwrap()
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == session_id),
+            "delete mutated the index before storage-path preflight completed"
+        );
+        assert_unsafe_storage_path(result, &transcript, "symlink");
+
+        remove_symlink_if_present(&transcript);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_preflight_failure_preserves_rows_and_all_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("unsafe-recovery-preflight");
+        let storage_str = storage.display().to_string();
+        let source_id = create_persisted_test_session(&storage).await;
+        let destination_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&destination_id, Some("destination"), "model")
+            .unwrap();
+        std::fs::write(
+            transcript_file(&storage, &destination_id),
+            b"published destination transcript",
+        )
+        .unwrap();
+        std::fs::create_dir_all(storage.join("metadata")).unwrap();
+        std::fs::write(
+            familiar_file(&storage, &destination_id),
+            serde_json::to_vec(&familiar()).unwrap(),
+        )
+        .unwrap();
+        create_pending_fork_marker(&storage, &destination_id).unwrap();
+        let stage = fork_staging_dir(&storage, &destination_id);
+        std::fs::create_dir_all(&stage).unwrap();
+        let (external, sentinel) = external_sentinel("unsafe-recovery-preflight-target");
+        let staged_transcript = stage.join(format!("{destination_id}.jsonl"));
+        symlink(&sentinel, &staged_transcript).unwrap();
+        clear_module_state_for_root(&storage).await;
+
+        let result = list_sessions(&storage_str).await;
+
+        assert_external_sentinel(&sentinel);
+        let rows = index_store(&storage).unwrap().list_sessions().unwrap();
+        assert!(rows.iter().any(|row| row.id == source_id));
+        assert!(rows.iter().any(|row| row.id == destination_id));
+        assert!(transcript_file(&storage, &destination_id).exists());
+        assert!(familiar_file(&storage, &destination_id).exists());
+        assert!(pending_fork_marker(&storage, &destination_id).exists());
+        assert!(staged_transcript.exists());
+        assert_unsafe_storage_path(result, &staged_transcript, "symlink");
+
+        remove_symlink_if_present(&staged_transcript);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
     }
 
     #[tokio::test]
@@ -2766,7 +3934,8 @@ mod tests {
         assert!(pending_fork_marker(&storage, &fork_id).exists());
 
         let mut lifecycle = SessionLifecycle::default();
-        recover_pending_forks_unlocked(&storage, &mut lifecycle).unwrap();
+        let checked_storage = CheckedStorage::from_root(&storage).unwrap();
+        recover_pending_forks_unlocked(&checked_storage, &mut lifecycle).unwrap();
         assert!(!pending_fork_marker(&storage, &fork_id).exists());
         assert!(!stage_root.exists());
 
