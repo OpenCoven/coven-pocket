@@ -6,6 +6,7 @@
 //! {storage_dir}/index.sqlite               — engine SqliteSessionStore (list/search index)
 //! {storage_dir}/transcripts/{uuid}.jsonl   — engine-format JSONL transcript (full fidelity)
 //! {storage_dir}/metadata/{uuid}.familiar.json — pinned familiar identity snapshot
+//! {storage_dir}/.session-lifecycle/pending-forks/{uuid}.pending — incomplete fork quarantine
 //! ```
 //!
 //! Transcripts use the engine's `session_storage` wire format, so files are
@@ -37,6 +38,7 @@ struct SessionKey {
 #[derive(Clone, Copy)]
 enum SessionLifecycleState {
     Active(uuid::Uuid),
+    PendingFork,
     Tombstoned,
 }
 
@@ -47,6 +49,17 @@ struct SessionLifecycle {
 
 static SESSION_LIFECYCLE_LOCK: LazyLock<tokio::sync::RwLock<SessionLifecycle>> =
     LazyLock::new(|| tokio::sync::RwLock::new(SessionLifecycle::default()));
+
+#[cfg(test)]
+#[derive(Default)]
+struct SessionTestFaults {
+    fail_fork_publication_after_row_once: bool,
+    fail_index_delete_remaining: usize,
+}
+
+#[cfg(test)]
+static SESSION_TEST_FAULTS: LazyLock<std::sync::Mutex<HashMap<PathBuf, SessionTestFaults>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Summary row for the session browser.
 #[derive(uniffi::Record)]
@@ -98,6 +111,47 @@ fn index_store(root: &Path) -> Result<SqliteSessionStore, PocketError> {
         .map_err(|e| engine_err("cannot open session index", e))
 }
 
+fn delete_index_session(root: &Path, session_id: &str, context: &str) -> Result<(), PocketError> {
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(root) {
+            if faults.fail_index_delete_remaining > 0 {
+                faults.fail_index_delete_remaining -= 1;
+                return Err(engine_err(
+                    context,
+                    std::io::Error::other("injected session index deletion failure"),
+                ));
+            }
+        }
+    }
+
+    index_store(root).and_then(|store| {
+        store
+            .delete_session(session_id)
+            .map_err(|err| engine_err(context, err))
+    })
+}
+
+#[cfg(test)]
+fn fail_fork_publication_after_row_if_requested(root: &Path) -> Result<(), PocketError> {
+    let mut faults = SESSION_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(faults) = faults.get_mut(root) {
+        if faults.fail_fork_publication_after_row_once {
+            faults.fail_fork_publication_after_row_once = false;
+            return Err(engine_err(
+                "cannot publish fork index",
+                std::io::Error::other("injected failure after fork row insertion"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn indexed_session_model(root: &Path, session_id: &str) -> Result<String, PocketError> {
     index_store(root)?
         .list_sessions()
@@ -119,6 +173,18 @@ fn familiar_file(root: &Path, session_id: &str) -> PathBuf {
         .join(format!("{session_id}.familiar.json"))
 }
 
+fn pending_forks_dir(root: &Path) -> PathBuf {
+    root.join(".session-lifecycle").join("pending-forks")
+}
+
+fn pending_fork_marker(root: &Path, session_id: &str) -> PathBuf {
+    pending_forks_dir(root).join(format!("{session_id}.pending"))
+}
+
+fn fork_staging_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join(".fork-staging").join(session_id)
+}
+
 fn session_key(root: &Path, session_id: &str) -> SessionKey {
     SessionKey {
         root: root.to_path_buf(),
@@ -134,6 +200,12 @@ fn ensure_session_available(
         Some(SessionLifecycleState::Tombstoned) => Err(PocketError::Engine {
             message: format!("session {} was deleted", key.session_id),
         }),
+        Some(SessionLifecycleState::PendingFork) => Err(PocketError::Engine {
+            message: format!(
+                "session {} is quarantined pending fork recovery",
+                key.session_id
+            ),
+        }),
         _ => Ok(()),
     }
 }
@@ -148,7 +220,9 @@ fn ensure_persistence_active(
         Some(SessionLifecycleState::Tombstoned) => Err(PocketError::Engine {
             message: format!("session {} was deleted", key.session_id),
         }),
-        Some(SessionLifecycleState::Active(_)) | None => Err(PocketError::Engine {
+        Some(SessionLifecycleState::Active(_))
+        | Some(SessionLifecycleState::PendingFork)
+        | None => Err(PocketError::Engine {
             message: format!(
                 "session persistence handle for {} was invalidated",
                 key.session_id
@@ -173,6 +247,42 @@ fn remove_dir_if_present(path: &Path, context: &str) -> Result<(), PocketError> 
     }
 }
 
+fn remove_dir_all_if_present(path: &Path, context: &str) -> Result<(), PocketError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(engine_err(context, err)),
+    }
+}
+
+fn sync_directory(path: &Path, context: &str) -> Result<(), PocketError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| engine_err(context, err))
+}
+
+fn ensure_durable_directory(
+    parent: &Path,
+    directory: &Path,
+    context: &str,
+) -> Result<(), PocketError> {
+    match std::fs::create_dir(directory) {
+        Ok(()) => sync_directory(parent, context),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::metadata(directory)
+                .map_err(|metadata_err| engine_err(context, metadata_err))?;
+            if metadata.is_dir() {
+                Ok(())
+            } else {
+                Err(PocketError::Engine {
+                    message: format!("{} is not a directory", directory.display()),
+                })
+            }
+        }
+        Err(err) => Err(engine_err(context, err)),
+    }
+}
+
 fn write_new_file(path: &Path, bytes: &[u8], context: &str) -> Result<(), PocketError> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -183,6 +293,107 @@ fn write_new_file(path: &Path, bytes: &[u8], context: &str) -> Result<(), Pocket
         .map_err(|err| engine_err(&format!("cannot write {context}"), err))?;
     file.sync_all()
         .map_err(|err| engine_err(&format!("cannot sync {context}"), err))
+}
+
+fn create_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), PocketError> {
+    let lifecycle_directory = root.join(".session-lifecycle");
+    let directory = pending_forks_dir(root);
+    ensure_durable_directory(
+        root,
+        &lifecycle_directory,
+        "cannot create pending fork lifecycle directory",
+    )?;
+    ensure_durable_directory(
+        &lifecycle_directory,
+        &directory,
+        "cannot create pending fork marker directory",
+    )?;
+    let marker = pending_fork_marker(root, session_id);
+    write_new_file(&marker, b"", "pending fork marker")?;
+    sync_directory(&directory, "cannot sync pending fork marker directory")
+}
+
+fn ensure_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), PocketError> {
+    let marker = pending_fork_marker(root, session_id);
+    match std::fs::metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(&marker)
+                .and_then(|file| file.sync_all())
+                .map_err(|err| engine_err("cannot sync pending fork marker", err))?;
+            sync_directory(
+                &pending_forks_dir(root),
+                "cannot sync pending fork marker directory",
+            )
+        }
+        Ok(_) => Err(PocketError::Engine {
+            message: format!("pending fork marker is not a file: {}", marker.display()),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            create_pending_fork_marker(root, session_id)
+        }
+        Err(err) => Err(engine_err("cannot inspect pending fork marker", err)),
+    }
+}
+
+fn remove_pending_fork_marker(
+    root: &Path,
+    session_id: &str,
+    missing_ok: bool,
+) -> Result<(), PocketError> {
+    let marker = pending_fork_marker(root, session_id);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(err) if missing_ok && err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(engine_err("cannot remove pending fork marker", err)),
+    }
+    sync_directory(
+        &pending_forks_dir(root),
+        "cannot sync pending fork marker removal",
+    )
+}
+
+fn pending_fork_ids(root: &Path) -> Result<Vec<String>, PocketError> {
+    let directory = pending_forks_dir(root);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(engine_err("cannot read pending fork markers", err)),
+    };
+    let mut session_ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| engine_err("cannot read pending fork marker", err))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
+        if !file_type.is_file() {
+            return Err(PocketError::Engine {
+                message: format!(
+                    "pending fork marker is not a file: {}",
+                    entry.path().display()
+                ),
+            });
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str().ok_or_else(|| PocketError::Engine {
+            message: format!(
+                "pending fork marker name is not valid UTF-8: {}",
+                entry.path().display()
+            ),
+        })?;
+        let session_id = file_name
+            .strip_suffix(".pending")
+            .ok_or_else(|| PocketError::Engine {
+                message: format!("invalid pending fork marker name: {file_name}"),
+            })?;
+        validate_session_id(session_id).map_err(|err| PocketError::Engine {
+            message: format!("invalid pending fork marker {file_name}: {err}"),
+        })?;
+        session_ids.push(session_id.to_string());
+    }
+    session_ids.sort();
+    Ok(session_ids)
 }
 
 fn save_familiar_metadata_at_root(
@@ -325,6 +536,7 @@ impl SessionPersistence {
         let root = storage_root(storage_dir)?;
         let key = session_key(&root, &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+        recover_pending_forks_unlocked(&root, &mut lifecycle)?;
         match lifecycle.sessions.get(&key).copied() {
             Some(SessionLifecycleState::Active(_)) => {
                 return Err(PocketError::Engine {
@@ -337,6 +549,11 @@ impl SessionPersistence {
                         message: format!("cannot clear deleted session before UUID reuse: {err}"),
                     }
                 })?;
+            }
+            Some(SessionLifecycleState::PendingFork) => {
+                return Err(PocketError::Engine {
+                    message: format!("session {session_id} is quarantined pending fork recovery"),
+                });
             }
             None => {}
         }
@@ -365,6 +582,7 @@ impl SessionPersistence {
         let root = storage_root(storage_dir)?;
         let key = session_key(&root, &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+        recover_pending_forks_unlocked(&root, &mut lifecycle)?;
         ensure_session_available(&lifecycle, &key)?;
         let (messages, last_uuid) = load_session_messages_at_root(&root, &session_id).await?;
         let familiar = load_familiar_metadata_at_root(&root, &session_id)?;
@@ -373,6 +591,11 @@ impl SessionPersistence {
             Some(SessionLifecycleState::Tombstoned) => {
                 return Err(PocketError::Engine {
                     message: format!("session {session_id} was deleted"),
+                });
+            }
+            Some(SessionLifecycleState::PendingFork) => {
+                return Err(PocketError::Engine {
+                    message: format!("session {session_id} is quarantined pending fork recovery"),
                 });
             }
             None => {
@@ -483,28 +706,29 @@ async fn load_session_messages_at_root(
 
 /// Newest-first summaries for the browser.
 pub async fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
-    let lifecycle = SESSION_LIFECYCLE_LOCK.read().await;
-    list_sessions_unlocked(storage_dir, &lifecycle)
+    let root = storage_root(storage_dir)?;
+    let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+    recover_pending_forks_unlocked(&root, &mut lifecycle)?;
+    list_sessions_unlocked(&root, &lifecycle)
 }
 
 fn list_sessions_unlocked(
-    storage_dir: &str,
+    root: &Path,
     lifecycle: &SessionLifecycle,
 ) -> Result<Vec<ChatSessionSummary>, PocketError> {
-    let root = storage_root(storage_dir)?;
-    let store = index_store(&root)?;
+    let store = index_store(root)?;
     let rows = store
         .list_sessions()
         .map_err(|e| engine_err("cannot list sessions", e))?;
     rows.into_iter()
         .filter(|session| {
             !matches!(
-                lifecycle.sessions.get(&session_key(&root, &session.id)),
-                Some(SessionLifecycleState::Tombstoned)
+                lifecycle.sessions.get(&session_key(root, &session.id)),
+                Some(SessionLifecycleState::Tombstoned | SessionLifecycleState::PendingFork)
             )
         })
         .map(|s| {
-            let familiar = load_familiar_metadata_at_root(&root, &s.id)?;
+            let familiar = load_familiar_metadata_at_root(root, &s.id)?;
             Ok(ChatSessionSummary {
                 session_id: s.id,
                 title: s.title.unwrap_or_default(),
@@ -524,22 +748,43 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
     let root = storage_root(storage_dir)?;
     let key = session_key(&root, session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    lifecycle
-        .sessions
-        .insert(key, SessionLifecycleState::Tombstoned);
-    cleanup_session_artifacts(&root, session_id)
+    let in_memory_pending = matches!(
+        lifecycle.sessions.get(&key),
+        Some(SessionLifecycleState::PendingFork)
+    );
+    let mut is_pending = pending_fork_marker(&root, session_id)
+        .try_exists()
+        .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
+    if in_memory_pending && !is_pending {
+        ensure_pending_fork_marker(&root, session_id)?;
+        is_pending = true;
+    }
+    lifecycle.sessions.insert(
+        key.clone(),
+        if is_pending {
+            SessionLifecycleState::PendingFork
+        } else {
+            SessionLifecycleState::Tombstoned
+        },
+    );
+    match cleanup_session_artifacts(&root, session_id) {
+        Ok(()) => {
+            lifecycle
+                .sessions
+                .insert(key, SessionLifecycleState::Tombstoned);
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn cleanup_session_artifacts(root: &Path, session_id: &str) -> Result<(), PocketError> {
+    delete_index_session(root, session_id, "cannot delete session index")?;
+
+    let marker_exists = pending_fork_marker(root, session_id)
+        .try_exists()
+        .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
     let mut errors = Vec::new();
-    match index_store(root).and_then(|store| {
-        store
-            .delete_session(session_id)
-            .map_err(|err| engine_err("cannot delete session index", err))
-    }) {
-        Ok(()) => {}
-        Err(err) => errors.push(err.to_string()),
-    }
     if let Err(err) = remove_file_if_present(
         &transcript_file(root, session_id),
         "cannot delete transcript",
@@ -548,6 +793,20 @@ fn cleanup_session_artifacts(root: &Path, session_id: &str) -> Result<(), Pocket
     }
     if let Err(err) = save_familiar_metadata_at_root(root, session_id, None) {
         errors.push(err.to_string());
+    }
+    if let Err(err) = remove_dir_all_if_present(
+        &fork_staging_dir(root, session_id),
+        "cannot delete fork staging artifacts",
+    ) {
+        errors.push(err.to_string());
+    }
+    if errors.is_empty() && marker_exists {
+        if let Err(err) = remove_pending_fork_marker(root, session_id, true) {
+            errors.push(err.to_string());
+            if let Err(restore_err) = ensure_pending_fork_marker(root, session_id) {
+                errors.push(restore_err.to_string());
+            }
+        }
     }
     if errors.is_empty() {
         Ok(())
@@ -558,6 +817,47 @@ fn cleanup_session_artifacts(root: &Path, session_id: &str) -> Result<(), Pocket
     }
 }
 
+fn recover_pending_forks_unlocked(
+    root: &Path,
+    lifecycle: &mut SessionLifecycle,
+) -> Result<(), PocketError> {
+    let pending_ids = pending_fork_ids(root)?;
+    if let Some(key) = lifecycle.sessions.keys().find(|key| {
+        key.root == root
+            && matches!(
+                lifecycle.sessions.get(*key),
+                Some(SessionLifecycleState::PendingFork)
+            )
+            && !pending_ids.contains(&key.session_id)
+    }) {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot recover pending fork {}: persistent marker is missing",
+                key.session_id
+            ),
+        });
+    }
+
+    for session_id in &pending_ids {
+        let key = session_key(root, session_id);
+        lifecycle
+            .sessions
+            .insert(key.clone(), SessionLifecycleState::PendingFork);
+        if let Err(err) = cleanup_session_artifacts(root, session_id) {
+            return Err(PocketError::Engine {
+                message: format!("cannot recover pending fork {session_id}: {err}"),
+            });
+        }
+        if matches!(
+            lifecycle.sessions.get(&key),
+            Some(SessionLifecycleState::PendingFork)
+        ) {
+            lifecycle.sessions.remove(&key);
+        }
+    }
+    Ok(())
+}
+
 /// Copy a session's transcript under a fresh id at its current head.
 /// Returns the new session id.
 pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String, PocketError> {
@@ -565,6 +865,7 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
     let root = storage_root(storage_dir)?;
     let key = session_key(&root, session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+    recover_pending_forks_unlocked(&root, &mut lifecycle)?;
     ensure_session_available(&lifecycle, &key)?;
     fork_session_unlocked(&root, session_id, &mut lifecycle, None).await
 }
@@ -585,6 +886,7 @@ async fn fork_session_with_stage_pause(
     let root = storage_root(storage_dir)?;
     let key = session_key(&root, session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+    recover_pending_forks_unlocked(&root, &mut lifecycle)?;
     ensure_session_available(&lifecycle, &key)?;
     fork_session_unlocked(&root, session_id, &mut lifecycle, Some(stage_pause)).await
 }
@@ -597,6 +899,7 @@ struct ForkStage {
     metadata: Option<PathBuf>,
     published_transcript: Option<PathBuf>,
     published_metadata: Option<PathBuf>,
+    pending_marker: Option<PathBuf>,
     index_may_exist: bool,
     armed: bool,
 }
@@ -632,6 +935,7 @@ impl ForkStage {
             directory,
             published_transcript: None,
             published_metadata: None,
+            pending_marker: None,
             index_may_exist: false,
             armed: true,
         })
@@ -653,19 +957,40 @@ impl ForkStage {
         write(&metadata, bytes, "staged fork familiar metadata")
     }
 
+    fn create_pending_marker(&mut self) -> Result<(), PocketError> {
+        self.pending_marker = Some(pending_fork_marker(&self.root, &self.session_id));
+        create_pending_fork_marker(&self.root, &self.session_id)
+    }
+
+    fn remove_pending_marker_for_commit(&mut self) -> Result<(), PocketError> {
+        remove_pending_fork_marker(&self.root, &self.session_id, false)?;
+        self.pending_marker = None;
+        Ok(())
+    }
+
     fn cleanup(&mut self) -> Result<(), PocketError> {
         if !self.armed {
             return Ok(());
         }
         let mut errors = Vec::new();
         if self.index_may_exist {
-            match index_store(&self.root).and_then(|store| {
-                store
-                    .delete_session(&self.session_id)
-                    .map_err(|err| engine_err("cannot clean fork index", err))
-            }) {
+            if self.pending_marker.is_some() {
+                if let Err(err) = ensure_pending_fork_marker(&self.root, &self.session_id) {
+                    errors.push(err.to_string());
+                }
+            }
+            match delete_index_session(&self.root, &self.session_id, "cannot clean fork index") {
                 Ok(()) => self.index_may_exist = false,
-                Err(err) => errors.push(err.to_string()),
+                Err(err) => {
+                    errors.push(err.to_string());
+                    self.armed = false;
+                    return Err(PocketError::Engine {
+                        message: format!(
+                            "cannot clean fork staging artifacts: {}",
+                            errors.join("; ")
+                        ),
+                    });
+                }
             }
         }
         for (path, context) in [
@@ -692,7 +1017,9 @@ impl ForkStage {
                 }
             }
         }
-        if let Err(err) = remove_dir_if_present(&self.directory, "cannot clean fork staging dir") {
+        if let Err(err) =
+            remove_dir_all_if_present(&self.directory, "cannot clean fork staging dir")
+        {
             errors.push(err.to_string());
         }
         if let Some(stage_root) = self.directory.parent() {
@@ -705,10 +1032,26 @@ impl ForkStage {
                 }
             }
         }
+        if errors.is_empty() && self.pending_marker.is_some() {
+            match remove_pending_fork_marker(&self.root, &self.session_id, true) {
+                Ok(()) => self.pending_marker = None,
+                Err(err) => {
+                    errors.push(err.to_string());
+                    if let Err(restore_err) =
+                        ensure_pending_fork_marker(&self.root, &self.session_id)
+                    {
+                        errors.push(restore_err.to_string());
+                    }
+                }
+            }
+        }
         if errors.is_empty() {
             self.armed = false;
             Ok(())
         } else {
+            if self.pending_marker.is_some() {
+                self.armed = false;
+            }
             Err(PocketError::Engine {
                 message: format!("cannot clean fork staging artifacts: {}", errors.join("; ")),
             })
@@ -749,6 +1092,35 @@ fn fork_stage_error(
     }
 }
 
+fn fork_publication_error(
+    context: &str,
+    err: impl std::fmt::Display,
+    stage: &mut ForkStage,
+    lifecycle: &mut SessionLifecycle,
+    key: &SessionKey,
+) -> PocketError {
+    let primary = format!("{context}: {err}");
+    match stage.cleanup() {
+        Ok(()) => {
+            if matches!(
+                lifecycle.sessions.get(key),
+                Some(SessionLifecycleState::PendingFork)
+            ) {
+                lifecycle.sessions.remove(key);
+            }
+            PocketError::Engine { message: primary }
+        }
+        Err(cleanup_err) => {
+            lifecycle
+                .sessions
+                .insert(key.clone(), SessionLifecycleState::PendingFork);
+            PocketError::Engine {
+                message: format!("{primary}; cleanup also failed: {cleanup_err}"),
+            }
+        }
+    }
+}
+
 async fn fork_session_unlocked(
     root: &Path,
     session_id: &str,
@@ -770,7 +1142,7 @@ async fn fork_session_unlocked(
     let key = session_key(root, &new_id);
     if matches!(
         lifecycle.sessions.get(&key),
-        Some(SessionLifecycleState::Active(_))
+        Some(SessionLifecycleState::Active(_) | SessionLifecycleState::PendingFork)
     ) {
         return Err(PocketError::Engine {
             message: format!("generated fork session id collision: {new_id}"),
@@ -840,6 +1212,17 @@ async fn fork_session_unlocked(
     std::fs::rename(&stage.transcript, &transcript_destination)
         .map_err(|err| fork_stage_error("cannot publish fork transcript", err, &mut stage))?;
     stage.published_transcript = Some(transcript_destination);
+    sync_directory(
+        &root.join("transcripts"),
+        "cannot sync published fork transcript directory",
+    )
+    .map_err(|err| {
+        fork_stage_error(
+            "cannot make published fork transcript durable",
+            err,
+            &mut stage,
+        )
+    })?;
 
     if let Some(metadata) = stage.metadata.clone() {
         let metadata_destination = familiar_file(root, &new_id);
@@ -851,29 +1234,90 @@ async fn fork_session_unlocked(
             .map_err(|err| fork_stage_error("cannot publish fork metadata", err, &mut stage))?;
         stage.metadata = None;
         stage.published_metadata = Some(metadata_destination);
+        sync_directory(
+            &root.join("metadata"),
+            "cannot sync published fork metadata directory",
+        )
+        .map_err(|err| {
+            fork_stage_error(
+                "cannot make published fork metadata durable",
+                err,
+                &mut stage,
+            )
+        })?;
     }
     stage
         .remove_empty_staging_dirs()
         .map_err(|err| fork_stage_error("cannot finalize fork staging", err, &mut stage))?;
 
-    let store = index_store(root)
-        .map_err(|err| fork_stage_error("cannot open fork index", err, &mut stage))?;
+    if let Err(err) = stage.create_pending_marker() {
+        return Err(fork_stage_error(
+            "cannot create pending fork marker",
+            err,
+            &mut stage,
+        ));
+    }
+    lifecycle
+        .sessions
+        .insert(key.clone(), SessionLifecycleState::PendingFork);
+
+    let store = match index_store(root) {
+        Ok(store) => store,
+        Err(err) => {
+            return Err(fork_publication_error(
+                "cannot open fork index",
+                err,
+                &mut stage,
+                lifecycle,
+                &key,
+            ));
+        }
+    };
     stage.index_may_exist = true;
-    store
-        .save_session(&new_id, Some(&derive_title(&messages)), &model)
-        .map_err(|err| fork_stage_error("cannot publish fork index", err, &mut stage))?;
+    if let Err(err) = store.save_session(&new_id, Some(&derive_title(&messages)), &model) {
+        return Err(fork_publication_error(
+            "cannot publish fork index",
+            err,
+            &mut stage,
+            lifecycle,
+            &key,
+        ));
+    }
+    #[cfg(test)]
+    if let Err(err) = fail_fork_publication_after_row_if_requested(root) {
+        return Err(fork_publication_error(
+            "cannot publish fork index",
+            err,
+            &mut stage,
+            lifecycle,
+            &key,
+        ));
+    }
     for (uuid, message) in indexed_messages {
-        store
-            .save_message(
-                &new_id,
-                &uuid,
-                role_str(&message.role),
-                &message.get_all_text(),
-                None,
-            )
-            .map_err(|err| {
-                fork_stage_error("cannot publish fork message index", err, &mut stage)
-            })?;
+        if let Err(err) = store.save_message(
+            &new_id,
+            &uuid,
+            role_str(&message.role),
+            &message.get_all_text(),
+            None,
+        ) {
+            return Err(fork_publication_error(
+                "cannot publish fork message index",
+                err,
+                &mut stage,
+                lifecycle,
+                &key,
+            ));
+        }
+    }
+    if let Err(err) = stage.remove_pending_marker_for_commit() {
+        return Err(fork_publication_error(
+            "cannot commit fork publication",
+            err,
+            &mut stage,
+            lifecycle,
+            &key,
+        ));
     }
     lifecycle
         .sessions
@@ -906,6 +1350,46 @@ mod tests {
             emoji: Some("moon".to_string()),
             role: Some("repository guide".to_string()),
         }
+    }
+
+    fn configure_session_faults(
+        root: &Path,
+        fail_fork_publication_after_row_once: bool,
+        fail_index_delete_remaining: usize,
+    ) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                root.to_path_buf(),
+                SessionTestFaults {
+                    fail_fork_publication_after_row_once,
+                    fail_index_delete_remaining,
+                },
+            );
+    }
+
+    async fn clear_module_state_for_root(root: &Path) {
+        SESSION_LIFECYCLE_LOCK
+            .write()
+            .await
+            .sessions
+            .retain(|key, _| key.root != root);
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(root);
+    }
+
+    fn indexed_fork_id(root: &Path, source_id: &str) -> String {
+        index_store(root)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id != source_id)
+            .unwrap()
+            .id
     }
 
     #[test]
@@ -1195,6 +1679,170 @@ mod tests {
 
         delete_session(&storage_str, &fork_id).await.unwrap();
         assert!(!fork_sidecar.exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_fork_publication_is_quarantined_until_restart_recovery() {
+        let storage = test_storage("fork-pending-recovery");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source = SessionPersistence::create(
+            &storage_str,
+            source_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        source
+            .persist_new(&[
+                Message::user("source message"),
+                Message::assistant("source response"),
+            ])
+            .await
+            .unwrap();
+
+        configure_session_faults(&storage, true, 1);
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected failure after fork row insertion"));
+        assert!(err
+            .to_string()
+            .contains("injected session index deletion failure"));
+
+        let fork_id = indexed_fork_id(&storage, &source_id);
+        let marker = storage
+            .join(".session-lifecycle")
+            .join("pending-forks")
+            .join(format!("{fork_id}.pending"));
+        assert!(transcript_file(&storage, &fork_id).exists());
+        assert!(familiar_file(&storage, &fork_id).exists());
+        assert!(marker.exists());
+
+        let stale_stage = storage.join(".fork-staging").join(&fork_id);
+        std::fs::create_dir_all(&stale_stage).unwrap();
+        std::fs::write(stale_stage.join("stale"), b"stale").unwrap();
+
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, source_id);
+        assert!(!index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == fork_id));
+        assert!(!transcript_file(&storage, &fork_id).exists());
+        assert!(!familiar_file(&storage, &fork_id).exists());
+        assert!(!marker.exists());
+        assert!(!stale_stage.exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_pending_fork_recovery_failure_preserves_identity_artifacts() {
+        let storage = test_storage("fork-pending-recovery-repeat");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source = SessionPersistence::create(
+            &storage_str,
+            source_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        source
+            .persist_new(&[Message::user("source message")])
+            .await
+            .unwrap();
+
+        configure_session_faults(&storage, true, 1);
+        fork_session(&storage_str, &source_id).await.unwrap_err();
+        let fork_id = indexed_fork_id(&storage, &source_id);
+        let marker = storage
+            .join(".session-lifecycle")
+            .join("pending-forks")
+            .join(format!("{fork_id}.pending"));
+
+        clear_module_state_for_root(&storage).await;
+        configure_session_faults(&storage, false, 2);
+        for _ in 0..2 {
+            let err = match list_sessions(&storage_str).await {
+                Ok(_) => panic!("pending-fork recovery failure must fail the list"),
+                Err(err) => err,
+            };
+            assert!(err
+                .to_string()
+                .contains("injected session index deletion failure"));
+            assert!(index_store(&storage)
+                .unwrap()
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == fork_id));
+            assert!(transcript_file(&storage, &fork_id).exists());
+            assert!(familiar_file(&storage, &fork_id).exists());
+            assert!(marker.exists());
+        }
+
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, source_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_pending_fork_uses_ordered_quarantine_cleanup() {
+        let storage = test_storage("fork-pending-delete");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source = SessionPersistence::create(
+            &storage_str,
+            source_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        source
+            .persist_new(&[Message::user("source message")])
+            .await
+            .unwrap();
+
+        configure_session_faults(&storage, true, 1);
+        fork_session(&storage_str, &source_id).await.unwrap_err();
+        let fork_id = indexed_fork_id(&storage, &source_id);
+        let marker = pending_fork_marker(&storage, &fork_id);
+
+        clear_module_state_for_root(&storage).await;
+        configure_session_faults(&storage, false, 1);
+        let err = delete_session(&storage_str, &fork_id).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected session index deletion failure"));
+        assert!(transcript_file(&storage, &fork_id).exists());
+        assert!(familiar_file(&storage, &fork_id).exists());
+        assert!(marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        delete_session(&storage_str, &fork_id).await.unwrap();
+        assert!(!index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == fork_id));
+        assert!(!transcript_file(&storage, &fork_id).exists());
+        assert!(!familiar_file(&storage, &fork_id).exists());
+        assert!(!marker.exists());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
