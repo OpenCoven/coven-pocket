@@ -73,6 +73,29 @@ enum ChatFamiliarProfile {
         }
         return model.selectedFamiliar?.id
     }
+
+    @MainActor
+    static func settingsForCodexResume(
+        current: ChatSettings,
+        codexProfileID: String?,
+        defaultModel: String,
+        model: FamiliarSelectionModel
+    ) -> ChatSettings? {
+        guard let codexProfileID, !codexProfileID.isEmpty else {
+            return nil
+        }
+
+        var prepared = current
+        prepared.backend = .codex
+        if prepared.model.isEmpty {
+            prepared.model = defaultModel
+        }
+        prepared.familiarID = synchronize(
+            .codex(profileID: codexProfileID),
+            model: model
+        )
+        return prepared
+    }
 }
 
 /// Answer sink for one approval request. `ChatPermissionResponder` conforms;

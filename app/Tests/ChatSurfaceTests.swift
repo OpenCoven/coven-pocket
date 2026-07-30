@@ -4,8 +4,29 @@ import XCTest
 // Chat surface coverage is kept together to share the deterministic session seam.
 // swiftlint:disable file_length
 
+@MainActor
+private final class NoopFamiliarRosterClient: FamiliarRosterClient {
+    func gate() async -> CompanionModel.SessionGate {
+        .notPaired
+    }
+
+    func familiars(pairing: DaemonPairing) async throws -> [RemoteFamiliar] {
+        []
+    }
+}
+
 // swiftlint:disable:next type_body_length
 final class ChatSurfaceTests: XCTestCase {
+    private struct SpotlightResumePreparation {
+        let suiteName: String
+        let defaults: UserDefaults
+        let store: FamiliarSelectionStore
+        let familiarModel: FamiliarSelectionModel
+        let settings: ChatSettings
+        let codexProfile: FamiliarProfileKey
+        let forge: FamiliarIdentity
+    }
+
     private final class StubChatSession: ChatSession, @unchecked Sendable {
         private let transcriptMessages: [ChatMessage]
 
@@ -872,6 +893,94 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testSpotlightPreparationResumesSageAndReusesWithForgeSettings() async throws {
+        let preparation = try makeSpotlightResumePreparation(modelName: "")
+        defer {
+            preparation.defaults.removePersistentDomain(
+                forName: preparation.suiteName
+            )
+        }
+
+        XCTAssertEqual(preparation.settings.backend, .codex)
+        XCTAssertEqual(preparation.settings.model, "codex-default")
+        XCTAssertEqual(preparation.settings.familiarID, "forge")
+        XCTAssertEqual(
+            preparation.familiarModel.activeProfile,
+            preparation.codexProfile
+        )
+        XCTAssertEqual(
+            preparation.familiarModel.selectedFamiliar,
+            preparation.forge
+        )
+
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+
+        let resumed = await model.resume(
+            makeSummary(familiar: sage),
+            settings: preparation.settings
+        )
+        XCTAssertTrue(resumed)
+        await model.send(
+            prompt: "continue",
+            settings: preparation.settings,
+            selectedFamiliar: preparation.familiarModel.selectedFamiliar
+        )
+
+        XCTAssertEqual(boundary.resumeCallCount, 1)
+        XCTAssertEqual(boundary.startCallCount, 0)
+        XCTAssertEqual(model.activeFamiliar, sage)
+        XCTAssertEqual(
+            try preparation.store.load(for: preparation.codexProfile),
+            preparation.forge
+        )
+    }
+
+    @MainActor
+    func testSpotlightPreparationResumesIdentitylessAndReusesWithForgeSettings() async throws {
+        let preparation = try makeSpotlightResumePreparation(
+            modelName: "codex-current"
+        )
+        defer {
+            preparation.defaults.removePersistentDomain(
+                forName: preparation.suiteName
+            )
+        }
+
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+
+        let resumed = await model.resume(
+            makeSummary(familiar: nil),
+            settings: preparation.settings
+        )
+        XCTAssertTrue(resumed)
+        await model.send(
+            prompt: "continue",
+            settings: preparation.settings,
+            selectedFamiliar: preparation.familiarModel.selectedFamiliar
+        )
+
+        XCTAssertEqual(preparation.settings.backend, .codex)
+        XCTAssertEqual(preparation.settings.model, "codex-current")
+        XCTAssertEqual(preparation.settings.familiarID, "forge")
+        XCTAssertEqual(boundary.resumeCallCount, 1)
+        XCTAssertEqual(boundary.startCallCount, 0)
+        XCTAssertNil(model.activeFamiliar)
+        XCTAssertEqual(
+            preparation.familiarModel.activeProfile,
+            preparation.codexProfile
+        )
+        XCTAssertEqual(
+            try preparation.store.load(for: preparation.codexProfile),
+            preparation.forge
+        )
+    }
+
+    @MainActor
     func testFailedResumeReturnsFalseWithoutPublishingFamiliar() async {
         enum ResumeFailure: LocalizedError {
             case failed
@@ -1051,6 +1160,51 @@ final class ChatSurfaceTests: XCTestCase {
             updatedAt: updatedAt,
             messageCount: 2,
             familiar: familiar
+        )
+    }
+
+    @MainActor
+    private func makeSpotlightResumePreparation(
+        modelName: String
+    ) throws -> SpotlightResumePreparation {
+        let suiteName = "spotlight-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let store = FamiliarSelectionStore(defaults: defaults)
+        let companionProfile = FamiliarProfileKey.companion(
+            host: "mac.local",
+            port: 7001
+        )
+        let codexProfile = FamiliarProfileKey.codex(profileID: "profile-a")
+        let owl = familiarIdentity(id: "owl", name: "Owl")
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+        try store.save(owl, for: companionProfile)
+        try store.save(forge, for: codexProfile)
+        let familiarModel = FamiliarSelectionModel(
+            client: NoopFamiliarRosterClient(),
+            store: store
+        )
+        familiarModel.activate(companionProfile)
+        let prepared = try XCTUnwrap(
+            ChatFamiliarProfile.settingsForCodexResume(
+                current: ChatSettings(
+                    backend: .companionClaude,
+                    model: modelName,
+                    daemonProjectRoot: "/companion",
+                    familiarID: "owl"
+                ),
+                codexProfileID: "profile-a",
+                defaultModel: "codex-default",
+                model: familiarModel
+            )
+        )
+        return SpotlightResumePreparation(
+            suiteName: suiteName,
+            defaults: defaults,
+            store: store,
+            familiarModel: familiarModel,
+            settings: prepared,
+            codexProfile: codexProfile,
+            forge: forge
         )
     }
 

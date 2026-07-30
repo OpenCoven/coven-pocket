@@ -212,11 +212,13 @@ private extension ChatView {
     /// switches to Codex rather than acting as an error fallback.
     private func consumeRouterSession() async {
         guard let sessionID = router.consumeSessionID() else { return }
-        settings.backend = .codex
-        if settings.model.isEmpty {
-            settings.model = client.defaultCodexModel
-        }
-        let currentSettings = settings
+        guard let currentSettings = ChatFamiliarProfile.settingsForCodexResume(
+            current: settings,
+            codexProfileID: client.codexAccount?.profileId,
+            defaultModel: client.defaultCodexModel,
+            model: familiarModel
+        ) else { return }
+        settings = currentSettings
         Task {
             guard
                 let summary = await model.storedSessions()

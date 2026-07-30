@@ -207,6 +207,93 @@ final class FamiliarSelectionTests: XCTestCase {
         }
     }
 
+    func testCodexResumeSettingsSynchronizeProfileBeforeCapture() throws {
+        try withDefaults { defaults in
+            let store = FamiliarSelectionStore(defaults: defaults)
+            let companion = FamiliarProfileKey.companion(
+                host: "mac.local",
+                port: 7001
+            )
+            let codex = FamiliarProfileKey.codex(profileID: "profile-a")
+            let owl = familiarIdentity(id: "owl", name: "Owl")
+            let forge = familiarIdentity(id: "forge", name: "Forge")
+            try store.save(owl, for: companion)
+            try store.save(forge, for: codex)
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+            model.activate(companion)
+            let current = ChatSettings(
+                backend: .companionClaude,
+                model: "",
+                daemonProjectRoot: "/companion",
+                familiarID: "owl"
+            )
+
+            let prepared = try XCTUnwrap(
+                ChatFamiliarProfile.settingsForCodexResume(
+                    current: current,
+                    codexProfileID: "profile-a",
+                    defaultModel: "codex-default",
+                    model: model
+                )
+            )
+
+            XCTAssertEqual(
+                current,
+                ChatSettings(
+                    backend: .companionClaude,
+                    model: "",
+                    daemonProjectRoot: "/companion",
+                    familiarID: "owl"
+                )
+            )
+            XCTAssertEqual(prepared.backend, .codex)
+            XCTAssertEqual(prepared.model, "codex-default")
+            XCTAssertEqual(prepared.familiarID, "forge")
+            XCTAssertEqual(model.activeProfile, codex)
+            XCTAssertEqual(model.selectedFamiliar, forge)
+            XCTAssertEqual(try store.load(for: companion), owl)
+            XCTAssertEqual(try store.load(for: codex), forge)
+        }
+    }
+
+    func testCodexResumeSettingsWithoutProfilePreserveCompanionState() throws {
+        try withDefaults { defaults in
+            let store = FamiliarSelectionStore(defaults: defaults)
+            let companion = FamiliarProfileKey.companion(
+                host: "mac.local",
+                port: 7001
+            )
+            let owl = familiarIdentity(id: "owl", name: "Owl")
+            try store.save(owl, for: companion)
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+            model.activate(companion)
+            let current = ChatSettings(
+                backend: .companionClaude,
+                model: "",
+                daemonProjectRoot: "/companion",
+                familiarID: "owl"
+            )
+
+            XCTAssertNil(
+                ChatFamiliarProfile.settingsForCodexResume(
+                    current: current,
+                    codexProfileID: nil,
+                    defaultModel: "codex-default",
+                    model: model
+                )
+            )
+            XCTAssertEqual(model.activeProfile, companion)
+            XCTAssertEqual(model.selectedFamiliar, owl)
+            XCTAssertEqual(try store.load(for: companion), owl)
+        }
+    }
+
     func testSameProfileSyncPreservesPinnedLiveSessionSetting() throws {
         try withDefaults { defaults in
             let profile = FamiliarProfileKey.codex(profileID: "profile-a")
