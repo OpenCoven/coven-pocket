@@ -893,6 +893,7 @@ final class ChatSurfaceTests: XCTestCase {
         )
         let secondResume = await model.resume(summary, settings: replacementSettings)
         XCTAssertTrue(secondResume)
+        XCTAssertFalse(model.isBusy)
         XCTAssertEqual(boundary.resumeCallCount, 1)
         XCTAssertEqual(model.items.map(\.id), preservedItemIDs)
         XCTAssertEqual(model.items.map(\.text), preservedItemTexts)
@@ -905,6 +906,49 @@ final class ChatSurfaceTests: XCTestCase {
             selectedFamiliar: familiarIdentity(id: "forge", name: "Forge")
         )
         XCTAssertEqual(boundary.startCallCount, 0)
+    }
+
+    @MainActor
+    func testSelectingLiveSessionWhileReplacementIsBusyReturnsFalse() async {
+        let boundary = SessionBoundary()
+        let summaryA = makeSummary()
+        boundary.resumeSessions = [
+            StubChatSession(sessionIdentifier: summaryA.sessionId)
+        ]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let settingsA = ChatSettings(
+            backend: .codex,
+            model: "session-a"
+        )
+
+        let installed = await model.resume(summaryA, settings: settingsA)
+        XCTAssertTrue(installed)
+        XCTAssertEqual(boundary.resumeCallCount, 1)
+
+        let sessionB = StubChatSession(sessionIdentifier: "session-b")
+        boundary.suspendNextStart = true
+        let replacement = Task {
+            await model.send(
+                prompt: "replace",
+                settings: ChatSettings(
+                    backend: .codex,
+                    model: "session-b"
+                )
+            )
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+        XCTAssertTrue(model.isBusy)
+
+        let selectedA = await model.resume(summaryA, settings: settingsA)
+        XCTAssertFalse(selectedA)
+        XCTAssertEqual(boundary.resumeCallCount, 1)
+
+        boundary.finishStart(with: sessionB)
+        await replacement.value
+
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(model.activeSessionID, "session-b")
+        XCTAssertEqual(model.items.map(\.text), ["replace"])
     }
 
     @MainActor

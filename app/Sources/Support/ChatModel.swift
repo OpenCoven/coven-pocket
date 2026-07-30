@@ -328,11 +328,11 @@ final class ChatModel: ObservableObject {
         _ summary: ChatSessionSummary,
         settings: ChatSettings
     ) async -> Bool {
+        guard let generation = claimOperation() else { return false }
+        defer { finishOperation(generation: generation) }
         if session != nil, activeSessionID == summary.sessionId {
             return true
         }
-        guard let generation = claimOperation() else { return false }
-        defer { finishOperation(generation: generation) }
 
         do {
             let resumedSettings = Self.settingsForResume(
