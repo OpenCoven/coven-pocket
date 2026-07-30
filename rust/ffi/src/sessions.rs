@@ -2553,7 +2553,7 @@ fn cleanup_session_artifacts(
     if let Err(err) = remove_fork_staging_artifacts(storage, session_id) {
         errors.push(err.to_string());
     }
-    if marker == SessionCleanupMarker::PendingDeletion && preflight.pending_fork_marker_exists {
+    if marker == SessionCleanupMarker::PendingDeletion {
         if let Err(err) = remove_pending_fork_marker_checked(storage, session_id, true) {
             errors.push(err.to_string());
         }
@@ -5595,6 +5595,74 @@ mod tests {
             Some(SessionLifecycleState::Tombstoned)
         ));
 
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_retry_resyncs_unlinked_fork_marker_before_completion() {
+        let storage = test_storage("pending-deletion-fork-marker-sync-retry");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let checked_storage = CheckedStorage::from_root(&storage).unwrap();
+        create_pending_fork_marker_checked(&checked_storage, &session_id).unwrap();
+        create_pending_deletion_marker_checked(&checked_storage, &session_id).unwrap();
+        let fork_directory = pending_forks_dir(&storage);
+        let fork_marker = pending_fork_marker(&storage, &session_id);
+        let deletion_marker = pending_deletion_marker(&storage, &session_id);
+        let fork_sync_count = || {
+            DIRECTORY_SYNC_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|path| path.as_path() == fork_directory)
+                .count()
+        };
+
+        clear_module_state_for_root(&storage).await;
+        fail_directory_sync(&fork_directory, 1);
+        let first_err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("pending-fork marker removal sync failure must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(first_err
+            .to_string()
+            .contains("cannot sync pending fork marker removal"));
+        assert!(first_err
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert!(!fork_marker.exists());
+        assert!(deletion_marker.exists());
+        assert!(!index_contains(&storage, &session_id));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!familiar_file(&storage, &session_id).exists());
+        assert!(!fork_staging_dir(&storage, &session_id).exists());
+        let syncs_after_first_failure = fork_sync_count();
+
+        clear_module_state_for_root(&storage).await;
+        fail_directory_sync(&fork_directory, 1);
+        let retry_err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("absent pending-fork marker sync failure must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(retry_err
+            .to_string()
+            .contains("cannot sync absent pending fork marker"));
+        assert!(retry_err
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert_eq!(fork_sync_count(), syncs_after_first_failure + 1);
+        assert!(!fork_marker.exists());
+        assert!(deletion_marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        let syncs_before_success = fork_sync_count();
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+
+        assert_eq!(fork_sync_count(), syncs_before_success + 1);
+        assert_deletion_targets_absent(&storage, &session_id);
         std::fs::remove_dir_all(storage).unwrap();
     }
 
