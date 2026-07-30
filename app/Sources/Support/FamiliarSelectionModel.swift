@@ -178,11 +178,6 @@ final class FamiliarSelectionModel: ObservableObject {
         case failed(reason: String)
     }
 
-    private struct RefreshFailure {
-        let profile: FamiliarProfileKey
-        let reason: String
-    }
-
     private struct RefreshSnapshot {
         let roster: [RemoteFamiliar]
         let state: State
@@ -192,7 +187,7 @@ final class FamiliarSelectionModel: ObservableObject {
         let endpointRosterCache: [FamiliarProfileKey: [RemoteFamiliar]]
         let latestValidatedRoster: [RemoteFamiliar]?
         let storeFailureReason: String?
-        let lastRefreshFailure: RefreshFailure?
+        let refreshFailures: [FamiliarProfileKey: String]
     }
 
     @Published private(set) var roster: [RemoteFamiliar] = []
@@ -210,7 +205,7 @@ final class FamiliarSelectionModel: ObservableObject {
     ] = [:]
     private var latestValidatedRoster: [RemoteFamiliar]?
     private var storeFailureReason: String?
-    private var lastRefreshFailure: RefreshFailure?
+    private var refreshFailures: [FamiliarProfileKey: String] = [:]
     private var refreshSnapshotInFlight: RefreshSnapshot?
 
     init(
@@ -237,15 +232,11 @@ final class FamiliarSelectionModel: ObservableObject {
             activeProfile = nil
             selectedFamiliar = nil
             storeFailureReason = nil
-            lastRefreshFailure = nil
             state = .idle
             return
         }
 
         let normalizedProfile = profile.normalized
-        if activeProfile != normalizedProfile {
-            lastRefreshFailure = nil
-        }
         activeProfile = normalizedProfile
         publishCachedRoster(for: normalizedProfile)
         restoreSelection(
@@ -359,9 +350,6 @@ final class FamiliarSelectionModel: ObservableObject {
         let endpoint = FamiliarProfileKey.companion(pairing: pairing)
         companionProfile = endpoint
         if case .companion = activeProfile {
-            if activeProfile != endpoint {
-                lastRefreshFailure = nil
-            }
             activeProfile = endpoint
         }
         publishRosterForReadyEndpoint(endpoint)
@@ -376,7 +364,7 @@ final class FamiliarSelectionModel: ObservableObject {
                 return false
             }
             refreshSnapshotInFlight = nil
-            lastRefreshFailure = nil
+            clearRefreshFailures(for: endpoint)
             let sorted = Self.sorted(fetched)
             endpointRosterCache[endpoint] = sorted
             latestValidatedRoster = sorted
@@ -391,7 +379,10 @@ final class FamiliarSelectionModel: ObservableObject {
                 return false
             }
             refreshSnapshotInFlight = nil
-            publishRefreshFailure(error.localizedDescription)
+            publishRefreshFailure(
+                error.localizedDescription,
+                readyEndpoint: endpoint
+            )
             return true
         }
     }
@@ -406,7 +397,7 @@ final class FamiliarSelectionModel: ObservableObject {
             endpointRosterCache: endpointRosterCache,
             latestValidatedRoster: latestValidatedRoster,
             storeFailureReason: storeFailureReason,
-            lastRefreshFailure: lastRefreshFailure
+            refreshFailures: refreshFailures
         )
     }
 
@@ -419,7 +410,7 @@ final class FamiliarSelectionModel: ObservableObject {
         endpointRosterCache = snapshot.endpointRosterCache
         latestValidatedRoster = snapshot.latestValidatedRoster
         storeFailureReason = snapshot.storeFailureReason
-        lastRefreshFailure = snapshot.lastRefreshFailure
+        refreshFailures = snapshot.refreshFailures
     }
 
     private func publishRosterForReadyEndpoint(
@@ -443,18 +434,18 @@ final class FamiliarSelectionModel: ObservableObject {
         case .codex:
             if let latestValidatedRoster {
                 roster = latestValidatedRoster
-                state = .loaded
+                publishCachedState(for: profile, fallback: .loaded)
             } else {
                 roster = []
-                state = .idle
+                publishCachedState(for: profile, fallback: .idle)
             }
         case .companion:
             if let cached = endpointRosterCache[profile] {
                 roster = cached
-                state = .loaded
+                publishCachedState(for: profile, fallback: .loaded)
             } else {
                 roster = []
-                state = .idle
+                publishCachedState(for: profile, fallback: .idle)
             }
         }
     }
@@ -518,35 +509,69 @@ final class FamiliarSelectionModel: ObservableObject {
         }
     }
 
-    private func publishRefreshFailure(_ reason: String) {
-        if let activeProfile {
-            lastRefreshFailure = RefreshFailure(
-                profile: activeProfile,
-                reason: reason
-            )
+    private func publishRefreshFailure(
+        _ reason: String,
+        readyEndpoint: FamiliarProfileKey? = nil
+    ) {
+        if let profile = refreshFailureProfile(
+            readyEndpoint: readyEndpoint
+        ) {
+            refreshFailures[profile] = reason
         }
         state = .failed(reason: storeFailureReason ?? reason)
     }
 
     private func restoreRefreshFailure(for profile: FamiliarProfileKey) {
         guard storeFailureReason == nil,
-              let lastRefreshFailure,
-              lastRefreshFailure.profile == profile else {
+              let reason = refreshFailures[profile.normalized] else {
             return
         }
-        state = .failed(reason: lastRefreshFailure.reason)
+        state = .failed(reason: reason)
     }
 
     private func publishSuccessfulSelectionState(
         for profile: FamiliarProfileKey,
         fallback: State
     ) {
-        guard let lastRefreshFailure,
-              lastRefreshFailure.profile == profile else {
+        guard let reason = refreshFailures[profile.normalized] else {
             state = fallback
             return
         }
-        state = .failed(reason: lastRefreshFailure.reason)
+        state = .failed(reason: reason)
+    }
+
+    private func publishCachedState(
+        for profile: FamiliarProfileKey,
+        fallback: State
+    ) {
+        guard let reason = refreshFailures[profile.normalized] else {
+            state = fallback
+            return
+        }
+        state = .failed(reason: reason)
+    }
+
+    private func clearRefreshFailures(
+        for readyEndpoint: FamiliarProfileKey
+    ) {
+        refreshFailures.removeValue(forKey: readyEndpoint.normalized)
+        guard let activeProfile, case .codex = activeProfile else { return }
+        refreshFailures.removeValue(forKey: activeProfile)
+    }
+
+    private func refreshFailureProfile(
+        readyEndpoint: FamiliarProfileKey?
+    ) -> FamiliarProfileKey? {
+        guard let activeProfile else {
+            return readyEndpoint?.normalized
+        }
+
+        switch activeProfile {
+        case .codex:
+            return activeProfile
+        case .companion:
+            return (readyEndpoint ?? activeProfile).normalized
+        }
     }
 
     private func publishStoreFailure(_ error: Error) {
