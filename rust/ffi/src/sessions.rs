@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Weak};
 
 use claurst_core::session_storage::{
     load_transcript, make_assistant_entry, make_user_entry, messages_from_transcript,
@@ -35,12 +35,16 @@ struct SessionKey {
     session_id: String,
 }
 
-#[derive(Clone, Copy)]
 enum SessionLifecycleState {
-    Active(uuid::Uuid),
+    Active {
+        generation: uuid::Uuid,
+        writer: Weak<SessionWriterLease>,
+    },
     PendingFork,
     Tombstoned,
 }
+
+struct SessionWriterLease;
 
 #[derive(Default)]
 struct SessionLifecycle {
@@ -234,11 +238,13 @@ fn ensure_persistence_active(
     generation: uuid::Uuid,
 ) -> Result<(), PocketError> {
     match lifecycle.sessions.get(key) {
-        Some(SessionLifecycleState::Active(active)) if *active == generation => Ok(()),
+        Some(SessionLifecycleState::Active {
+            generation: active, ..
+        }) if *active == generation => Ok(()),
         Some(SessionLifecycleState::Tombstoned) => Err(PocketError::Engine {
             message: format!("session {} was deleted", key.session_id),
         }),
-        Some(SessionLifecycleState::Active(_))
+        Some(SessionLifecycleState::Active { .. })
         | Some(SessionLifecycleState::PendingFork)
         | None => Err(PocketError::Engine {
             message: format!(
@@ -687,6 +693,7 @@ fn derive_title(messages: &[Message]) -> String {
 pub(crate) struct SessionPersistence {
     key: SessionKey,
     generation: uuid::Uuid,
+    _writer_lease: Arc<SessionWriterLease>,
     model: String,
     state: tokio::sync::Mutex<PersistState>,
 }
@@ -708,8 +715,8 @@ impl SessionPersistence {
         let key = session_key(&root, &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
         recover_pending_forks_unlocked(&root, &mut lifecycle)?;
-        match lifecycle.sessions.get(&key).copied() {
-            Some(SessionLifecycleState::Active(_)) => {
+        match lifecycle.sessions.get(&key) {
+            Some(SessionLifecycleState::Active { .. }) => {
                 return Err(PocketError::Engine {
                     message: format!("generated session id collision: {session_id}"),
                 });
@@ -730,12 +737,18 @@ impl SessionPersistence {
         }
         save_familiar_metadata_at_root(&root, &session_id, familiar)?;
         let generation = uuid::Uuid::new_v4();
-        lifecycle
-            .sessions
-            .insert(key.clone(), SessionLifecycleState::Active(generation));
+        let writer_lease = Arc::new(SessionWriterLease);
+        lifecycle.sessions.insert(
+            key.clone(),
+            SessionLifecycleState::Active {
+                generation,
+                writer: Arc::downgrade(&writer_lease),
+            },
+        );
         Ok(Self {
             key,
             generation,
+            _writer_lease: writer_lease,
             model,
             state: tokio::sync::Mutex::new(PersistState {
                 persisted: 0,
@@ -755,31 +768,29 @@ impl SessionPersistence {
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
         recover_pending_forks_unlocked(&root, &mut lifecycle)?;
         ensure_session_available(&lifecycle, &key)?;
+        if matches!(
+            lifecycle.sessions.get(&key),
+            Some(SessionLifecycleState::Active { writer, .. }) if writer.upgrade().is_some()
+        ) {
+            return Err(PocketError::Engine {
+                message: format!("session {session_id} is already open for writing"),
+            });
+        }
         let (messages, last_uuid) = load_session_messages_at_root(&root, &session_id).await?;
         let familiar = load_familiar_metadata_at_root(&root, &session_id)?;
-        let generation = match lifecycle.sessions.get(&key).copied() {
-            Some(SessionLifecycleState::Active(generation)) => generation,
-            Some(SessionLifecycleState::Tombstoned) => {
-                return Err(PocketError::Engine {
-                    message: format!("session {session_id} was deleted"),
-                });
-            }
-            Some(SessionLifecycleState::PendingFork) => {
-                return Err(PocketError::Engine {
-                    message: format!("session {session_id} is quarantined pending fork recovery"),
-                });
-            }
-            None => {
-                let generation = uuid::Uuid::new_v4();
-                lifecycle
-                    .sessions
-                    .insert(key.clone(), SessionLifecycleState::Active(generation));
-                generation
-            }
-        };
+        let generation = uuid::Uuid::new_v4();
+        let writer_lease = Arc::new(SessionWriterLease);
+        lifecycle.sessions.insert(
+            key.clone(),
+            SessionLifecycleState::Active {
+                generation,
+                writer: Arc::downgrade(&writer_lease),
+            },
+        );
         let persistence = Self {
             key,
             generation,
+            _writer_lease: writer_lease,
             model,
             state: tokio::sync::Mutex::new(PersistState {
                 persisted: messages.len(),
@@ -1319,7 +1330,7 @@ async fn fork_session_unlocked(
     let key = session_key(root, &new_id);
     if matches!(
         lifecycle.sessions.get(&key),
-        Some(SessionLifecycleState::Active(_) | SessionLifecycleState::PendingFork)
+        Some(SessionLifecycleState::Active { .. } | SessionLifecycleState::PendingFork)
     ) {
         return Err(PocketError::Engine {
             message: format!("generated fork session id collision: {new_id}"),
@@ -1504,9 +1515,13 @@ async fn fork_session_unlocked(
             &key,
         ));
     }
-    lifecycle
-        .sessions
-        .insert(key, SessionLifecycleState::Active(uuid::Uuid::new_v4()));
+    lifecycle.sessions.insert(
+        key,
+        SessionLifecycleState::Active {
+            generation: uuid::Uuid::new_v4(),
+            writer: Weak::new(),
+        },
+    );
     stage.published_transcript = None;
     stage.published_metadata = None;
     stage.index_may_exist = false;
@@ -2071,6 +2086,24 @@ mod tests {
         assert!(!transcript_file(&storage, &session_id).exists());
         assert!(!familiar_file(&storage, &session_id).exists());
 
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &session_id)),
+            Some(SessionLifecycleState::Tombstoned)
+        ));
+        drop(persistence);
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &session_id)),
+            Some(SessionLifecycleState::Tombstoned)
+        ));
+
         std::fs::remove_dir_all(storage).unwrap();
     }
 
@@ -2189,6 +2222,126 @@ mod tests {
         std::fs::remove_dir_all(storage).unwrap();
     }
 
+    #[tokio::test]
+    async fn fork_destination_allows_one_writer_resume() {
+        let storage = test_storage("fork-single-writer");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source =
+            SessionPersistence::create(&storage_str, source_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        source
+            .persist_new(&[
+                Message::user("source message"),
+                Message::assistant("source response"),
+            ])
+            .await
+            .unwrap();
+
+        let fork_id = fork_session(&storage_str, &source_id).await.unwrap();
+        let (winner, _, _) =
+            SessionPersistence::resume(&storage_str, fork_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        let loser =
+            match SessionPersistence::resume(&storage_str, fork_id.clone(), "model".to_string())
+                .await
+            {
+                Ok(_) => panic!("a second fork writer resume must be rejected"),
+                Err(err) => err,
+            };
+
+        assert!(loser
+            .to_string()
+            .contains(&format!("session {fork_id} is already open for writing")));
+        drop(winner);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_resumes_grant_one_writer_and_preserve_linear_chain() {
+        let storage = test_storage("resume-single-writer");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let original =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        original
+            .persist_new(&[
+                Message::user("first message"),
+                Message::assistant("first response"),
+            ])
+            .await
+            .unwrap();
+        drop(original);
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_storage = storage_str.clone();
+        let first_id = session_id.clone();
+        let first = tokio::spawn(async move {
+            first_barrier.wait().await;
+            SessionPersistence::resume(&first_storage, first_id, "model".to_string()).await
+        });
+        let second_barrier = barrier.clone();
+        let second_storage = storage_str.clone();
+        let second_id = session_id.clone();
+        let second = tokio::spawn(async move {
+            second_barrier.wait().await;
+            SessionPersistence::resume(&second_storage, second_id, "model".to_string()).await
+        });
+        barrier.wait().await;
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        let ((winner, mut messages, _), loser) = match (first, second) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            (Ok(_), Ok(_)) => panic!("both concurrent resumes claimed a writer"),
+            (Err(first), Err(second)) => {
+                panic!("both concurrent resumes failed: {first}; {second}")
+            }
+        };
+        assert!(loser
+            .to_string()
+            .contains(&format!("session {session_id} is already open for writing")));
+
+        messages.push(Message::user("winner follow-up"));
+        winner.persist_new(&messages).await.unwrap();
+
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        let first_uuid = match &entries[0] {
+            TranscriptEntry::User(message) => {
+                assert!(message.parent_uuid.is_none());
+                message.uuid.as_deref().unwrap()
+            }
+            _ => panic!("first transcript entry must be a user message"),
+        };
+        let second_uuid = match &entries[1] {
+            TranscriptEntry::Assistant(message) => {
+                assert_eq!(message.parent_uuid.as_deref(), Some(first_uuid));
+                message.uuid.as_deref().unwrap()
+            }
+            _ => panic!("second transcript entry must be an assistant message"),
+        };
+        match &entries[2] {
+            TranscriptEntry::User(message) => {
+                assert_eq!(message.parent_uuid.as_deref(), Some(second_uuid));
+            }
+            _ => panic!("third transcript entry must be a user message"),
+        }
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 3);
+
+        drop(winner);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
     async fn assert_fork_directory_sync_failure_rolls_back(
         label: &str,
         directory_name: &str,
@@ -2256,7 +2409,7 @@ mod tests {
         );
         assert!(matches!(
             lifecycle.sessions.get(&session_key(&storage, &source_id)),
-            Some(SessionLifecycleState::Active(_))
+            Some(SessionLifecycleState::Active { .. })
         ));
         drop(lifecycle);
 
@@ -2712,6 +2865,7 @@ mod tests {
             .await
             .unwrap();
         save_familiar_metadata(&storage_str, &source_id, Some(&familiar())).unwrap();
+        drop(persistence);
 
         let write_guard = SESSION_LIFECYCLE_LOCK.write().await;
         let (resume_started_tx, resume_started_rx) = tokio::sync::oneshot::channel();

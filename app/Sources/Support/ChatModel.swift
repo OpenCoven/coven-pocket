@@ -67,6 +67,7 @@ final class ChatModel: ObservableObject {
     @Published var isBusy = false
     @Published var canRetry = false
     @Published private(set) var activeFamiliar: FamiliarIdentity?
+    @Published private(set) var activeSessionID: String?
     /// The approval sheet currently on screen, if any.
     @Published var pendingApproval: PendingApproval?
     /// Applies to the live session immediately; changing it never restarts
@@ -240,6 +241,7 @@ final class ChatModel: ObservableObject {
         sessionReplacementSettings = nil
         sessionWorkspace = nil
         activeFamiliar = nil
+        activeSessionID = nil
         items = []
         canRetry = false
         // Dropping unanswered responders denies their tool calls.
@@ -296,6 +298,7 @@ final class ChatModel: ObservableObject {
         sessionReplacementSettings = settings
         sessionWorkspace = workspace.path
         activeFamiliar = familiar
+        activeSessionID = fresh.sessionId()
         return fresh
     }
 
@@ -325,6 +328,9 @@ final class ChatModel: ObservableObject {
         _ summary: ChatSessionSummary,
         settings: ChatSettings
     ) async -> Bool {
+        if session != nil, activeSessionID == summary.sessionId {
+            return true
+        }
         guard let generation = claimOperation() else { return false }
         defer { finishOperation(generation: generation) }
 
@@ -360,6 +366,7 @@ final class ChatModel: ObservableObject {
             sessionReplacementSettings = settings
             sessionWorkspace = workspace.path
             activeFamiliar = summary.familiar
+            activeSessionID = summary.sessionId
             items = Self.items(fromTranscript: transcript)
             return true
         } catch {

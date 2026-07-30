@@ -1715,6 +1715,8 @@ mod tests {
         let storage_str = storage.display().to_string();
 
         let original = persisted_session(&storage, &workspace).await;
+        let session_id = original.session_id();
+        drop(original);
         let resumed = resume_session(
             PocketProvider::Anthropic,
             "key".to_string(),
@@ -1723,13 +1725,13 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             storage_str.clone(),
-            original.session_id(),
+            session_id.clone(),
             false,
         )
         .await
         .unwrap();
 
-        assert_eq!(resumed.session_id(), original.session_id());
+        assert_eq!(resumed.session_id(), session_id);
         let transcript = resumed.transcript().await;
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].role, "user");
@@ -1748,6 +1750,72 @@ mod tests {
         let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].message_count, 3);
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn newly_started_session_blocks_resume_until_all_arcs_drop() {
+        let storage = temp_dir("store-writer-lease");
+        let workspace = temp_dir("ws-writer-lease");
+        let storage_str = storage.display().to_string();
+        let original = persisted_session(&storage, &workspace).await;
+        let surviving_clone = original.clone();
+        let session_id = original.session_id();
+
+        let first_error = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str.clone(),
+            session_id.clone(),
+            false,
+        )
+        .await
+        .err()
+        .expect("a newly started session must retain its writer lease");
+        assert!(first_error
+            .to_string()
+            .contains(&format!("session {session_id} is already open for writing")));
+
+        drop(original);
+        let clone_error = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str.clone(),
+            session_id.clone(),
+            false,
+        )
+        .await
+        .err()
+        .expect("a surviving ChatSession Arc must retain the writer lease");
+        assert!(clone_error
+            .to_string()
+            .contains(&format!("session {session_id} is already open for writing")));
+
+        drop(surviving_clone);
+        let resumed = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str,
+            session_id.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.session_id(), session_id);
 
         let _ = std::fs::remove_dir_all(&storage);
         let _ = std::fs::remove_dir_all(&workspace);
@@ -1778,6 +1846,8 @@ mod tests {
             messages.push(Message::user("remember me"));
             original.persist_new(&messages, &delegate).await;
         }
+        let session_id = original.session_id();
+        drop(original);
 
         let resumed = resume_session(
             PocketProvider::Anthropic,
@@ -1787,7 +1857,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Plan,
             storage_str,
-            original.session_id(),
+            session_id,
             false,
         )
         .await
@@ -1809,11 +1879,13 @@ mod tests {
         let workspace = temp_dir("ws-resume-malformed");
         let storage_str = storage.display().to_string();
         let original = persisted_session(&storage, &workspace).await;
+        let session_id = original.session_id();
         let metadata = storage
             .join("metadata")
-            .join(format!("{}.familiar.json", original.session_id()));
+            .join(format!("{session_id}.familiar.json"));
         std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
         std::fs::write(metadata, b"not-json").unwrap();
+        drop(original);
 
         let err = resume_session(
             PocketProvider::Anthropic,
@@ -1823,7 +1895,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Plan,
             storage_str,
-            original.session_id(),
+            session_id,
             false,
         )
         .await

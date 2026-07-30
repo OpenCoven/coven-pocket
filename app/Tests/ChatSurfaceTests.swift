@@ -29,14 +29,20 @@ final class ChatSurfaceTests: XCTestCase {
 
     private final class StubChatSession: ChatSession, @unchecked Sendable {
         private let transcriptMessages: [ChatMessage]
+        private let sessionIdentifier: String
 
-        init(transcript: [ChatMessage] = []) {
+        init(
+            transcript: [ChatMessage] = [],
+            sessionIdentifier: String = UUID().uuidString
+        ) {
             transcriptMessages = transcript
+            self.sessionIdentifier = sessionIdentifier
             super.init(noHandle: ChatSession.NoHandle())
         }
 
         required init(unsafeFromHandle handle: UInt64) {
             transcriptMessages = []
+            sessionIdentifier = UUID().uuidString
             super.init(unsafeFromHandle: handle)
         }
 
@@ -46,12 +52,17 @@ final class ChatSurfaceTests: XCTestCase {
             transcriptMessages
         }
 
+        override func sessionId() -> String {
+            sessionIdentifier
+        }
+
         override func stop() {}
     }
 
     private final class SuspendedChatSession: ChatSession, @unchecked Sendable {
         let sendRequested = XCTestExpectation(description: "chat send requested")
 
+        private let sessionIdentifier = UUID().uuidString
         private let lock = NSLock()
         private var continuation: CheckedContinuation<Void, Never>?
         private var delegate: ChatDelegate?
@@ -72,6 +83,10 @@ final class ChatSurfaceTests: XCTestCase {
                 lock.unlock()
                 sendRequested.fulfill()
             }
+        }
+
+        override func sessionId() -> String {
+            sessionIdentifier
         }
 
         override func stop() {}
@@ -846,6 +861,50 @@ final class ChatSurfaceTests: XCTestCase {
         let updated = ChatModel.settingsForResume(summary, current: latest)
         XCTAssertEqual(updated.model, "new-model")
         XCTAssertEqual(updated.daemonProjectRoot, "/new/root")
+    }
+
+    @MainActor
+    func testSelectingLiveSessionAgainSucceedsWithoutAnotherEngineResume() async {
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [
+            StubChatSession(transcript: [
+                ChatMessage(role: "assistant", text: "preserved transcript")
+            ])
+        ]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let summary = makeSummary(familiar: sage)
+        let originalSettings = ChatSettings(
+            backend: .codex,
+            model: "original",
+            familiarID: "forge"
+        )
+
+        let firstResume = await model.resume(summary, settings: originalSettings)
+        XCTAssertTrue(firstResume)
+        let preservedItemIDs = model.items.map(\.id)
+        let preservedItemTexts = model.items.map(\.text)
+        let preservedFamiliar = model.activeFamiliar
+
+        let replacementSettings = ChatSettings(
+            backend: .codex,
+            model: "replacement",
+            familiarID: nil
+        )
+        let secondResume = await model.resume(summary, settings: replacementSettings)
+        XCTAssertTrue(secondResume)
+        XCTAssertEqual(boundary.resumeCallCount, 1)
+        XCTAssertEqual(model.items.map(\.id), preservedItemIDs)
+        XCTAssertEqual(model.items.map(\.text), preservedItemTexts)
+        XCTAssertEqual(model.activeFamiliar, preservedFamiliar)
+
+        boundary.startSessions = [StubChatSession()]
+        await model.send(
+            prompt: "continue",
+            settings: originalSettings,
+            selectedFamiliar: familiarIdentity(id: "forge", name: "Forge")
+        )
+        XCTAssertEqual(boundary.startCallCount, 0)
     }
 
     @MainActor
