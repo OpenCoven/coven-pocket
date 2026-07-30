@@ -43,7 +43,10 @@ struct ChatSettingsView: View {
                 FamiliarPickerSection(
                     settings: $settings,
                     model: familiarModel,
-                    profile: activeFamiliarProfile
+                    profile: activeFamiliarProfile,
+                    refreshContext: {
+                        await refreshFamiliarContext()
+                    }
                 )
 
                 if settings.backend == .codex {
@@ -147,6 +150,7 @@ struct ChatSettingsView: View {
         )
     }
 
+    @MainActor
     private func refreshFamiliarContext() async {
         await FamiliarContextRefreshCoordinator.refresh(
             availability: {

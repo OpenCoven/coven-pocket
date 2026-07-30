@@ -149,6 +149,7 @@ struct FamiliarPickerSection: View {
     @Binding var settings: ChatSettings
     @ObservedObject var model: FamiliarSelectionModel
     let profile: FamiliarProfileKey?
+    let refreshContext: @MainActor () async -> Void
 
     var body: some View {
         Section {
@@ -224,7 +225,7 @@ struct FamiliarPickerSection: View {
                     .foregroundStyle(.secondary)
             } else {
                 Button("Load familiars") {
-                    Task { await refresh() }
+                    Task { await performRefresh() }
                 }
                 .accessibilityHint("Loads familiars from the paired daemon.")
             }
@@ -241,7 +242,7 @@ struct FamiliarPickerSection: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Button("Retry") {
-                Task { await refresh() }
+                Task { await performRefresh() }
             }
             .accessibilityHint("Attempts to reload the familiar roster.")
         }
@@ -256,8 +257,9 @@ struct FamiliarPickerSection: View {
         }
     }
 
-    private func refresh() async {
-        await model.refresh()
+    @MainActor
+    func performRefresh() async {
+        await refreshContext()
     }
 }
 

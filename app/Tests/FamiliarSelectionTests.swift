@@ -454,6 +454,56 @@ final class FamiliarSelectionTests: XCTestCase {
         )
     }
 
+    func testPickerIdleLoadAndFailedRetryDelegateToInjectedAction() async throws {
+        try await withDefaultsAsync { defaults in
+            var refreshes = 0
+            let profile = FamiliarProfileKey.codex(profileID: "profile-a")
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: FamiliarSelectionStore(defaults: defaults)
+            )
+            model.activate(profile)
+            let picker = FamiliarPickerSection(
+                settings: .constant(ChatSettings()),
+                model: model,
+                profile: profile,
+                refreshContext: {
+                    refreshes += 1
+                }
+            )
+
+            XCTAssertEqual(model.state, .idle)
+            await picker.performRefresh()
+            _ = await model.refresh()
+            guard case .failed = model.state else {
+                return XCTFail("expected failed state before retry")
+            }
+            await picker.performRefresh()
+
+            XCTAssertEqual(refreshes, 2)
+        }
+    }
+
+    func testPickerLoadAndRetryUseOnlyInjectedContextRefresh() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/FamiliarPickerSection.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(
+            source.components(
+                separatedBy: "Task { await performRefresh() }"
+            ).count - 1,
+            2
+        )
+        XCTAssertFalse(source.contains("model.refresh()"))
+    }
+
     func testIdentitySealKeepsActiveConversationAheadOfNextSelection() {
         let sage = familiarIdentity(
             id: "sage",
