@@ -59,6 +59,7 @@ struct RemoteTranscriptDecoder {
         }
         streamBuffer.append(data)
         decodeStreamLines(eventSeq: eventSeq)
+        decodeCompleteRemainder(eventSeq: eventSeq)
     }
 
     private mutating func decodeStreamLines(eventSeq: Int64) {
@@ -69,6 +70,19 @@ struct RemoteTranscriptDecoder {
             guard !line.isEmpty, let payload = Self.parse(line) else { continue }
             appendPayload(payload, eventSeq: eventSeq)
         }
+    }
+
+    private mutating func decodeCompleteRemainder(eventSeq: Int64) {
+        let remainder = streamBuffer.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !remainder.isEmpty,
+              let payload = Self.parse(remainder)
+        else {
+            return
+        }
+        streamBuffer = ""
+        appendPayload(payload, eventSeq: eventSeq)
     }
 }
 
