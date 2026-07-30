@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 enum ChatBackend: String, CaseIterable, Hashable {
@@ -32,6 +33,76 @@ struct ChatSettings: Equatable {
     var model: String = ""
     var daemonProjectRoot: String = ""
     var familiarID: String?
+}
+
+@MainActor
+final class ChatRouteGenerationCoordinator: ObservableObject {
+    struct Token: Equatable {
+        fileprivate let generation: UInt64
+    }
+
+    private var generation: UInt64 = 0
+    private var cancelResume: (() -> Void)?
+
+    func begin() -> Token {
+        advanceGeneration()
+        return Token(generation: generation)
+    }
+
+    func invalidate() {
+        advanceGeneration()
+    }
+
+    func isCurrent(_ token: Token) -> Bool {
+        token.generation == generation
+    }
+
+    func prepareToResume(
+        _ token: Token,
+        cancelOnInvalidation: @escaping () -> Void
+    ) -> Bool {
+        guard isCurrent(token) else { return false }
+        cancelResume = cancelOnInvalidation
+        return true
+    }
+
+    func retire(_ token: Token) {
+        guard isCurrent(token) else { return }
+        cancelResume = nil
+        generation &+= 1
+    }
+
+    private func advanceGeneration() {
+        let cancellation = cancelResume
+        cancelResume = nil
+        generation &+= 1
+        cancellation?()
+    }
+}
+
+@MainActor
+enum SpotlightSessionRouteRunner {
+    static func run<Summary>(
+        token: ChatRouteGenerationCoordinator.Token,
+        coordinator: ChatRouteGenerationCoordinator,
+        lookup: @escaping () async -> Summary?,
+        cancelResume: @escaping () -> Void,
+        resume: @escaping (Summary) async -> Void
+    ) async {
+        guard coordinator.isCurrent(token) else { return }
+        guard let summary = await lookup() else {
+            coordinator.retire(token)
+            return
+        }
+        guard coordinator.isCurrent(token),
+              coordinator.prepareToResume(
+                token,
+                cancelOnInvalidation: cancelResume
+              ) else { return }
+        await resume(summary)
+        guard coordinator.isCurrent(token) else { return }
+        coordinator.retire(token)
+    }
 }
 
 enum ChatFamiliarProfile {

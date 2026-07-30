@@ -376,6 +376,41 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertFalse(chat.contains("settings = ChatModel.settingsForResume("))
     }
 
+    func testChatSupersedingActionsInvalidateSpotlightRoute() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let chat = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatView.swift"
+            ),
+            encoding: .utf8
+        )
+        let settings = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatSettingsView.swift"
+            ),
+            encoding: .utf8
+        )
+        let sessions = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/SessionsView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(chat.contains("private func startSend"))
+        XCTAssertTrue(chat.contains("routeCoordinator.invalidate()"))
+        XCTAssertTrue(
+            chat.contains("onReset: { routeCoordinator.invalidate() }")
+        )
+        XCTAssertTrue(
+            chat.contains("onResume: { routeCoordinator.invalidate() }")
+        )
+        XCTAssertTrue(settings.contains("onReset()"))
+        XCTAssertTrue(sessions.contains("onResume()"))
+    }
+
     func testChatSurfacesAlwaysSynchronizeProfileAsNextFamiliar() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -978,6 +1013,163 @@ final class ChatSurfaceTests: XCTestCase {
             try preparation.store.load(for: preparation.codexProfile),
             preparation.forge
         )
+    }
+
+    @MainActor
+    func testOlderSpotlightLookupCannotResumeAfterNewerRouteBegins() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let lookupRequested = XCTestExpectation(
+            description: "older Spotlight lookup requested"
+        )
+        var lookupContinuation: CheckedContinuation<Int?, Never>?
+        var resumed: [Int] = []
+        let olderToken = coordinator.begin()
+        let older = Task {
+            await SpotlightSessionRouteRunner.run(
+                token: olderToken,
+                coordinator: coordinator,
+                lookup: {
+                    lookupRequested.fulfill()
+                    return await withCheckedContinuation { continuation in
+                        lookupContinuation = continuation
+                    }
+                },
+                cancelResume: {},
+                resume: { resumed.append($0) }
+            )
+        }
+        await fulfillment(of: [lookupRequested], timeout: 1)
+
+        let newerToken = coordinator.begin()
+        await SpotlightSessionRouteRunner.run(
+            token: newerToken,
+            coordinator: coordinator,
+            lookup: { 2 },
+            cancelResume: {},
+            resume: { resumed.append($0) }
+        )
+        lookupContinuation?.resume(returning: 1)
+        await older.value
+
+        XCTAssertEqual(resumed, [2])
+        XCTAssertFalse(coordinator.isCurrent(olderToken))
+        XCTAssertFalse(coordinator.isCurrent(newerToken))
+    }
+
+    @MainActor
+    func testSupersedingSendInvalidatesSuspendedSpotlightLookup() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let lookupRequested = XCTestExpectation(
+            description: "Spotlight lookup requested"
+        )
+        var lookupContinuation: CheckedContinuation<Int?, Never>?
+        var resumeCount = 0
+        let token = coordinator.begin()
+        let route = Task {
+            await SpotlightSessionRouteRunner.run(
+                token: token,
+                coordinator: coordinator,
+                lookup: {
+                    lookupRequested.fulfill()
+                    return await withCheckedContinuation { continuation in
+                        lookupContinuation = continuation
+                    }
+                },
+                cancelResume: {},
+                resume: { _ in resumeCount += 1 }
+            )
+        }
+        await fulfillment(of: [lookupRequested], timeout: 1)
+
+        coordinator.invalidate()
+        lookupContinuation?.resume(returning: 1)
+        await route.value
+
+        XCTAssertEqual(resumeCount, 0)
+    }
+
+    @MainActor
+    func testResetDuringSpotlightLookupBlocksStaleResume() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let lookupRequested = XCTestExpectation(
+            description: "Spotlight lookup requested before reset"
+        )
+        var lookupContinuation: CheckedContinuation<Int?, Never>?
+        var resumeCount = 0
+        let token = coordinator.begin()
+        let route = Task {
+            await SpotlightSessionRouteRunner.run(
+                token: token,
+                coordinator: coordinator,
+                lookup: {
+                    lookupRequested.fulfill()
+                    return await withCheckedContinuation { continuation in
+                        lookupContinuation = continuation
+                    }
+                },
+                cancelResume: {},
+                resume: { _ in resumeCount += 1 }
+            )
+        }
+        await fulfillment(of: [lookupRequested], timeout: 1)
+
+        coordinator.invalidate()
+        lookupContinuation?.resume(returning: 1)
+        await route.value
+
+        XCTAssertEqual(resumeCount, 0)
+        XCTAssertFalse(coordinator.isCurrent(token))
+    }
+
+    @MainActor
+    func testInvalidationCancelsSpotlightResumeAlreadyInFlight() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let resumeRequested = XCTestExpectation(
+            description: "Spotlight resume requested"
+        )
+        var resumeContinuation: CheckedContinuation<Void, Never>?
+        var cancellationCount = 0
+        let token = coordinator.begin()
+        let route = Task {
+            await SpotlightSessionRouteRunner.run(
+                token: token,
+                coordinator: coordinator,
+                lookup: { 1 },
+                cancelResume: { cancellationCount += 1 },
+                resume: { _ in
+                    resumeRequested.fulfill()
+                    await withCheckedContinuation { continuation in
+                        resumeContinuation = continuation
+                    }
+                }
+            )
+        }
+        await fulfillment(of: [resumeRequested], timeout: 1)
+
+        coordinator.invalidate()
+        resumeContinuation?.resume()
+        await route.value
+
+        XCTAssertEqual(cancellationCount, 1)
+        XCTAssertFalse(coordinator.isCurrent(token))
+    }
+
+    @MainActor
+    func testMissingSpotlightLookupRetiresCurrentToken() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let token = coordinator.begin()
+        var resumeCount = 0
+
+        await SpotlightSessionRouteRunner.run(
+            token: token,
+            coordinator: coordinator,
+            lookup: { Optional<Int>.none },
+            cancelResume: {},
+            resume: { _ in resumeCount += 1 }
+        )
+
+        XCTAssertEqual(resumeCount, 0)
+        XCTAssertFalse(coordinator.isCurrent(token))
     }
 
     @MainActor

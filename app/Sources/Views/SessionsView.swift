@@ -5,6 +5,7 @@ import SwiftUI
 struct SessionsView: View {
     @ObservedObject var model: ChatModel
     let settings: ChatSettings
+    let onResume: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     @State private var sessions: [ChatSessionSummary] = []
@@ -60,6 +61,7 @@ struct SessionsView: View {
         List {
             ForEach(sessions) { summary in
                 Button {
+                    onResume()
                     Task {
                         if await model.resume(
                             summary,

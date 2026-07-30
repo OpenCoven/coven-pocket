@@ -6,6 +6,7 @@ struct ChatSettingsView: View {
     @ObservedObject var model: ChatModel
     @ObservedObject var companionModel: CompanionChatModel
     @ObservedObject var familiarModel: FamiliarSelectionModel
+    let onReset: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -73,6 +74,7 @@ struct ChatSettingsView: View {
 
                     Section {
                         Button("Clear conversation", role: .destructive) {
+                            onReset()
                             model.reset()
                             synchronizeFamiliarProfile()
                             dismiss()

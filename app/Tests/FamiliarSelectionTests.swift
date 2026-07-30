@@ -39,6 +39,7 @@ private final class FakeFamiliarRosterClient: FamiliarRosterClient {
     var familiarResult: Result<[RemoteFamiliar], Error> = .success([])
     var suspendsGate = false
     var suspendsFamiliars = false
+    private(set) var gateCallCount = 0
     private(set) var requestedPairings: [DaemonPairing] = []
 
     private var gateExpectations: [XCTestExpectation] = []
@@ -55,6 +56,7 @@ private final class FakeFamiliarRosterClient: FamiliarRosterClient {
     }
 
     func gate() async -> CompanionModel.SessionGate {
+        gateCallCount += 1
         fulfillNext(&gateExpectations)
         guard suspendsGate else { return gateResult }
         return await withCheckedContinuation { continuation in
@@ -958,7 +960,7 @@ final class FamiliarSelectionTests: XCTestCase {
         }
     }
 
-    func testStaleEndpointRefreshCannotOverwriteNewerEndpoint() async throws {
+    func testOlderCancelledRefreshCannotRestoreOverNewerEndpoint() async throws {
         try await withDefaultsAsync { defaults in
             let endpointA = daemonPairing(host: "a.local", port: 7001)
             let endpointB = daemonPairing(host: "b.local", port: 7002)
@@ -981,6 +983,7 @@ final class FamiliarSelectionTests: XCTestCase {
             await fulfillment(of: [secondGate], timeout: 1)
             client.resumeNextGate(with: .ready(endpointB))
             await fulfillment(of: [secondFamiliars], timeout: 1)
+            firstRefresh.cancel()
             client.resumeLastFamiliars(
                 returning: [remoteFamiliar(id: "b", name: "B Familiar")]
             )
@@ -1052,12 +1055,23 @@ final class FamiliarSelectionTests: XCTestCase {
         }
     }
 
-    func testCancelledRosterRefreshReturnsFalse() async throws {
+    func testCancelledRosterRefreshRestoresLoadedContext() async throws {
         try await withDefaultsAsync { defaults in
-            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
-            client.suspendsFamiliars = true
+            let endpointA = daemonPairing(host: "a.local", port: 7001)
+            let endpointB = daemonPairing(host: "b.local", port: 7002)
+            let profileA = FamiliarProfileKey.companion(pairing: endpointA)
+            let client = FakeFamiliarRosterClient(gate: .ready(endpointA))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven"),
+                remoteFamiliar(id: "owl", name: "Owl")
+            ])
             let model = makeModel(defaults: defaults, client: client)
-            model.activate(.codex(profileID: "codex-a"))
+            model.activate(profileA)
+            await model.refresh()
+            model.select(id: "raven", for: profileA)
+
+            client.gateResult = .ready(endpointB)
+            client.suspendsFamiliars = true
 
             let requested = client.expectFamiliars()
             let refresh = Task { await model.refresh() }
@@ -1070,8 +1084,136 @@ final class FamiliarSelectionTests: XCTestCase {
 
             let published = await refresh.value
             XCTAssertFalse(published)
-            XCTAssertEqual(model.state, .loading)
-            XCTAssertTrue(model.roster.isEmpty)
+            XCTAssertEqual(model.state, .loaded)
+            XCTAssertEqual(model.roster.map(\.id), ["owl", "raven"])
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(model.activeProfile, profileA)
+            XCTAssertEqual(model.companionProfile, profileA)
+        }
+    }
+
+    func testCancelledRosterRefreshRestoresFailedContextAndProvenance() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven"),
+                remoteFamiliar(id: "owl", name: "Owl")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "raven", for: profile)
+            client.familiarResult = .failure(FakeFamiliarRosterError.transport)
+            await model.refresh()
+
+            client.suspendsFamiliars = true
+            let requested = client.expectFamiliars()
+            let refresh = Task { await model.refresh() }
+            await fulfillment(of: [requested], timeout: 1)
+
+            refresh.cancel()
+            client.resumeNextFamiliars(
+                returning: [remoteFamiliar(id: "changed", name: "Changed")]
+            )
+            let published = await refresh.value
+
+            XCTAssertFalse(published)
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Roster transport failed.")
+            )
+            XCTAssertEqual(model.roster.map(\.id), ["owl", "raven"])
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(model.activeProfile, profile)
+            XCTAssertEqual(
+                model.companionProfile,
+                .companion(pairing: daemonPairing())
+            )
+
+            model.select(id: "owl", for: profile)
+            XCTAssertEqual(model.selectedFamiliar?.id, "owl")
+            XCTAssertEqual(
+                model.state,
+                .failed(reason: "Roster transport failed.")
+            )
+        }
+    }
+
+    func testRosterRefreshCancelledBeforeStartLeavesContextUnchanged() async throws {
+        try await withDefaultsAsync { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "codex-a")
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "raven", for: profile)
+            let priorGateCalls = client.gateCallCount
+
+            let refresh = Task { await model.refresh() }
+            refresh.cancel()
+            let published = await refresh.value
+
+            XCTAssertFalse(published)
+            XCTAssertEqual(client.gateCallCount, priorGateCalls)
+            XCTAssertEqual(model.state, .loaded)
+            XCTAssertEqual(model.roster.map(\.id), ["raven"])
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(model.activeProfile, profile)
+            XCTAssertEqual(
+                model.companionProfile,
+                .companion(pairing: daemonPairing())
+            )
+        }
+    }
+
+    func testCancelledNewerRosterRefreshRestoresLastStableContext() async throws {
+        try await withDefaultsAsync { defaults in
+            let endpointA = daemonPairing(host: "a.local", port: 7001)
+            let endpointB = daemonPairing(host: "b.local", port: 7002)
+            let profileA = FamiliarProfileKey.companion(pairing: endpointA)
+            let client = FakeFamiliarRosterClient(gate: .ready(endpointA))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profileA)
+            await model.refresh()
+            model.select(id: "raven", for: profileA)
+
+            client.gateResult = .ready(endpointB)
+            client.suspendsFamiliars = true
+            let firstRequested = client.expectFamiliars(
+                "older endpoint B roster requested"
+            )
+            let first = Task { await model.refresh() }
+            await fulfillment(of: [firstRequested], timeout: 1)
+            let secondRequested = client.expectFamiliars(
+                "newer endpoint B roster requested"
+            )
+            let second = Task { await model.refresh() }
+            await fulfillment(of: [secondRequested], timeout: 1)
+
+            second.cancel()
+            client.resumeLastFamiliars(
+                returning: [remoteFamiliar(id: "b", name: "B Familiar")]
+            )
+            let secondPublished = await second.value
+            client.resumeNextFamiliars(
+                returning: [remoteFamiliar(id: "stale", name: "Stale")]
+            )
+            let firstPublished = await first.value
+
+            XCTAssertFalse(secondPublished)
+            XCTAssertFalse(firstPublished)
+            XCTAssertEqual(model.state, .loaded)
+            XCTAssertEqual(model.roster.map(\.id), ["raven"])
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(model.activeProfile, profileA)
+            XCTAssertEqual(model.companionProfile, profileA)
         }
     }
 
@@ -1094,6 +1236,7 @@ final class FamiliarSelectionTests: XCTestCase {
             await fulfillment(of: [requested], timeout: 1)
 
             model.select(id: "NEW", for: profile)
+            refresh.cancel()
             client.resumeNextFamiliars(
                 returning: [remoteFamiliar(id: "old", name: "Changed")]
             )

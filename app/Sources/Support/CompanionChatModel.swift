@@ -30,7 +30,13 @@ final class CompanionChatModel: ObservableObject {
     @Published var items: [ChatItem] = []
     @Published var isBusy = false
     @Published var canRetry = false
-    @Published var availability: Availability = .checking
+    @Published var availability: Availability = .checking {
+        didSet {
+            if let terminal = availability.terminal {
+                lastTerminalAvailability = terminal
+            }
+        }
+    }
     @Published private var pinnedSessionFamiliar: FamiliarIdentity?
 
     var cursor: Int64 = 0
@@ -57,6 +63,7 @@ final class CompanionChatModel: ObservableObject {
     var retriesPolling = false
     var operationGeneration: UInt64 = 0
     var availabilityGeneration: UInt64 = 0
+    private var lastTerminalAvailability: Availability?
     var launchInFlight = false
     var pendingCleanup: RemoteSession?
     var pendingCleanupPairing: DaemonPairing?
@@ -113,10 +120,16 @@ final class CompanionChatModel: ObservableObject {
     @discardableResult
     func refreshAvailability() async -> Bool {
         guard !Task.isCancelled else { return false }
+        let priorAvailability = lastTerminalAvailability
         let generation = beginAvailabilityCheck()
         let gate = await client.sessionGate()
-        guard generation == availabilityGeneration,
-              !Task.isCancelled else { return false }
+        guard generation == availabilityGeneration else { return false }
+        guard !Task.isCancelled else {
+            if let priorAvailability {
+                availability = priorAvailability
+            }
+            return false
+        }
         availability = Self.availability(from: gate)
         return true
     }
@@ -194,6 +207,17 @@ final class CompanionChatModel: ObservableObject {
                 context: context,
                 generation: generation
             )
+        }
+    }
+}
+
+private extension CompanionChatModel.Availability {
+    var terminal: Self? {
+        switch self {
+        case .checking:
+            return nil
+        case .ready, .blocked:
+            return self
         }
     }
 }

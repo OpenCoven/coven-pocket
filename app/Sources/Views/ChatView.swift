@@ -10,6 +10,7 @@ struct ChatView: View {
     @StateObject private var companion: CompanionModel
     @StateObject private var companionModel: CompanionChatModel
     @StateObject private var familiarModel: FamiliarSelectionModel
+    @StateObject private var routeCoordinator = ChatRouteGenerationCoordinator()
     @ObservedObject private var router = AppRouter.shared
 
     @State private var settings = ChatSettings(
@@ -88,6 +89,7 @@ struct ChatView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        routeCoordinator.invalidate()
                         showSessions = true
                     } label: {
                         Image(systemName: "clock.arrow.circlepath")
@@ -105,11 +107,12 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showSettings) {
                 ChatSettingsView(
-                    settings: $settings,
+                    settings: routedSettings,
                     client: client,
                     model: model,
                     companionModel: companionModel,
-                    familiarModel: familiarModel
+                    familiarModel: familiarModel,
+                    onReset: { routeCoordinator.invalidate() }
                 )
             }
             .sheet(isPresented: $showSessions) {
@@ -121,7 +124,11 @@ struct ChatView: View {
                         )
                     }
                 } else {
-                    SessionsView(model: model, settings: settings)
+                    SessionsView(
+                        model: model,
+                        settings: settings,
+                        onResume: { routeCoordinator.invalidate() }
+                    )
                 }
             }
             .sheet(isPresented: $showShare) {
@@ -177,6 +184,18 @@ private extension ChatView {
         )
     }
 
+    var routedSettings: Binding<ChatSettings> {
+        Binding(
+            get: { settings },
+            set: { updated in
+                if updated.backend != settings.backend {
+                    routeCoordinator.invalidate()
+                }
+                settings = updated
+            }
+        )
+    }
+
     var identitySeal: FamiliarSealValue? {
         switch settings.backend {
         case .companionClaude:
@@ -205,26 +224,42 @@ private extension ChatView {
         prompt = queued
         guard canSend else { return }
         prompt = ""
-        Task { await send(queued) }
+        startSend(queued)
     }
 
     /// Spotlight indexes on-device sessions, so this explicit history choice
     /// switches to Codex rather than acting as an error fallback.
     private func consumeRouterSession() async {
         guard let sessionID = router.consumeSessionID() else { return }
+        let token = routeCoordinator.begin()
         guard let currentSettings = ChatFamiliarProfile.settingsForCodexResume(
             current: settings,
             codexProfileID: client.codexAccount?.profileId,
             defaultModel: client.defaultCodexModel,
             model: familiarModel
-        ) else { return }
+        ) else {
+            routeCoordinator.retire(token)
+            return
+        }
         settings = currentSettings
         Task {
-            guard
-                let summary = await model.storedSessions()
-                    .first(where: { $0.sessionId == sessionID })
-            else { return }
-            _ = await model.resume(summary, settings: currentSettings)
+            await SpotlightSessionRouteRunner.run(
+                token: token,
+                coordinator: routeCoordinator,
+                lookup: {
+                    await model.storedSessions()
+                        .first(where: { $0.sessionId == sessionID })
+                },
+                cancelResume: {
+                    model.stop()
+                },
+                resume: { summary in
+                    _ = await model.resume(
+                        summary,
+                        settings: currentSettings
+                    )
+                }
+            )
         }
     }
 
@@ -297,7 +332,7 @@ private extension ChatView {
                 Button {
                     let text = prompt
                     prompt = ""
-                    Task { await send(text) }
+                    startSend(text)
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
@@ -310,6 +345,11 @@ private extension ChatView {
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
+    }
+
+    private func startSend(_ text: String) {
+        routeCoordinator.invalidate()
+        Task { await send(text) }
     }
 
     private func send(_ text: String) async {
@@ -350,6 +390,7 @@ private extension ChatView {
     }
 
     private func resetActiveConversation() async {
+        routeCoordinator.invalidate()
         switch settings.backend {
         case .companionClaude:
             await companionModel.reset()
@@ -369,6 +410,7 @@ private extension ChatView {
               let fallback = available.first else {
             return
         }
+        routeCoordinator.invalidate()
         settings.backend = fallback
         if fallback == .codex, settings.model.isEmpty {
             settings.model = client.defaultCodexModel

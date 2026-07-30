@@ -183,6 +183,18 @@ final class FamiliarSelectionModel: ObservableObject {
         let reason: String
     }
 
+    private struct RefreshSnapshot {
+        let roster: [RemoteFamiliar]
+        let state: State
+        let selectedFamiliar: FamiliarIdentity?
+        let activeProfile: FamiliarProfileKey?
+        let companionProfile: FamiliarProfileKey?
+        let endpointRosterCache: [FamiliarProfileKey: [RemoteFamiliar]]
+        let latestValidatedRoster: [RemoteFamiliar]?
+        let storeFailureReason: String?
+        let lastRefreshFailure: RefreshFailure?
+    }
+
     @Published private(set) var roster: [RemoteFamiliar] = []
     @Published private(set) var state: State = .idle
     @Published private(set) var selectedFamiliar: FamiliarIdentity?
@@ -199,6 +211,7 @@ final class FamiliarSelectionModel: ObservableObject {
     private var latestValidatedRoster: [RemoteFamiliar]?
     private var storeFailureReason: String?
     private var lastRefreshFailure: RefreshFailure?
+    private var refreshSnapshotInFlight: RefreshSnapshot?
 
     init(
         client: any FamiliarRosterClient,
@@ -245,24 +258,35 @@ final class FamiliarSelectionModel: ObservableObject {
     @discardableResult
     func refresh() async -> Bool {
         guard !Task.isCancelled else { return false }
-        let refreshGeneration = beginRefresh()
+        let snapshot = refreshSnapshotInFlight ?? refreshSnapshot()
+        if refreshSnapshotInFlight != nil {
+            restore(snapshot)
+        }
+        let refreshGeneration = beginRefresh(snapshot: snapshot)
         let gate = await client.gate()
-        guard refreshGeneration == generation,
-              !Task.isCancelled else { return false }
+        guard refreshGeneration == generation else { return false }
+        guard !Task.isCancelled else {
+            restore(snapshot)
+            refreshSnapshotInFlight = nil
+            return false
+        }
 
         switch gate {
         case .notPaired:
+            refreshSnapshotInFlight = nil
             publishRefreshFailure(
                 "Pair with a daemon to load familiars."
             )
             return true
         case let .blocked(reason, hint):
+            refreshSnapshotInFlight = nil
             publishRefreshFailure("\(reason) \(hint)")
             return true
         case let .ready(pairing):
             return await refresh(
                 pairing: pairing,
-                generation: refreshGeneration
+                generation: refreshGeneration,
+                snapshot: snapshot
             )
         }
     }
@@ -315,19 +339,22 @@ final class FamiliarSelectionModel: ObservableObject {
         roster.first { Self.idsMatch($0.id, id) }
     }
 
-    private func beginRefresh() -> UInt64 {
-        invalidate()
+    private func beginRefresh(snapshot: RefreshSnapshot) -> UInt64 {
+        generation &+= 1
+        refreshSnapshotInFlight = snapshot
         state = .loading
         return generation
     }
 
     private func invalidate() {
         generation &+= 1
+        refreshSnapshotInFlight = nil
     }
 
     private func refresh(
         pairing: DaemonPairing,
-        generation refreshGeneration: UInt64
+        generation refreshGeneration: UInt64,
+        snapshot: RefreshSnapshot
     ) async -> Bool {
         let endpoint = FamiliarProfileKey.companion(pairing: pairing)
         companionProfile = endpoint
@@ -342,8 +369,13 @@ final class FamiliarSelectionModel: ObservableObject {
 
         do {
             let fetched = try await client.familiars(pairing: pairing)
-            guard refreshGeneration == generation,
-                  !Task.isCancelled else { return false }
+            guard refreshGeneration == generation else { return false }
+            guard !Task.isCancelled else {
+                restore(snapshot)
+                refreshSnapshotInFlight = nil
+                return false
+            }
+            refreshSnapshotInFlight = nil
             lastRefreshFailure = nil
             let sorted = Self.sorted(fetched)
             endpointRosterCache[endpoint] = sorted
@@ -352,11 +384,42 @@ final class FamiliarSelectionModel: ObservableObject {
             reconcileActiveSelection(with: sorted)
             return true
         } catch {
-            guard refreshGeneration == generation,
-                  !Task.isCancelled else { return false }
+            guard refreshGeneration == generation else { return false }
+            guard !Task.isCancelled else {
+                restore(snapshot)
+                refreshSnapshotInFlight = nil
+                return false
+            }
+            refreshSnapshotInFlight = nil
             publishRefreshFailure(error.localizedDescription)
             return true
         }
+    }
+
+    private func refreshSnapshot() -> RefreshSnapshot {
+        RefreshSnapshot(
+            roster: roster,
+            state: state,
+            selectedFamiliar: selectedFamiliar,
+            activeProfile: activeProfile,
+            companionProfile: companionProfile,
+            endpointRosterCache: endpointRosterCache,
+            latestValidatedRoster: latestValidatedRoster,
+            storeFailureReason: storeFailureReason,
+            lastRefreshFailure: lastRefreshFailure
+        )
+    }
+
+    private func restore(_ snapshot: RefreshSnapshot) {
+        roster = snapshot.roster
+        state = snapshot.state
+        selectedFamiliar = snapshot.selectedFamiliar
+        activeProfile = snapshot.activeProfile
+        companionProfile = snapshot.companionProfile
+        endpointRosterCache = snapshot.endpointRosterCache
+        latestValidatedRoster = snapshot.latestValidatedRoster
+        storeFailureReason = snapshot.storeFailureReason
+        lastRefreshFailure = snapshot.lastRefreshFailure
     }
 
     private func publishRosterForReadyEndpoint(
