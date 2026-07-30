@@ -11,12 +11,18 @@ struct ChatItem: Identifiable {
         case tool
     }
 
-    let id = UUID()
+    let id: String
     let kind: Kind
     var text: String
     var tool: ToolCallInfo?
 
-    init(kind: Kind, text: String, tool: ToolCallInfo? = nil) {
+    init(
+        id: String = UUID().uuidString,
+        kind: Kind,
+        text: String,
+        tool: ToolCallInfo? = nil
+    ) {
+        self.id = id
         self.kind = kind
         self.text = text
         self.tool = tool

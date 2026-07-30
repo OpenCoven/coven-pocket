@@ -32,6 +32,7 @@ struct ChatView: View {
 
     private var canSend: Bool {
         guard !activeIsBusy,
+              !(settings.backend == .companionClaude && companionModel.hasPendingCleanup),
               !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return false }
         switch settings.backend {
@@ -300,6 +301,7 @@ private extension ChatView {
     }
 
     private func normalizeBackendSelection() {
+        guard companionModel.availability != .checking else { return }
         let available = ChatBackend.available(
             companionAvailable: companionModel.isAvailable,
             codexAvailable: client.codexAccount != nil

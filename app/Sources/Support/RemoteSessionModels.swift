@@ -70,8 +70,13 @@ final class RemoteAttachModel: ObservableObject {
     private var pairing: DaemonPairing?
     private var events: [RemoteEvent] = []
     private var cursor: Int64 = 0
+    private var attachmentMode: RemoteTranscript.AttachmentMode = .unknown
 
     private var engine: PocketEngine { companion.engine }
+
+    var acceptsInput: Bool {
+        !finished && attachmentMode != .unknown
+    }
 
     static let pollInterval: Duration = .seconds(2)
     static let pageLimit: UInt32 = 200
@@ -117,20 +122,50 @@ final class RemoteAttachModel: ObservableObject {
 
     /// Pure state derivation, split out so tests can drive it directly.
     func apply(events: [RemoteEvent]) {
-        items = RemoteTranscript.items(from: events)
-        approvalPrompt = RemoteTranscript.approvalPrompt(in: items)
-        finished = events.contains { $0.kind == "result" }
+        let snapshot = RemoteTranscript.attachmentSnapshot(from: events)
+        attachmentMode = snapshot.attachmentMode
+        items = snapshot.items
+        approvalPrompt = attachmentMode != .pty
+            ? nil
+            : RemoteTranscript.approvalPrompt(in: items)
+        finished = snapshot.sessionEnded
+            || (attachmentMode == .pty && snapshot.latestResultSeq != nil)
     }
 
     func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        guard let data = Self.inputData(text, mode: attachmentMode) else {
+            errorText = "Waiting for session output before enabling input."
+            return
+        }
         draft = ""
-        await forward(text + "\n")
+        await forward(data)
     }
 
-    func approve() async { await forward("y\n") }
-    func deny() async { await forward("n\n") }
+    func approve() async {
+        guard attachmentMode == .pty else { return }
+        await forward("y\n")
+    }
+
+    func deny() async {
+        guard attachmentMode == .pty else { return }
+        await forward("n\n")
+    }
+
+    static func inputData(
+        _ text: String,
+        mode: RemoteTranscript.AttachmentMode
+    ) -> String? {
+        switch mode {
+        case .unknown:
+            return nil
+        case .pty:
+            return text + "\n"
+        case .stream:
+            return text
+        }
+    }
 
     func kill() async {
         guard let pairing = await gate() else { return }

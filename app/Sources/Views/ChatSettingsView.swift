@@ -96,12 +96,15 @@ struct ChatSettingsView: View {
 
     private var availableBackends: [ChatBackend] {
         ChatBackend.available(
-            companionAvailable: companionModel.isAvailable,
+            companionAvailable: companionModel.isAvailable
+                || (companionModel.availability == .checking
+                    && settings.backend == .companionClaude),
             codexAvailable: client.codexAccount != nil
         )
     }
 
     private func normalizeBackendSelection() {
+        guard companionModel.availability != .checking else { return }
         guard !availableBackends.contains(settings.backend),
               let fallback = availableBackends.first else {
             return

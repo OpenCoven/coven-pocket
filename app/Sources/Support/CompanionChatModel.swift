@@ -8,28 +8,36 @@ final class CompanionChatModel: ObservableObject {
         case blocked(reason: String, hint: String)
     }
 
-    @Published private(set) var items: [ChatItem] = []
-    @Published private(set) var isBusy = false
-    @Published private(set) var canRetry = false
-    @Published private(set) var availability: Availability = .checking
+    @Published var items: [ChatItem] = []
+    @Published var isBusy = false
+    @Published var canRetry = false
+    @Published var availability: Availability = .checking
 
-    private(set) var cursor: Int64 = 0
+    var cursor: Int64 = 0
 
     static let requestTimeoutMs: UInt32 = 6_000
     static let pageLimit: UInt32 = 200
     static let pollInterval: Duration = .seconds(2)
 
     let companion: CompanionModel
-    private let client: any CompanionSessionClient
-    private var pairing: DaemonPairing?
-    private var session: RemoteSession?
-    private var accumulatedEvents: [RemoteEvent] = []
-    private var retryPrompt: String?
-    private var retryProjectRoot = ""
-    private var pollTask: Task<Void, Never>?
-    private var lastCompletedResultSeq: Int64 = 0
-    private var initialPrompt: String?
-    private var retriesPolling = false
+    let client: any CompanionSessionClient
+    var pairing: DaemonPairing?
+    var session: RemoteSession?
+    var sessionProjectRoot: String?
+    var accumulatedEvents: [RemoteEvent] = []
+    var retryPrompt: String?
+    var retryProjectRoot = ""
+    var pollTask: Task<Void, Never>?
+    var lastCompletedResultSeq: Int64 = 0
+    var initialPrompt: String?
+    var initialPromptID: String?
+    var retriesPolling = false
+    var operationGeneration: UInt64 = 0
+    var availabilityGeneration: UInt64 = 0
+    var launchInFlight = false
+    var pendingCleanup: RemoteSession?
+    var pendingCleanupPairing: DaemonPairing?
+    var pendingCleanupCompletionText: String?
 
     convenience init() {
         self.init(companion: CompanionModel())
@@ -59,14 +67,31 @@ final class CompanionChatModel: ObservableObject {
         return false
     }
 
+    var hasPendingCleanup: Bool {
+        pendingCleanup != nil
+    }
+
+    var hasActivePollTask: Bool {
+        pollTask != nil
+    }
+
     func refreshAvailability() async {
-        availability = Self.availability(from: await client.sessionGate())
+        let generation = beginAvailabilityCheck()
+        let gate = await client.sessionGate()
+        guard generation == availabilityGeneration else { return }
+        availability = Self.availability(from: gate)
+    }
+
+    func beginAvailabilityCheck() -> UInt64 {
+        availabilityGeneration &+= 1
+        availability = .checking
+        return availabilityGeneration
     }
 
     func send(prompt: String, projectRoot: String) async {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedRoot = projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPrompt.isEmpty, !isBusy else { return }
+        guard !trimmedPrompt.isEmpty, !isBusy, pendingCleanup == nil else { return }
         guard Self.isAbsoluteHostPath(trimmedRoot) else {
             fail(
                 "Enter an absolute project path on the daemon host.",
@@ -74,61 +99,55 @@ final class CompanionChatModel: ObservableObject {
             )
             return
         }
+        operationGeneration &+= 1
+        pollTask?.cancel()
+        pollTask = nil
+        let generation = operationGeneration
+        isBusy = true
         retryProjectRoot = trimmedRoot
-        guard let verified = await verifiedPairing(reportFailure: true) else {
+        guard let verified = await verifiedPairing(
+            reportFailure: true,
+            generation: generation
+        ) else {
+            guard generation == operationGeneration else { return }
+            isBusy = false
             retryPrompt = trimmedPrompt
             canRetry = true
             return
         }
 
-        isBusy = true
         canRetry = false
         retryPrompt = nil
         retriesPolling = false
         do {
-            if let session {
-                try await client.sendInput(
-                    pairing: verified,
-                    sessionID: session.id,
-                    data: trimmedPrompt
-                )
-            } else {
-                prepareForNewSession()
-                session = try await client.launch(
-                    pairing: verified,
-                    projectRoot: trimmedRoot,
-                    prompt: trimmedPrompt,
-                    title: Self.title(from: trimmedPrompt)
-                )
-                initialPrompt = trimmedPrompt
-                items = [ChatItem(kind: .user, text: trimmedPrompt)]
-            }
-            pairing = verified
-            startPolling()
+            try await performSend(
+                prompt: trimmedPrompt,
+                projectRoot: trimmedRoot,
+                pairing: verified,
+                generation: generation
+            )
         } catch {
-            isBusy = false
-            if Self.isSessionNotLive(error) {
-                abandonSession()
-            }
-            fail(error.localizedDescription, retryPrompt: trimmedPrompt)
+            handleSendFailure(
+                error,
+                prompt: trimmedPrompt,
+                generation: generation
+            )
         }
     }
+}
 
+extension CompanionChatModel {
     func retry() async {
         guard !isBusy else { return }
+        if pendingCleanup != nil {
+            operationGeneration &+= 1
+            pollTask?.cancel()
+            pollTask = nil
+            await retryPendingCleanup()
+            return
+        }
         if retriesPolling {
-            guard let verified = await verifiedPairing(reportFailure: true) else {
-                canRetry = true
-                return
-            }
-            pairing = verified
-            retriesPolling = false
-            canRetry = false
-            isBusy = true
-            await refreshOnce()
-            if !retriesPolling {
-                startPolling()
-            }
+            await retryPolling()
             return
         }
         guard let prompt = retryPrompt else { return }
@@ -137,6 +156,7 @@ final class CompanionChatModel: ObservableObject {
     }
 
     func refreshOnce() async {
+        let generation = operationGeneration
         guard let pairing, let session else { return }
         do {
             var hasMore = true
@@ -146,7 +166,8 @@ final class CompanionChatModel: ObservableObject {
                     sessionID: session.id,
                     afterSeq: cursor
                 )
-                guard !Task.isCancelled else { return }
+                guard generation == operationGeneration,
+                      !Task.isCancelled else { return }
                 let knownSequences = Set(accumulatedEvents.map(\.seq))
                 accumulatedEvents.append(
                     contentsOf: page.events.filter { !knownSequences.contains($0.seq) }
@@ -154,9 +175,13 @@ final class CompanionChatModel: ObservableObject {
                 cursor = max(cursor, page.nextAfterSeq)
                 hasMore = page.hasMore
             }
+            guard generation == operationGeneration,
+                  !Task.isCancelled else { return }
             apply(events: accumulatedEvents)
         } catch {
-            guard !Task.isCancelled else { return }
+            guard generation == operationGeneration,
+                  !Task.isCancelled else { return }
+            let wasAwaitingResult = isBusy
             items.append(ChatItem(kind: .error, text: error.localizedDescription))
             pollTask?.cancel()
             pollTask = nil
@@ -166,8 +191,8 @@ final class CompanionChatModel: ObservableObject {
                 retriesPolling = false
                 canRetry = false
             } else {
-                retriesPolling = true
-                canRetry = true
+                retriesPolling = wasAwaitingResult
+                canRetry = wasAwaitingResult
             }
         }
     }
@@ -181,8 +206,16 @@ final class CompanionChatModel: ObservableObject {
         )
         items = Self.chatItems(from: snapshot.items)
         if let initialPrompt {
-            items.insert(ChatItem(kind: .user, text: initialPrompt), at: 0)
+            items.insert(
+                ChatItem(
+                    id: initialPromptID ?? "companion-initial",
+                    kind: .user,
+                    text: initialPrompt
+                ),
+                at: 0
+            )
         }
+
         if let newestResult = snapshot.latestResultSeq,
            newestResult > lastCompletedResultSeq {
             lastCompletedResultSeq = newestResult
@@ -195,170 +228,63 @@ final class CompanionChatModel: ObservableObject {
     }
 
     func stop() async {
-        guard let session, let verified = await verifiedPairing(reportFailure: true) else {
-            return
-        }
-        do {
-            try await client.kill(pairing: verified, sessionID: session.id)
-            finishStoppedSession(message: "Stopped.")
-        } catch {
-            if Self.isSessionNotLive(error) {
-                finishStoppedSession(message: "Session already stopped.")
-                return
-            }
-            items.append(ChatItem(kind: .error, text: error.localizedDescription))
+        operationGeneration &+= 1
+        let sessionToKill = session
+        let pairingToKill = pairing
+        pollTask?.cancel()
+        pollTask = nil
+        session = nil
+        canRetry = false
+        retriesPolling = false
+        retryPrompt = nil
+
+        if let sessionToKill {
+            await beginCleanup(
+                of: sessionToKill,
+                pairing: pairingToKill,
+                completionText: "Stopped."
+            )
+        } else if pendingCleanup != nil {
+            await retryPendingCleanup()
+        } else if launchInFlight {
+            isBusy = true
+        } else {
+            isBusy = false
+            items.append(ChatItem(kind: .status, text: "Stopped."))
         }
     }
 
     func reset() async {
-        if let session,
-           let verified = await verifiedPairing(reportFailure: false) {
-            try? await client.kill(pairing: verified, sessionID: session.id)
-        }
+        operationGeneration &+= 1
+        let sessionToKill = session
+        let pairingToKill = pairing
         pollTask?.cancel()
         pollTask = nil
         pairing = nil
         session = nil
+        sessionProjectRoot = nil
         accumulatedEvents = []
         cursor = 0
         lastCompletedResultSeq = 0
         initialPrompt = nil
+        initialPromptID = nil
         retriesPolling = false
         retryPrompt = nil
         retryProjectRoot = ""
         items = []
-        isBusy = false
         canRetry = false
-    }
-}
+        pendingCleanupCompletionText = nil
 
-private extension CompanionChatModel {
-    static func availability(
-        from gate: CompanionModel.SessionGate
-    ) -> Availability {
-        switch gate {
-        case let .ready(pairing):
-            return .ready(pairing)
-        case .notPaired:
-            return .blocked(
-                reason: "Not paired",
-                hint: "Pair with a daemon in the Companion tab first."
+        if let sessionToKill {
+            await beginCleanup(
+                of: sessionToKill,
+                pairing: pairingToKill,
+                completionText: nil
             )
-        case let .blocked(reason, hint):
-            return .blocked(reason: reason, hint: hint)
+        } else if pendingCleanup != nil {
+            await retryPendingCleanup()
+        } else {
+            isBusy = launchInFlight
         }
-    }
-
-    func verifiedPairing(reportFailure: Bool) async -> DaemonPairing? {
-        let gate = await client.sessionGate()
-        availability = Self.availability(from: gate)
-        switch gate {
-        case let .ready(pairing):
-            return pairing
-        case .notPaired:
-            if reportFailure {
-                fail(
-                    "Not paired. Pair with a daemon in the Companion tab first.",
-                    retryPrompt: nil
-                )
-            }
-        case let .blocked(reason, hint):
-            if reportFailure {
-                fail("\(reason). \(hint)", retryPrompt: nil)
-            }
-        }
-        return nil
-    }
-
-    func startPolling() {
-        guard pollTask == nil else { return }
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refreshOnce()
-                try? await Task.sleep(for: Self.pollInterval)
-            }
-        }
-    }
-
-    func prepareForNewSession() {
-        pollTask?.cancel()
-        pollTask = nil
-        accumulatedEvents = []
-        cursor = 0
-        lastCompletedResultSeq = 0
-        initialPrompt = nil
-        retriesPolling = false
-        items = []
-    }
-
-    func abandonSession() {
-        pollTask?.cancel()
-        pollTask = nil
-        session = nil
-    }
-
-    func finishStoppedSession(message: String) {
-        abandonSession()
-        isBusy = false
-        canRetry = false
-        retriesPolling = false
-        items.append(ChatItem(kind: .status, text: message))
-    }
-
-    func fail(_ message: String, retryPrompt: String?) {
-        items.append(ChatItem(kind: .error, text: message))
-        self.retryPrompt = retryPrompt
-        canRetry = retryPrompt != nil
-    }
-
-    static func title(from prompt: String) -> String {
-        let firstLine = prompt.split(separator: "\n", maxSplits: 1).first.map(String.init)
-            ?? "Claude session"
-        return String(firstLine.prefix(80))
-    }
-
-    static func chatItems(from remote: [RemoteTranscriptItem]) -> [ChatItem] {
-        remote.map { item in
-            switch item.role {
-            case .user:
-                return ChatItem(kind: .user, text: item.text)
-            case .assistant:
-                return ChatItem(kind: .assistant, text: item.text)
-            case .terminal:
-                return ChatItem(kind: .status, text: item.text)
-            case .status:
-                return ChatItem(kind: .status, text: item.text)
-            case let .tool(isError):
-                return ChatItem(
-                    kind: .tool,
-                    text: "Tool result",
-                    tool: ToolCallInfo(
-                        toolId: "remote-\(item.id)",
-                        name: "Tool result",
-                        inputSummary: "",
-                        result: item.text,
-                        isError: isError,
-                        isRunning: false
-                    )
-                )
-            }
-        }
-    }
-
-    static func isSessionNotLive(_ error: Error) -> Bool {
-        let message = error.localizedDescription.lowercased()
-        return message.contains("session is not live")
-            || message.contains("session is not running")
-    }
-}
-
-extension CompanionChatModel {
-    static func isAbsoluteHostPath(_ path: String) -> Bool {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.hasPrefix("/")
-            || trimmed.range(
-                of: #"^[A-Za-z]:[\\/]"#,
-                options: .regularExpression
-            ) != nil
     }
 }
