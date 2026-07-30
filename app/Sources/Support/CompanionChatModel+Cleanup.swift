@@ -14,7 +14,18 @@ extension CompanionChatModel {
         of sessionToClean: RemoteSession,
         pairing knownPairing: DaemonPairing?,
         completionText: String?
-    ) async {
+    ) async -> Bool {
+        let generation = operationGeneration
+        let retainedRetryContext = retryPrompt.map {
+            (prompt: $0, projectRoot: retryProjectRoot, familiarID: retryFamiliarID)
+        }
+        defer {
+            if generation == operationGeneration, let retainedRetryContext {
+                retryPrompt = retainedRetryContext.prompt
+                retryProjectRoot = retainedRetryContext.projectRoot
+                retryFamiliarID = retainedRetryContext.familiarID
+            }
+        }
         pendingCleanup = sessionToClean
         if let knownPairing {
             pendingCleanupPairing = knownPairing
@@ -23,31 +34,31 @@ extension CompanionChatModel {
         isBusy = true
         canRetry = false
         retriesPolling = false
-        retryPrompt = nil
-        let generation = operationGeneration
 
         guard let verified = await cleanupPairing(
             generation: generation,
             session: sessionToClean,
             completionText: completionText
-        ) else { return }
+        ) else { return false }
 
         do {
             try await client.kill(pairing: verified, sessionID: sessionToClean.id)
-            guard generation == operationGeneration else { return }
+            guard generation == operationGeneration else { return false }
             completeCleanup(of: sessionToClean, message: completionText)
+            return true
         } catch {
-            guard generation == operationGeneration else { return }
+            guard generation == operationGeneration else { return false }
             if Self.isSessionNotLive(error) {
                 completeCleanup(
                     of: sessionToClean,
                     message: completionText ?? "Session already stopped."
                 )
-                return
+                return true
             }
             isBusy = false
             fail(error.localizedDescription, retryPrompt: nil)
             canRetry = true
+            return false
         }
     }
 
@@ -170,5 +181,11 @@ extension CompanionChatModel {
                 of: #"^[A-Za-z]:[\\/]"#,
                 options: .regularExpression
             ) != nil
+    }
+
+    static func normalizedFamiliarID(_ familiarID: String?) -> String? {
+        guard let familiarID else { return nil }
+        let normalized = familiarID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
     }
 }

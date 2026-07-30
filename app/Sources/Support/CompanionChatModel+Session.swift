@@ -4,11 +4,14 @@ extension CompanionChatModel {
     func performSend(
         prompt: String,
         projectRoot: String,
+        familiarID: String?,
         pairing verified: DaemonPairing,
         generation: UInt64
     ) async throws {
         guard try await replaceSessionIfNeeded(
+            prompt: prompt,
             projectRoot: projectRoot,
+            familiarID: familiarID,
             pairing: verified,
             generation: generation
         ) else { return }
@@ -24,6 +27,7 @@ extension CompanionChatModel {
             try await prepareAndLaunch(
                 prompt: prompt,
                 projectRoot: projectRoot,
+                familiarID: familiarID,
                 pairing: verified,
                 generation: generation
             )
@@ -34,7 +38,9 @@ extension CompanionChatModel {
     }
 
     func replaceSessionIfNeeded(
+        prompt: String,
         projectRoot: String,
+        familiarID: String?,
         pairing: DaemonPairing,
         generation: UInt64
     ) async throws -> Bool {
@@ -56,14 +62,24 @@ extension CompanionChatModel {
             abandonSession()
             return true
         }
-        guard sessionProjectRoot != projectRoot else { return true }
-        do {
-            try await client.kill(pairing: pairing, sessionID: activeSession.id)
-        } catch {
-            guard Self.isSessionNotLive(error) else { throw error }
-        }
-        guard generation == operationGeneration else { return false }
+        guard sessionProjectRoot != projectRoot
+                || sessionFamiliarID != familiarID else { return true }
         abandonSession()
+        let cleaned = await beginCleanup(
+            of: activeSession,
+            pairing: sessionPairing,
+            completionText: nil
+        )
+        guard generation == operationGeneration else { return false }
+        guard cleaned else {
+            setRetryContext(
+                prompt: prompt,
+                projectRoot: projectRoot,
+                familiarID: familiarID
+            )
+            return false
+        }
+        isBusy = true
         return true
     }
 
@@ -133,6 +149,7 @@ extension CompanionChatModel {
     func prepareAndLaunch(
         prompt: String,
         projectRoot: String,
+        familiarID: String?,
         pairing: DaemonPairing,
         generation: UInt64
     ) async throws {
@@ -143,7 +160,8 @@ extension CompanionChatModel {
                 pairing: pairing,
                 projectRoot: projectRoot,
                 prompt: prompt,
-                title: Self.title(from: prompt)
+                title: Self.title(from: prompt),
+                familiarID: familiarID
             )
             launchInFlight = false
             guard generation == operationGeneration else {
@@ -154,8 +172,18 @@ extension CompanionChatModel {
                 )
                 return
             }
+            guard launched.familiarId == familiarID else {
+                await beginCleanup(
+                    of: launched,
+                    pairing: pairing,
+                    completionText: nil
+                )
+                guard generation == operationGeneration else { return }
+                throw FamiliarConfirmationError()
+            }
             session = launched
             sessionProjectRoot = projectRoot
+            sessionFamiliarID = familiarID
             initialPrompt = prompt
             initialPromptID = "companion-initial-\(launched.id)"
             items = [
@@ -174,6 +202,8 @@ extension CompanionChatModel {
     func handleSendFailure(
         _ error: Error,
         prompt: String,
+        projectRoot: String,
+        familiarID: String?,
         generation: UInt64
     ) {
         guard generation == operationGeneration else {
@@ -186,7 +216,12 @@ extension CompanionChatModel {
         if Self.isSessionNotLive(error) {
             abandonSession()
         }
-        fail(error.localizedDescription, retryPrompt: prompt)
+        items.append(ChatItem(kind: .error, text: error.localizedDescription))
+        setRetryContext(
+            prompt: prompt,
+            projectRoot: projectRoot,
+            familiarID: familiarID
+        )
     }
 
     static func availability(
@@ -259,5 +294,23 @@ extension CompanionChatModel {
         pollTask = nil
         session = nil
         sessionProjectRoot = nil
+        sessionFamiliarID = nil
+    }
+
+    func setRetryContext(
+        prompt: String,
+        projectRoot: String,
+        familiarID: String?
+    ) {
+        retryPrompt = prompt
+        retryProjectRoot = projectRoot
+        retryFamiliarID = familiarID
+        canRetry = true
+    }
+}
+
+private struct FamiliarConfirmationError: LocalizedError {
+    var errorDescription: String? {
+        "The companion daemon did not confirm the selected familiar."
     }
 }

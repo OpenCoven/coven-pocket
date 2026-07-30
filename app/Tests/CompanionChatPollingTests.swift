@@ -163,11 +163,16 @@ final class CompanionChatPollingTests: XCTestCase {
     func testResetKillsTheActiveDaemonSessionAndClearsState() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         let model = CompanionChatModel(client: client)
-        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "sage"
+        )
 
         await model.reset()
 
         XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertNil(model.sessionFamiliarID)
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertEqual(model.cursor, 0)
         XCTAssertFalse(model.isBusy)

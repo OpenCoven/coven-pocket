@@ -92,7 +92,11 @@ final class CompanionChatLifecycleTests: XCTestCase {
         let model = CompanionChatModel(client: client)
 
         let send = Task {
-            await model.send(prompt: "first", projectRoot: "/srv/repo")
+            await model.send(
+                prompt: "first",
+                projectRoot: "/srv/repo",
+                familiarID: "sage"
+            )
         }
         await fulfillment(of: [client.launchRequested], timeout: 1)
         await model.stop()
@@ -107,6 +111,7 @@ final class CompanionChatLifecycleTests: XCTestCase {
         XCTAssertTrue(model.hasPendingCleanup)
         XCTAssertTrue(model.canRetry)
         XCTAssertFalse(model.isBusy)
+        XCTAssertNil(model.sessionFamiliarID)
 
         client.killError = nil
         await model.retry()
@@ -195,4 +200,5 @@ final class CompanionChatLifecycleTests: XCTestCase {
         XCTAssertEqual(client.launchedPrompts, ["first", "second"])
         XCTAssertEqual(model.cursor, 0)
     }
+
 }

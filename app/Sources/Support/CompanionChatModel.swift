@@ -24,9 +24,11 @@ final class CompanionChatModel: ObservableObject {
     var pairing: DaemonPairing?
     var session: RemoteSession?
     var sessionProjectRoot: String?
+    var sessionFamiliarID: String?
     var accumulatedEvents: [RemoteEvent] = []
     var retryPrompt: String?
     var retryProjectRoot = ""
+    var retryFamiliarID: String?
     var pollTask: Task<Void, Never>?
     var lastCompletedResultSeq: Int64 = 0
     var initialPrompt: String?
@@ -88,11 +90,17 @@ final class CompanionChatModel: ObservableObject {
         return availabilityGeneration
     }
 
-    func send(prompt: String, projectRoot: String) async {
+    func send(
+        prompt: String,
+        projectRoot: String,
+        familiarID: String? = nil
+    ) async {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedRoot = projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedFamiliarID = Self.normalizedFamiliarID(familiarID)
         guard !trimmedPrompt.isEmpty, !isBusy, pendingCleanup == nil else { return }
         guard Self.isAbsoluteHostPath(trimmedRoot) else {
+            retryFamiliarID = nil
             fail(
                 "Enter an absolute project path on the daemon host.",
                 retryPrompt: nil
@@ -105,6 +113,7 @@ final class CompanionChatModel: ObservableObject {
         let generation = operationGeneration
         isBusy = true
         retryProjectRoot = trimmedRoot
+        retryFamiliarID = normalizedFamiliarID
         guard let verified = await verifiedPairing(
             reportFailure: true,
             generation: generation
@@ -118,11 +127,13 @@ final class CompanionChatModel: ObservableObject {
 
         canRetry = false
         retryPrompt = nil
+        retryFamiliarID = nil
         retriesPolling = false
         do {
             try await performSend(
                 prompt: trimmedPrompt,
                 projectRoot: trimmedRoot,
+                familiarID: normalizedFamiliarID,
                 pairing: verified,
                 generation: generation
             )
@@ -130,6 +141,8 @@ final class CompanionChatModel: ObservableObject {
             handleSendFailure(
                 error,
                 prompt: trimmedPrompt,
+                projectRoot: trimmedRoot,
+                familiarID: normalizedFamiliarID,
                 generation: generation
             )
         }
@@ -140,10 +153,24 @@ extension CompanionChatModel {
     func retry() async {
         guard !isBusy else { return }
         if pendingCleanup != nil {
+            let prompt = retryPrompt
+            let projectRoot = retryProjectRoot
+            let familiarID = retryFamiliarID
             operationGeneration &+= 1
+            let generation = operationGeneration
             pollTask?.cancel()
             pollTask = nil
             await retryPendingCleanup()
+            guard generation == operationGeneration,
+                  pendingCleanup == nil,
+                  let prompt else { return }
+            retryPrompt = nil
+            retryFamiliarID = nil
+            await send(
+                prompt: prompt,
+                projectRoot: projectRoot,
+                familiarID: familiarID
+            )
             return
         }
         if retriesPolling {
@@ -151,8 +178,14 @@ extension CompanionChatModel {
             return
         }
         guard let prompt = retryPrompt else { return }
+        let familiarID = retryFamiliarID
         retryPrompt = nil
-        await send(prompt: prompt, projectRoot: retryProjectRoot)
+        retryFamiliarID = nil
+        await send(
+            prompt: prompt,
+            projectRoot: retryProjectRoot,
+            familiarID: familiarID
+        )
     }
 
     func refreshOnce() async {
@@ -234,9 +267,12 @@ extension CompanionChatModel {
         pollTask?.cancel()
         pollTask = nil
         session = nil
+        sessionProjectRoot = nil
+        sessionFamiliarID = nil
         canRetry = false
         retriesPolling = false
         retryPrompt = nil
+        retryFamiliarID = nil
 
         if let sessionToKill {
             await beginCleanup(
@@ -263,6 +299,7 @@ extension CompanionChatModel {
         pairing = nil
         session = nil
         sessionProjectRoot = nil
+        sessionFamiliarID = nil
         accumulatedEvents = []
         cursor = 0
         lastCompletedResultSeq = 0
@@ -271,6 +308,7 @@ extension CompanionChatModel {
         retriesPolling = false
         retryPrompt = nil
         retryProjectRoot = ""
+        retryFamiliarID = nil
         items = []
         canRetry = false
         pendingCleanupCompletionText = nil
