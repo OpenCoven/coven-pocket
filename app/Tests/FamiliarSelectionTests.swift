@@ -456,6 +456,16 @@ final class FamiliarSelectionTests: XCTestCase {
         )
     }
 
+    func testPickerIdleProfileExplainsPairedDaemonSource() {
+        XCTAssertEqual(
+            FamiliarPickerSection.idleExplanation(
+                for: .codex(profileID: "profile-a")
+            ),
+            "Familiars come from your paired Coven daemon."
+        )
+        XCTAssertNil(FamiliarPickerSection.idleExplanation(for: nil))
+    }
+
     func testPickerIdleLoadAndFailedRetryDelegateToInjectedAction() async throws {
         try await withDefaultsAsync { defaults in
             var refreshes = 0

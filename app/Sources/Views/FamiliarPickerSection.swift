@@ -202,6 +202,13 @@ struct FamiliarPickerSection: View {
         return state == .loading
     }
 
+    static func idleExplanation(
+        for profile: FamiliarProfileKey?
+    ) -> String? {
+        guard profile != nil else { return nil }
+        return "Familiars come from your paired Coven daemon."
+    }
+
     private var selection: Binding<String?> {
         Binding(
             get: { settings.familiarID },
@@ -219,15 +226,22 @@ struct FamiliarPickerSection: View {
     @ViewBuilder private var status: some View {
         switch model.state {
         case .idle:
-            if profile == nil {
+            if let explanation = Self.idleExplanation(for: profile) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(explanation)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Button("Load familiars") {
+                        Task { await performRefresh() }
+                    }
+                    .accessibilityHint(
+                        "Loads familiars from the paired daemon."
+                    )
+                }
+            } else {
                 Text(unavailableCopy)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-            } else {
-                Button("Load familiars") {
-                    Task { await performRefresh() }
-                }
-                .accessibilityHint("Loads familiars from the paired daemon.")
             }
         case .loading:
             ProgressView("Loading familiars…")

@@ -1089,6 +1089,49 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testUnavailableQueuedPromptInvalidatesSuspendedSpotlightLookup() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let lookupRequested = XCTestExpectation(
+            description: "Spotlight lookup requested before queued prompt"
+        )
+        var lookupContinuation: CheckedContinuation<Int?, Never>?
+        var prompt = ""
+        var resumeCount = 0
+        let token = coordinator.begin()
+        let route = Task {
+            await SpotlightSessionRouteRunner.run(
+                token: token,
+                coordinator: coordinator,
+                lookup: {
+                    lookupRequested.fulfill()
+                    return await withCheckedContinuation { continuation in
+                        lookupContinuation = continuation
+                    }
+                },
+                cancelResume: {},
+                resume: { _ in resumeCount += 1 }
+            )
+        }
+        await fulfillment(of: [lookupRequested], timeout: 1)
+
+        let queuedForSend = ChatView.consumeQueuedPrompt(
+            "Explain this session",
+            coordinator: coordinator,
+            stage: { prompt = $0 },
+            canSend: {
+                XCTAssertFalse(coordinator.isCurrent(token))
+                return false
+            }
+        )
+        lookupContinuation?.resume(returning: 1)
+        await route.value
+
+        XCTAssertNil(queuedForSend)
+        XCTAssertEqual(prompt, "Explain this session")
+        XCTAssertEqual(resumeCount, 0)
+    }
+
+    @MainActor
     func testResetDuringSpotlightLookupBlocksStaleResume() async {
         let coordinator = ChatRouteGenerationCoordinator()
         let lookupRequested = XCTestExpectation(

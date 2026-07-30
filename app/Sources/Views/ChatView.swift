@@ -174,6 +174,20 @@ struct ChatView: View {
     }
 }
 
+extension ChatView {
+    static func consumeQueuedPrompt(
+        _ queued: String?,
+        coordinator: ChatRouteGenerationCoordinator,
+        stage: (String) -> Void,
+        canSend: () -> Bool
+    ) -> String? {
+        guard let queued else { return nil }
+        coordinator.invalidate()
+        stage(queued)
+        return canSend() ? queued : nil
+    }
+}
+
 private extension ChatView {
     var activeFamiliarProfile: FamiliarProfileKey? {
         ChatFamiliarProfile.active(
@@ -220,9 +234,12 @@ private extension ChatView {
     /// Send a queued intent when configured; the nested task survives
     /// cancellation caused by consuming the router value.
     private func consumeRouterPrompt() async {
-        guard let queued = router.consumePrompt() else { return }
-        prompt = queued
-        guard canSend else { return }
+        guard let queued = Self.consumeQueuedPrompt(
+            router.consumePrompt(),
+            coordinator: routeCoordinator,
+            stage: { prompt = $0 },
+            canSend: { canSend }
+        ) else { return }
         prompt = ""
         startSend(queued)
     }
