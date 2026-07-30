@@ -1,5 +1,8 @@
 import Foundation
 
+// Session lifecycle state intentionally stays with the main-actor model.
+// swiftlint:disable file_length
+
 /// One rendered row in the chat transcript.
 struct ChatItem: Identifiable {
     enum Kind {
@@ -42,7 +45,18 @@ struct ToolCallInfo {
 /// Drives the agentic chat surface: owns the engine session, the rendered
 /// transcript, and the delegate bridge from Rust callback threads.
 @MainActor
+// swiftlint:disable:next type_body_length
 final class ChatModel: ObservableObject {
+    enum SessionOperationKind {
+        case start
+        case resume
+    }
+
+    typealias SessionOperation = @MainActor (
+        SessionOperationKind,
+        @MainActor () async throws -> ChatSession
+    ) async throws -> ChatSession
+
     @Published var items: [ChatItem] = []
     @Published var isBusy = false
     @Published var canRetry = false
@@ -62,8 +76,13 @@ final class ChatModel: ObservableObject {
     private var session: ChatSession?
     private var sessionSettings: ChatSettings?
     private var sessionWorkspace: String?
+    private var transcriptGeneration: UInt64 = 0
+    private var operationGeneration: UInt64 = 0
+    private var activeOperationGeneration: UInt64?
+    private var activeOperationSession: ChatSession?
     private var approvalQueue: [PendingApproval] = []
     private let defaults: UserDefaults
+    private let performSessionOperation: SessionOperation
 
     static let permissionModeKey = "chat-permission-mode"
     /// Absolute path of the git workspace chat should operate in, written by
@@ -86,8 +105,14 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        performSessionOperation: @escaping SessionOperation = { _, operation in
+            try await operation()
+        }
+    ) {
         self.defaults = defaults
+        self.performSessionOperation = performSessionOperation
         permissionMode = ChatPermissionMode(
             storageValue: defaults.string(forKey: Self.permissionModeKey)
         )
@@ -123,42 +148,77 @@ final class ChatModel: ObservableObject {
 
     func send(prompt: String, settings: ChatSettings) async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isBusy else { return }
+        guard !trimmed.isEmpty,
+              let generation = claimOperation()
+        else { return }
+        defer { finishOperation(generation: generation) }
 
         canRetry = false
         do {
-            let session = try await activeSession(for: settings)
+            guard let session = try await activeSession(
+                for: settings,
+                generation: generation
+            ), setOperationSession(session, generation: generation) else { return }
             items.append(ChatItem(kind: .user, text: trimmed))
-            isBusy = true
-            defer { isBusy = false }
-            try await session.send(prompt: trimmed, delegate: ChatBridge(model: self))
+            try await session.send(
+                prompt: trimmed,
+                delegate: GenerationChatBridge(
+                    model: self,
+                    generation: transcriptGeneration
+                )
+            )
         } catch {
+            guard isCurrentOperation(generation: generation) else { return }
             appendError(error.localizedDescription)
         }
     }
 
     /// Re-run the last failed turn without repeating the user message.
     func retry() async {
-        guard let session, canRetry, !isBusy else { return }
+        guard let session,
+              canRetry,
+              let generation = claimOperation(session: session)
+        else { return }
+        defer { finishOperation(generation: generation) }
+
         canRetry = false
-        isBusy = true
-        defer { isBusy = false }
         do {
-            try await session.retry(delegate: ChatBridge(model: self))
+            try await session.retry(
+                delegate: GenerationChatBridge(
+                    model: self,
+                    generation: transcriptGeneration
+                )
+            )
         } catch {
+            guard isCurrentOperation(generation: generation) else { return }
             appendError(error.localizedDescription)
         }
     }
 
     func stop() {
-        session?.stop()
+        guard let generation = activeOperationGeneration else {
+            session?.stop()
+            return
+        }
+        if let runningSession = activeOperationSession {
+            runningSession.stop()
+        } else {
+            invalidateOperation(generation: generation)
+        }
     }
 
     /// Discard the session and transcript (e.g. after changing settings).
     func reset() {
-        stop()
+        let runningSession = invalidateOperation()
+        transcriptGeneration &+= 1
+        (runningSession ?? session)?.stop()
+        clearSessionState()
+    }
+
+    private func clearSessionState() {
         session = nil
         sessionSettings = nil
+        sessionWorkspace = nil
         items = []
         canRetry = false
         // Dropping unanswered responders denies their tool calls.
@@ -168,24 +228,36 @@ final class ChatModel: ObservableObject {
 
     /// Reuse the live session when settings and workspace are unchanged;
     /// otherwise start a fresh one bound to the effective workspace.
-    private func activeSession(for settings: ChatSettings) async throws -> ChatSession {
+    private func activeSession(
+        for settings: ChatSettings,
+        generation: UInt64
+    ) async throws -> ChatSession? {
+        guard isCurrentOperation(generation: generation) else { return nil }
         let workspace = effectiveWorkspaceURL
         if let session, sessionSettings == settings, sessionWorkspace == workspace.path {
             return session
         }
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let permissionMode = permissionMode
+        let injectContext = injectContext
+        let engine = engine
+        let fresh = try await performSessionOperation(.start) {
+            try await engine.startChat(
+                provider: .codex,
+                apiKey: "",
+                model: settings.model,
+                effort: nil,
+                workspaceDir: workspace.path,
+                permissionMode: permissionMode,
+                storageDir: Self.sessionStoreURL.path,
+                familiar: nil,
+                injectContext: injectContext
+            )
+        }
+        guard isCurrentOperation(generation: generation) else { return nil }
+
+        transcriptGeneration &+= 1
         items = []
-        let fresh = try await engine.startChat(
-            provider: .codex,
-            apiKey: "",
-            model: settings.model,
-            effort: nil,
-            workspaceDir: workspace.path,
-            permissionMode: permissionMode,
-            storageDir: Self.sessionStoreURL.path,
-            familiar: nil,
-            injectContext: injectContext
-        )
         session = fresh
         sessionSettings = settings
         sessionWorkspace = workspace.path
@@ -202,31 +274,84 @@ final class ChatModel: ObservableObject {
 
     /// Swap the live conversation for a stored one, restoring its transcript.
     func resume(_ summary: ChatSessionSummary, settings: ChatSettings) async {
-        guard !isBusy else { return }
+        guard let generation = claimOperation() else { return }
+        defer { finishOperation(generation: generation) }
+
         do {
             let workspace = effectiveWorkspaceURL
             try FileManager.default.createDirectory(
                 at: workspace, withIntermediateDirectories: true
             )
-            let resumed = try await engine.resumeChat(
-                provider: .codex,
-                apiKey: "",
-                model: settings.model,
-                effort: nil,
-                workspaceDir: workspace.path,
-                permissionMode: permissionMode,
-                storageDir: Self.sessionStoreURL.path,
-                sessionId: summary.sessionId,
-                injectContext: injectContext
-            )
-            reset()
+            let permissionMode = permissionMode
+            let injectContext = injectContext
+            let engine = engine
+            let resumed = try await performSessionOperation(.resume) {
+                try await engine.resumeChat(
+                    provider: .codex,
+                    apiKey: "",
+                    model: settings.model,
+                    effort: nil,
+                    workspaceDir: workspace.path,
+                    permissionMode: permissionMode,
+                    storageDir: Self.sessionStoreURL.path,
+                    sessionId: summary.sessionId,
+                    injectContext: injectContext
+                )
+            }
+            guard isCurrentOperation(generation: generation) else { return }
+            let transcript = await resumed.transcript()
+            guard isCurrentOperation(generation: generation) else { return }
+
+            transcriptGeneration &+= 1
+            session?.stop()
+            clearSessionState()
             session = resumed
             sessionSettings = settings
             sessionWorkspace = workspace.path
-            items = Self.items(fromTranscript: await resumed.transcript())
+            items = Self.items(fromTranscript: transcript)
         } catch {
+            guard isCurrentOperation(generation: generation) else { return }
             appendError(error.localizedDescription)
         }
+    }
+
+    private func claimOperation(session: ChatSession? = nil) -> UInt64? {
+        guard activeOperationGeneration == nil, !isBusy else { return nil }
+        operationGeneration &+= 1
+        activeOperationGeneration = operationGeneration
+        activeOperationSession = session
+        isBusy = true
+        return operationGeneration
+    }
+
+    private func setOperationSession(_ session: ChatSession, generation: UInt64) -> Bool {
+        guard activeOperationGeneration == generation else { return false }
+        activeOperationSession = session
+        return true
+    }
+
+    private func isCurrentOperation(generation: UInt64) -> Bool {
+        activeOperationGeneration == generation
+    }
+
+    private func finishOperation(generation: UInt64) {
+        guard activeOperationGeneration == generation else { return }
+        activeOperationGeneration = nil
+        activeOperationSession = nil
+        isBusy = false
+    }
+
+    @discardableResult
+    private func invalidateOperation(generation: UInt64? = nil) -> ChatSession? {
+        guard let activeGeneration = activeOperationGeneration,
+              generation == nil || generation == activeGeneration
+        else { return nil }
+
+        let runningSession = activeOperationSession
+        activeOperationGeneration = nil
+        activeOperationSession = nil
+        isBusy = false
+        return runningSession
     }
 
     func deleteSession(_ summary: ChatSessionSummary) async {
@@ -261,7 +386,8 @@ final class ChatModel: ObservableObject {
 
     // MARK: - Bridge entry points (already on the main actor)
 
-    func appendAssistantText(_ delta: String) {
+    func appendAssistantText(_ delta: String, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         if let last = items.indices.last, items[last].kind == .assistant {
             items[last].text += delta
         } else {
@@ -269,7 +395,8 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    func appendThinking(_ delta: String) {
+    func appendThinking(_ delta: String, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         if let last = items.indices.last, items[last].kind == .thinking {
             items[last].text += delta
         } else {
@@ -277,7 +404,13 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    func beginTool(id: String, name: String, inputJson: String) {
+    func beginTool(
+        id: String,
+        name: String,
+        inputJson: String,
+        generation: UInt64? = nil
+    ) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         let info = ToolCallInfo(
             toolId: id,
             name: name,
@@ -286,36 +419,130 @@ final class ChatModel: ObservableObject {
         items.append(ChatItem(kind: .tool, text: name, tool: info))
     }
 
-    func endTool(id: String, result: String, isError: Bool) {
+    func endTool(
+        id: String,
+        result: String,
+        isError: Bool,
+        generation: UInt64? = nil
+    ) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         guard let index = items.lastIndex(where: { $0.tool?.toolId == id }) else { return }
         items[index].tool?.result = result
         items[index].tool?.isError = isError
         items[index].tool?.isRunning = false
     }
 
-    func appendStatus(_ message: String) {
+    func appendStatus(_ message: String, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         items.append(ChatItem(kind: .status, text: message))
     }
 
-    func finishTurn(stopReason: String) {
+    func finishTurn(stopReason: String, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         if stopReason == "cancelled" {
             appendStatus("Stopped.")
         }
     }
 
-    func appendError(_ message: String) {
+    func appendError(_ message: String, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         items.append(ChatItem(kind: .error, text: message))
         canRetry = true
+    }
+
+    private func acceptsTranscriptCallback(generation: UInt64?) -> Bool {
+        generation == nil || generation == transcriptGeneration
     }
 
     // MARK: - Approvals
 
     /// Show the request, or queue it behind the one already on screen.
-    func receiveApproval(_ approval: PendingApproval) {
+    func receiveApproval(_ approval: PendingApproval, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
         if pendingApproval == nil {
             pendingApproval = approval
         } else {
             approvalQueue.append(approval)
+        }
+    }
+
+    private final class GenerationChatBridge: ChatDelegate, @unchecked Sendable {
+        weak var model: ChatModel?
+        private let generation: UInt64
+
+        init(model: ChatModel, generation: UInt64) {
+            self.model = model
+            self.generation = generation
+        }
+
+        private func publish(
+            _ update: @escaping @MainActor @Sendable (ChatModel, UInt64) -> Void
+        ) {
+            Task { @MainActor [model, generation] in
+                guard let model else { return }
+                update(model, generation)
+            }
+        }
+
+        func onText(text: String) {
+            publish { model, generation in
+                model.appendAssistantText(text, generation: generation)
+            }
+        }
+
+        func onThinking(text: String) {
+            publish { model, generation in
+                model.appendThinking(text, generation: generation)
+            }
+        }
+
+        func onToolStart(toolId: String, toolName: String, inputJson: String) {
+            publish { model, generation in
+                model.beginTool(
+                    id: toolId,
+                    name: toolName,
+                    inputJson: inputJson,
+                    generation: generation
+                )
+            }
+        }
+
+        func onToolEnd(toolId: String, toolName: String, result: String, isError: Bool) {
+            publish { model, generation in
+                model.endTool(
+                    id: toolId,
+                    result: result,
+                    isError: isError,
+                    generation: generation
+                )
+            }
+        }
+
+        func onStatus(message: String) {
+            publish { model, generation in
+                model.appendStatus(message, generation: generation)
+            }
+        }
+
+        func onPermissionRequest(request: ChatPermissionRequest, responder: ChatPermissionResponder) {
+            publish { model, generation in
+                model.receiveApproval(
+                    PendingApproval(request: request, responder: responder),
+                    generation: generation
+                )
+            }
+        }
+
+        func onDone(stopReason: String) {
+            publish { model, generation in
+                model.finishTurn(stopReason: stopReason, generation: generation)
+            }
+        }
+
+        func onError(message: String) {
+            publish { model, generation in
+                model.appendError(message, generation: generation)
+            }
         }
     }
 

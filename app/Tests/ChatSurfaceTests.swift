@@ -1,7 +1,136 @@
 import XCTest
 @testable import CovenPocket
 
+// Chat surface coverage is kept together to share the deterministic session seam.
+// swiftlint:disable file_length
+
+// swiftlint:disable:next type_body_length
 final class ChatSurfaceTests: XCTestCase {
+    private final class StubChatSession: ChatSession, @unchecked Sendable {
+        private let transcriptMessages: [ChatMessage]
+
+        init(transcript: [ChatMessage] = []) {
+            transcriptMessages = transcript
+            super.init(noHandle: ChatSession.NoHandle())
+        }
+
+        required init(unsafeFromHandle handle: UInt64) {
+            transcriptMessages = []
+            super.init(unsafeFromHandle: handle)
+        }
+
+        override func send(prompt: String, delegate: ChatDelegate) async throws {}
+
+        override func transcript() async -> [ChatMessage] {
+            transcriptMessages
+        }
+
+        override func stop() {}
+    }
+
+    private final class SuspendedChatSession: ChatSession, @unchecked Sendable {
+        let sendRequested = XCTestExpectation(description: "chat send requested")
+
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var delegate: ChatDelegate?
+
+        init() {
+            super.init(noHandle: ChatSession.NoHandle())
+        }
+
+        required init(unsafeFromHandle handle: UInt64) {
+            super.init(unsafeFromHandle: handle)
+        }
+
+        override func send(prompt: String, delegate: ChatDelegate) async throws {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                self.continuation = continuation
+                self.delegate = delegate
+                lock.unlock()
+                sendRequested.fulfill()
+            }
+        }
+
+        override func stop() {}
+
+        func publishStaleCallbackAndFinish() {
+            lock.lock()
+            let continuation = continuation
+            let delegate = delegate
+            self.continuation = nil
+            self.delegate = nil
+            lock.unlock()
+
+            delegate?.onText(text: "stale callback")
+            delegate?.onDone(stopReason: "cancelled")
+            continuation?.resume()
+        }
+    }
+
+    @MainActor
+    private final class SessionBoundary {
+        let startRequested = XCTestExpectation(description: "session start requested")
+        let resumeRequested = XCTestExpectation(description: "session resume requested")
+
+        var suspendNextStart = false
+        var suspendNextResume = false
+        var startCallCount = 0
+        var resumeCallCount = 0
+        var startSessions: [ChatSession] = []
+        var resumeSessions: [ChatSession] = []
+
+        private var startContinuation: CheckedContinuation<ChatSession, Error>?
+        private var resumeContinuation: CheckedContinuation<ChatSession, Error>?
+
+        func perform(
+            _ kind: ChatModel.SessionOperationKind,
+            operation: @MainActor () async throws -> ChatSession
+        ) async throws -> ChatSession {
+            switch kind {
+            case .start:
+                startCallCount += 1
+                if suspendNextStart {
+                    suspendNextStart = false
+                    startRequested.fulfill()
+                    return try await withCheckedThrowingContinuation { continuation in
+                        startContinuation = continuation
+                    }
+                }
+                if startSessions.isEmpty {
+                    return try await operation()
+                }
+                return startSessions.removeFirst()
+            case .resume:
+                resumeCallCount += 1
+                if suspendNextResume {
+                    suspendNextResume = false
+                    resumeRequested.fulfill()
+                    return try await withCheckedThrowingContinuation { continuation in
+                        resumeContinuation = continuation
+                    }
+                }
+                if resumeSessions.isEmpty {
+                    return try await operation()
+                }
+                return resumeSessions.removeFirst()
+            }
+        }
+
+        func finishStart(with session: ChatSession) {
+            let continuation = startContinuation
+            startContinuation = nil
+            continuation?.resume(returning: session)
+        }
+
+        func finishResume(with session: ChatSession) {
+            let continuation = resumeContinuation
+            resumeContinuation = nil
+            continuation?.resume(returning: session)
+        }
+    }
+
     private func makeWorkspace() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("chat-tests-\(UUID().uuidString)", isDirectory: true)
@@ -125,6 +254,168 @@ final class ChatSurfaceTests: XCTestCase {
             return
         }
         XCTFail("Expected a relative workspace to be rejected")
+    }
+
+    @MainActor
+    func testSecondSendIsRejectedWhileSessionCreationIsSuspended() async {
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = true
+        boundary.startSessions = [StubChatSession()]
+        let firstSession = StubChatSession()
+        let model = ChatModel(
+            performSessionOperation: boundary.perform
+        )
+        let settings = ChatSettings(backend: .codex, model: "test", daemonProjectRoot: "")
+
+        let firstSend = Task {
+            await model.send(prompt: "first", settings: settings)
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+
+        XCTAssertTrue(model.isBusy)
+        await model.send(prompt: "second", settings: settings)
+        XCTAssertEqual(boundary.startCallCount, 1)
+
+        boundary.finishStart(with: firstSession)
+        await firstSend.value
+
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(model.items.map(\.text), ["first"])
+    }
+
+    @MainActor
+    func testResetInvalidatesSuspendedSessionCreation() async {
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = true
+        boundary.startSessions = [StubChatSession()]
+        let model = ChatModel(
+            performSessionOperation: boundary.perform
+        )
+        let settings = ChatSettings(backend: .codex, model: "test", daemonProjectRoot: "")
+
+        let staleSend = Task {
+            await model.send(prompt: "stale", settings: settings)
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+
+        model.reset()
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.items.isEmpty)
+
+        boundary.finishStart(with: StubChatSession())
+        await staleSend.value
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.items.isEmpty)
+
+        await model.send(prompt: "fresh", settings: settings)
+        XCTAssertEqual(boundary.startCallCount, 2)
+        XCTAssertEqual(model.items.map(\.text), ["fresh"])
+    }
+
+    @MainActor
+    func testStopInvalidatesSuspendedSessionCreation() async {
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = true
+        boundary.startSessions = [StubChatSession()]
+        let model = ChatModel(
+            performSessionOperation: boundary.perform
+        )
+        let settings = ChatSettings(backend: .codex, model: "test", daemonProjectRoot: "")
+
+        let staleSend = Task {
+            await model.send(prompt: "stale", settings: settings)
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+
+        model.stop()
+        XCTAssertFalse(model.isBusy)
+
+        boundary.finishStart(with: StubChatSession())
+        await staleSend.value
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.items.isEmpty)
+
+        await model.send(prompt: "fresh", settings: settings)
+        XCTAssertEqual(boundary.startCallCount, 2)
+        XCTAssertEqual(model.items.map(\.text), ["fresh"])
+    }
+
+    @MainActor
+    func testResetDropsCallbacksFromInvalidatedRunningSend() async {
+        let boundary = SessionBoundary()
+        let staleSession = SuspendedChatSession()
+        boundary.startSessions = [staleSession, StubChatSession()]
+        let model = ChatModel(
+            performSessionOperation: boundary.perform
+        )
+        let settings = ChatSettings(backend: .codex, model: "test", daemonProjectRoot: "")
+
+        let staleSend = Task {
+            await model.send(prompt: "stale", settings: settings)
+        }
+        await fulfillment(of: [staleSession.sendRequested], timeout: 1)
+
+        model.reset()
+        await model.send(prompt: "fresh", settings: settings)
+        staleSession.publishStaleCallbackAndFinish()
+        await staleSend.value
+        await Task.yield()
+        await Task.yield()
+
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(model.items.map(\.text), ["fresh"])
+    }
+
+    @MainActor
+    func testResumeCannotOverlapSendOrPublishAfterReset() async {
+        let boundary = SessionBoundary()
+        boundary.suspendNextResume = true
+        boundary.startSessions = [StubChatSession(), StubChatSession()]
+        let resumedSession = StubChatSession(transcript: [
+            ChatMessage(role: "assistant", text: "stale resume")
+        ])
+        let model = ChatModel(
+            performSessionOperation: boundary.perform
+        )
+        let summary = makeSummary()
+        let resumeSettings = ChatSettings(
+            backend: .codex,
+            model: "resume",
+            daemonProjectRoot: ""
+        )
+        let sendSettings = ChatSettings(
+            backend: .codex,
+            model: "send",
+            daemonProjectRoot: ""
+        )
+
+        let resume = Task {
+            await model.resume(summary, settings: resumeSettings)
+        }
+        await fulfillment(of: [boundary.resumeRequested], timeout: 1)
+
+        XCTAssertTrue(model.isBusy)
+        await model.send(prompt: "blocked", settings: sendSettings)
+        XCTAssertEqual(boundary.startCallCount, 0)
+
+        model.reset()
+        boundary.suspendNextStart = true
+        let freshSend = Task {
+            await model.send(prompt: "fresh", settings: sendSettings)
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+
+        boundary.finishResume(with: resumedSession)
+        await resume.value
+        XCTAssertTrue(model.isBusy, "a stale resume must not finish the newer send")
+        XCTAssertTrue(model.items.isEmpty, "a stale resume must not restore its transcript")
+
+        boundary.finishStart(with: StubChatSession())
+        await freshSend.value
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(boundary.resumeCallCount, 1)
+        XCTAssertEqual(boundary.startCallCount, 1)
+        XCTAssertEqual(model.items.map(\.text), ["fresh"])
     }
 
     @MainActor
