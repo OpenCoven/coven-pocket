@@ -26,11 +26,11 @@ struct FamiliarPresentation: Equatable {
         role = Self.nonblank(identity.role)
     }
 
-    init(id: String) {
-        self.id = id
-        displayName = id
-        glyph = "✦"
-        role = nil
+    init(identity: FamiliarIdentity) {
+        id = identity.id
+        displayName = identity.displayName
+        glyph = Self.glyph(icon: nil, emoji: identity.emoji)
+        role = Self.nonblank(identity.role)
     }
 
     var accessibilityLabel: String {
@@ -109,30 +109,17 @@ enum FamiliarSealResolver {
     }
 
     static func companion(
-        sessionFamiliarID: String?,
+        activeFamiliar: FamiliarIdentity?,
         hasActiveSession: Bool,
         selectedFamiliar: FamiliarIdentity?,
         roster: [RemoteFamiliar]
     ) -> FamiliarSealValue? {
         if hasActiveSession {
-            guard let sessionFamiliarID else { return nil }
-            let presentation: FamiliarPresentation
-            if let remote = roster.first(where: {
-                $0.id.caseInsensitiveCompare(sessionFamiliarID) == .orderedSame
-            }) {
-                presentation = FamiliarPresentation(remote: remote)
-            } else if let selectedFamiliar,
-                      selectedFamiliar.id.caseInsensitiveCompare(
-                        sessionFamiliarID
-                      ) == .orderedSame {
-                presentation = FamiliarPresentation(
-                    identity: selectedFamiliar,
-                    roster: roster
-                )
-            } else {
-                presentation = FamiliarPresentation(id: sessionFamiliarID)
-            }
-            return seal(presentation, binding: .activeConversation)
+            guard let activeFamiliar else { return nil }
+            return seal(
+                FamiliarPresentation(identity: activeFamiliar),
+                binding: .activeConversation
+            )
         }
         guard let selectedFamiliar else { return nil }
         return seal(

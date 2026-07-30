@@ -82,6 +82,7 @@ final class ChatModel: ObservableObject {
 
     private var session: ChatSession?
     private var sessionSettings: ChatSettings?
+    private var sessionReplacementSettings: ChatSettings?
     private var sessionWorkspace: String?
     private var transcriptGeneration: UInt64 = 0
     private var operationGeneration: UInt64 = 0
@@ -236,6 +237,7 @@ final class ChatModel: ObservableObject {
     private func clearSessionState() {
         session = nil
         sessionSettings = nil
+        sessionReplacementSettings = nil
         sessionWorkspace = nil
         activeFamiliar = nil
         items = []
@@ -254,7 +256,9 @@ final class ChatModel: ObservableObject {
     ) async throws -> ChatSession? {
         guard isCurrentOperation(generation: generation) else { return nil }
         let workspace = effectiveWorkspaceURL
-        if let session, sessionSettings == settings, sessionWorkspace == workspace.path {
+        if let session,
+           sessionReplacementSettings == settings,
+           sessionWorkspace == workspace.path {
             return session
         }
         let familiar = try Self.resolvedFamiliar(
@@ -289,6 +293,7 @@ final class ChatModel: ObservableObject {
         items = []
         session = fresh
         sessionSettings = settings
+        sessionReplacementSettings = settings
         sessionWorkspace = workspace.path
         activeFamiliar = familiar
         return fresh
@@ -352,6 +357,7 @@ final class ChatModel: ObservableObject {
             clearSessionState()
             session = resumed
             sessionSettings = resumedSettings
+            sessionReplacementSettings = settings
             sessionWorkspace = workspace.path
             activeFamiliar = summary.familiar
             items = Self.items(fromTranscript: transcript)

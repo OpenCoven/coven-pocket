@@ -2,16 +2,12 @@ import Foundation
 
 extension CompanionChatModel {
     func performSend(
-        prompt: String,
-        projectRoot: String,
-        familiarID: String?,
+        context: CompanionSendContext,
         pairing verified: DaemonPairing,
         generation: UInt64
     ) async throws {
         guard try await replaceSessionIfNeeded(
-            prompt: prompt,
-            projectRoot: projectRoot,
-            familiarID: familiarID,
+            context: context,
             pairing: verified,
             generation: generation
         ) else { return }
@@ -21,13 +17,11 @@ extension CompanionChatModel {
             try await client.sendInput(
                 pairing: verified,
                 sessionID: session.id,
-                data: prompt
+                data: context.prompt
             )
         } else {
             try await prepareAndLaunch(
-                prompt: prompt,
-                projectRoot: projectRoot,
-                familiarID: familiarID,
+                context: context,
                 pairing: verified,
                 generation: generation
             )
@@ -38,9 +32,7 @@ extension CompanionChatModel {
     }
 
     func replaceSessionIfNeeded(
-        prompt: String,
-        projectRoot: String,
-        familiarID: String?,
+        context: CompanionSendContext,
         pairing: DaemonPairing,
         generation: UInt64
     ) async throws -> Bool {
@@ -62,8 +54,8 @@ extension CompanionChatModel {
             abandonSession()
             return true
         }
-        guard sessionProjectRoot != projectRoot
-                || sessionFamiliarID != familiarID else { return true }
+        guard sessionProjectRoot != context.projectRoot
+                || sessionFamiliarID != context.familiarID else { return true }
         abandonSession()
         let cleaned = await beginCleanup(
             of: activeSession,
@@ -73,9 +65,7 @@ extension CompanionChatModel {
         guard generation == operationGeneration else { return false }
         guard cleaned else {
             setRetryContext(
-                prompt: prompt,
-                projectRoot: projectRoot,
-                familiarID: familiarID
+                context
             )
             return false
         }
@@ -147,9 +137,7 @@ extension CompanionChatModel {
     }
 
     func prepareAndLaunch(
-        prompt: String,
-        projectRoot: String,
-        familiarID: String?,
+        context: CompanionSendContext,
         pairing: DaemonPairing,
         generation: UInt64
     ) async throws {
@@ -158,10 +146,10 @@ extension CompanionChatModel {
         do {
             let launched = try await client.launch(
                 pairing: pairing,
-                projectRoot: projectRoot,
-                prompt: prompt,
-                title: Self.title(from: prompt),
-                familiarID: familiarID
+                projectRoot: context.projectRoot,
+                prompt: context.prompt,
+                title: Self.title(from: context.prompt),
+                familiarID: context.familiarID
             )
             launchInFlight = false
             guard generation == operationGeneration else {
@@ -172,7 +160,7 @@ extension CompanionChatModel {
                 )
                 return
             }
-            guard launched.familiarId == familiarID else {
+            guard launched.familiarId == context.familiarID else {
                 await beginCleanup(
                     of: launched,
                     pairing: pairing,
@@ -182,15 +170,19 @@ extension CompanionChatModel {
                 throw FamiliarConfirmationError()
             }
             session = launched
-            sessionProjectRoot = projectRoot
-            sessionFamiliarID = familiarID
-            initialPrompt = prompt
+            sessionProjectRoot = context.projectRoot
+            pinSessionFamiliar(
+                id: context.familiarID,
+                presentation: context.familiarPresentation,
+                pairing: pairing
+            )
+            initialPrompt = context.prompt
             initialPromptID = "companion-initial-\(launched.id)"
             items = [
                 ChatItem(
                     id: initialPromptID ?? "companion-initial",
                     kind: .user,
-                    text: prompt
+                    text: context.prompt
                 )
             ]
         } catch {
@@ -201,9 +193,7 @@ extension CompanionChatModel {
 
     func handleSendFailure(
         _ error: Error,
-        prompt: String,
-        projectRoot: String,
-        familiarID: String?,
+        context: CompanionSendContext,
         generation: UInt64
     ) {
         guard generation == operationGeneration else {
@@ -217,11 +207,7 @@ extension CompanionChatModel {
             abandonSession()
         }
         items.append(ChatItem(kind: .error, text: error.localizedDescription))
-        setRetryContext(
-            prompt: prompt,
-            projectRoot: projectRoot,
-            familiarID: familiarID
-        )
+        setRetryContext(context)
     }
 
     static func availability(
@@ -292,19 +278,14 @@ extension CompanionChatModel {
     func abandonSession() {
         pollTask?.cancel()
         pollTask = nil
-        session = nil
-        sessionProjectRoot = nil
-        sessionFamiliarID = nil
+        clearSessionBinding()
     }
 
-    func setRetryContext(
-        prompt: String,
-        projectRoot: String,
-        familiarID: String?
-    ) {
-        retryPrompt = prompt
-        retryProjectRoot = projectRoot
-        retryFamiliarID = familiarID
+    func setRetryContext(_ context: CompanionSendContext) {
+        retryPrompt = context.prompt
+        retryProjectRoot = context.projectRoot
+        retryFamiliarID = context.familiarID
+        retryFamiliarPresentation = context.familiarPresentation
         canRetry = true
     }
 }

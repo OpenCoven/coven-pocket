@@ -17,13 +17,19 @@ extension CompanionChatModel {
     ) async -> Bool {
         let generation = operationGeneration
         let retainedRetryContext = retryPrompt.map {
-            (prompt: $0, projectRoot: retryProjectRoot, familiarID: retryFamiliarID)
+            (
+                prompt: $0,
+                projectRoot: retryProjectRoot,
+                familiarID: retryFamiliarID,
+                familiarPresentation: retryFamiliarPresentation
+            )
         }
         defer {
             if generation == operationGeneration, let retainedRetryContext {
                 retryPrompt = retainedRetryContext.prompt
                 retryProjectRoot = retainedRetryContext.projectRoot
                 retryFamiliarID = retainedRetryContext.familiarID
+                retryFamiliarPresentation = retainedRetryContext.familiarPresentation
             }
         }
         pendingCleanup = sessionToClean

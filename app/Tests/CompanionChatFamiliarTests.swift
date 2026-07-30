@@ -1,7 +1,10 @@
 import XCTest
 @testable import CovenPocket
 
+// swiftlint:disable file_length
+
 @MainActor
+// swiftlint:disable:next type_body_length
 final class CompanionChatFamiliarTests: XCTestCase {
     func testChangingFamiliarKillsOldSessionBeforeLaunchingReplacement() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
@@ -30,22 +33,39 @@ final class CompanionChatFamiliarTests: XCTestCase {
     func testSameProjectAndFamiliarReuseSession() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         let model = CompanionChatModel(client: client)
+        let profile = FamiliarProfileKey.companion(pairing: pairedDaemon())
+        let firstPresentation = companionFamiliar(
+            id: "sage",
+            name: "Sage on A",
+            emoji: "🅰️",
+            role: "A role"
+        )
         await model.send(
             prompt: "first",
             projectRoot: "/srv/repo",
-            familiarID: "sage"
+            familiarID: "sage",
+            familiar: firstPresentation,
+            familiarProfile: profile
         )
         completeTurn(on: model)
 
         await model.send(
             prompt: "second",
             projectRoot: "/srv/repo",
-            familiarID: "sage"
+            familiarID: "sage",
+            familiar: companionFamiliar(
+                id: "sage",
+                name: "Relabeled Sage",
+                emoji: "🅱️",
+                role: "B role"
+            ),
+            familiarProfile: profile
         )
 
         XCTAssertEqual(client.launchedFamiliarIDs, ["sage"])
         XCTAssertEqual(client.sentInputs, ["second"])
         XCTAssertTrue(client.killedSessionIDs.isEmpty)
+        XCTAssertEqual(model.sessionFamiliar, firstPresentation)
     }
 
     func testAddingFamiliarReplacesIdentitylessSession() async {
@@ -104,11 +124,19 @@ final class CompanionChatFamiliarTests: XCTestCase {
         let client = FakeCompanionSessionClient(gate: .notPaired)
         client.suspendsGate = true
         let model = CompanionChatModel(client: client)
+        let presentation = companionFamiliar(
+            id: "sage",
+            name: "Sage on A",
+            emoji: "🅰️",
+            role: "A role"
+        )
         let firstSend = Task {
             await model.send(
                 prompt: "first",
                 projectRoot: "/srv/repo",
-                familiarID: "sage"
+                familiarID: "sage",
+                familiar: presentation,
+                familiarProfile: .companion(pairing: pairedDaemon())
             )
         }
         await fulfillment(of: [client.gateRequested], timeout: 1)
@@ -126,16 +154,25 @@ final class CompanionChatFamiliarTests: XCTestCase {
         await model.retry()
 
         XCTAssertEqual(client.launchedFamiliarIDs, ["sage"])
+        XCTAssertEqual(model.sessionFamiliar, presentation)
     }
 
     func testLaunchFailureRetryUsesOriginalFamiliar() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         client.launchError = .polling
         let model = CompanionChatModel(client: client)
+        let presentation = companionFamiliar(
+            id: "sage",
+            name: "Sage on A",
+            emoji: "🅰️",
+            role: "A role"
+        )
         await model.send(
             prompt: "first",
             projectRoot: "/srv/repo",
-            familiarID: "sage"
+            familiarID: "sage",
+            familiar: presentation,
+            familiarProfile: .companion(pairing: pairedDaemon())
         )
 
         XCTAssertEqual(model.retryFamiliarID, "sage")
@@ -143,23 +180,35 @@ final class CompanionChatFamiliarTests: XCTestCase {
         await model.retry()
 
         XCTAssertEqual(client.launchedFamiliarIDs, ["sage", "sage"])
+        XCTAssertEqual(model.sessionFamiliar, presentation)
     }
 
     func testFamiliarChangeKillFailureBlocksReplacementAndRetriesIdentity() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         let model = CompanionChatModel(client: client)
+        let profile = FamiliarProfileKey.companion(pairing: pairedDaemon())
         await model.send(
             prompt: "first",
             projectRoot: "/srv/repo",
-            familiarID: "sage"
+            familiarID: "sage",
+            familiar: companionFamiliar(id: "sage", name: "Sage on A"),
+            familiarProfile: profile
         )
         completeTurn(on: model)
         client.killError = .polling
+        let forge = companionFamiliar(
+            id: "forge",
+            name: "Forge on A",
+            emoji: "🔥",
+            role: "Implementation"
+        )
 
         await model.send(
             prompt: "second",
             projectRoot: "/srv/repo",
-            familiarID: "forge"
+            familiarID: "forge",
+            familiar: forge,
+            familiarProfile: profile
         )
 
         XCTAssertTrue(model.hasPendingCleanup)
@@ -176,6 +225,80 @@ final class CompanionChatFamiliarTests: XCTestCase {
         XCTAssertFalse(model.hasPendingCleanup)
         XCTAssertEqual(client.launchedFamiliarIDs, ["sage", "forge"])
         XCTAssertEqual(model.sessionFamiliarID, "forge")
+        XCTAssertEqual(model.sessionFamiliar, forge)
+    }
+
+    func testLaunchPinsDisplayMetadataToVerifiedEndpoint() async {
+        let endpointA = pairedDaemon(host: "a.local")
+        let endpointB = pairedDaemon(host: "b.local")
+        let client = FakeCompanionSessionClient(gate: .ready(endpointA))
+        let model = CompanionChatModel(client: client)
+        let familiarA = companionFamiliar(
+            id: "sage",
+            name: "Sage on A",
+            emoji: "🅰️",
+            role: "A role"
+        )
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "sage",
+            familiar: familiarA,
+            familiarProfile: .companion(pairing: endpointA)
+        )
+
+        client.gate = .ready(endpointB)
+        _ = await model.refreshAvailability()
+        let seal = FamiliarSealResolver.companion(
+            activeFamiliar: model.sessionFamiliar,
+            hasActiveSession: model.hasActiveSession,
+            selectedFamiliar: companionFamiliar(
+                id: "sage",
+                name: "Sage on B",
+                emoji: "🅱️",
+                role: "B role"
+            ),
+            roster: [
+                companionRemoteFamiliar(
+                    id: "sage",
+                    name: "Sage on B",
+                    emoji: "🅱️",
+                    role: "B role"
+                )
+            ]
+        )
+
+        XCTAssertEqual(model.sessionFamiliar, familiarA)
+        XCTAssertEqual(seal?.displayName, "Sage on A")
+        XCTAssertEqual(seal?.glyph, "🅰️")
+        XCTAssertEqual(seal?.role, "A role")
+    }
+
+    func testMismatchedPresentationProfileFallsBackToRawFamiliarID() async {
+        let endpointA = pairedDaemon(host: "a.local")
+        let client = FakeCompanionSessionClient(gate: .ready(endpointA))
+        let model = CompanionChatModel(client: client)
+
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: " SaGe ",
+            familiar: companionFamiliar(
+                id: "sage",
+                name: "Sage on B",
+                emoji: "🅱️",
+                role: "B role"
+            ),
+            familiarProfile: .companion(
+                host: "b.local",
+                port: endpointA.port
+            )
+        )
+
+        XCTAssertEqual(
+            model.sessionFamiliar,
+            companionFamiliar(id: "SaGe", name: "SaGe")
+        )
     }
 }
 
@@ -246,10 +369,16 @@ final class CompanionChatFamiliarAuthorityTests: XCTestCase {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         let model = CompanionChatModel(client: client)
 
-        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiar: companionFamiliar(id: "sage", name: "Sage"),
+            familiarProfile: .companion(pairing: pairedDaemon())
+        )
 
         XCTAssertNotNil(model.session)
         XCTAssertNil(model.sessionFamiliarID)
+        XCTAssertNil(model.sessionFamiliar)
         XCTAssertTrue(client.killedSessionIDs.isEmpty)
         XCTAssertFalse(model.items.contains { $0.kind == .error })
     }
@@ -292,6 +421,7 @@ final class CompanionChatFamiliarAuthorityTests: XCTestCase {
 
         XCTAssertNil(model.session)
         XCTAssertNil(model.sessionFamiliarID)
+        XCTAssertNil(model.sessionFamiliar)
     }
 
     func testStaleCleanupCompletionCannotOverwriteNewFamiliarBinding() async {
@@ -354,3 +484,36 @@ final class CompanionChatFamiliarAuthorityTests: XCTestCase {
         XCTAssertNil(model.retryFamiliarID)
     }
 }
+
+private func companionFamiliar(
+    id: String,
+    name: String,
+    emoji: String? = nil,
+    role: String? = nil
+) -> FamiliarIdentity {
+    FamiliarIdentity(
+        id: id,
+        displayName: name,
+        emoji: emoji,
+        role: role
+    )
+}
+
+private func companionRemoteFamiliar(
+    id: String,
+    name: String,
+    emoji: String? = nil,
+    role: String? = nil
+) -> RemoteFamiliar {
+    RemoteFamiliar(
+        id: id,
+        displayName: name,
+        emoji: emoji,
+        role: role,
+        description: nil,
+        pronouns: nil,
+        icon: nil
+    )
+}
+
+// swiftlint:enable file_length

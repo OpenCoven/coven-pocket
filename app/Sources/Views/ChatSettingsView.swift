@@ -23,7 +23,7 @@ struct ChatSettingsView: View {
                             if backend == .codex, settings.model.isEmpty {
                                 settings.model = client.defaultCodexModel
                             }
-                            synchronizeFamiliarProfile(useActiveConversation: true)
+                            synchronizeFamiliarProfile()
                         }
                     } else {
                         LabeledContent(
@@ -71,7 +71,7 @@ struct ChatSettingsView: View {
                     Section {
                         Button("Clear conversation", role: .destructive) {
                             model.reset()
-                            synchronizeFamiliarProfile(preserveCurrent: false)
+                            synchronizeFamiliarProfile()
                             dismiss()
                         }
                     } footer: {
@@ -94,7 +94,7 @@ struct ChatSettingsView: View {
             }
             .onChange(of: client.codexAccount?.profileId) {
                 normalizeBackendSelection()
-                synchronizeFamiliarProfile(preserveCurrent: false)
+                synchronizeFamiliarProfile()
             }
             .onChange(of: familiarModel.selectedFamiliar?.id) { oldID, newID in
                 guard oldID != newID,
@@ -128,24 +128,6 @@ struct ChatSettingsView: View {
         )
     }
 
-    private var hasActiveConversation: Bool {
-        switch settings.backend {
-        case .companionClaude:
-            return companionModel.hasActiveSession
-        case .codex:
-            return model.hasActiveSession
-        }
-    }
-
-    private var activeConversationFamiliarID: String? {
-        switch settings.backend {
-        case .companionClaude:
-            return companionModel.activeSessionFamiliarID
-        case .codex:
-            return model.activeFamiliar?.id
-        }
-    }
-
     private func normalizeBackendSelection() {
         guard companionModel.availability != .checking else { return }
         guard !availableBackends.contains(settings.backend),
@@ -158,27 +140,29 @@ struct ChatSettingsView: View {
         }
     }
 
-    private func synchronizeFamiliarProfile(
-        preserveCurrent: Bool? = nil,
-        useActiveConversation: Bool = false
-    ) {
-        let shouldPreserve = preserveCurrent ?? hasActiveConversation
+    private func synchronizeFamiliarProfile() {
         settings.familiarID = ChatFamiliarProfile.synchronize(
             activeFamiliarProfile,
-            model: familiarModel,
-            currentFamiliarID: useActiveConversation && shouldPreserve
-                ? activeConversationFamiliarID
-                : settings.familiarID,
-            preserveCurrent: shouldPreserve
+            model: familiarModel
         )
     }
 
     private func refreshFamiliarContext() async {
-        await companionModel.refreshAvailability()
-        normalizeBackendSelection()
-        synchronizeFamiliarProfile()
-        await familiarModel.refresh()
-        synchronizeFamiliarProfile()
+        await FamiliarContextRefreshCoordinator.refresh(
+            availability: {
+                await companionModel.refreshAvailability()
+            },
+            synchronizeAfterAvailability: {
+                normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            },
+            roster: {
+                await familiarModel.refresh()
+            },
+            synchronizeAfterRoster: {
+                synchronizeFamiliarProfile()
+            }
+        )
     }
 
     @ViewBuilder private var companionRows: some View {

@@ -1,5 +1,24 @@
 import Foundation
 
+// swiftlint:disable file_length
+
+struct CompanionFamiliarPresentationContext: Equatable {
+    let familiar: FamiliarIdentity?
+    let profile: FamiliarProfileKey?
+
+    static let empty = CompanionFamiliarPresentationContext(
+        familiar: nil,
+        profile: nil
+    )
+}
+
+struct CompanionSendContext: Equatable {
+    let prompt: String
+    let projectRoot: String
+    let familiarID: String?
+    let familiarPresentation: CompanionFamiliarPresentationContext
+}
+
 @MainActor
 final class CompanionChatModel: ObservableObject {
     enum Availability: Equatable {
@@ -12,6 +31,7 @@ final class CompanionChatModel: ObservableObject {
     @Published var isBusy = false
     @Published var canRetry = false
     @Published var availability: Availability = .checking
+    @Published private var pinnedSessionFamiliar: FamiliarIdentity?
 
     var cursor: Int64 = 0
 
@@ -29,6 +49,7 @@ final class CompanionChatModel: ObservableObject {
     var retryPrompt: String?
     var retryProjectRoot = ""
     var retryFamiliarID: String?
+    var retryFamiliarPresentation = CompanionFamiliarPresentationContext.empty
     var pollTask: Task<Void, Never>?
     var lastCompletedResultSeq: Int64 = 0
     var initialPrompt: String?
@@ -73,6 +94,10 @@ final class CompanionChatModel: ObservableObject {
         sessionFamiliarID
     }
 
+    var sessionFamiliar: FamiliarIdentity? {
+        pinnedSessionFamiliar
+    }
+
     var hasActiveSession: Bool {
         session != nil
     }
@@ -85,11 +110,15 @@ final class CompanionChatModel: ObservableObject {
         pollTask != nil
     }
 
-    func refreshAvailability() async {
+    @discardableResult
+    func refreshAvailability() async -> Bool {
+        guard !Task.isCancelled else { return false }
         let generation = beginAvailabilityCheck()
         let gate = await client.sessionGate()
-        guard generation == availabilityGeneration else { return }
+        guard generation == availabilityGeneration,
+              !Task.isCancelled else { return false }
         availability = Self.availability(from: gate)
+        return true
     }
 
     func beginAvailabilityCheck() -> UInt64 {
@@ -98,17 +127,31 @@ final class CompanionChatModel: ObservableObject {
         return availabilityGeneration
     }
 
+    // swiftlint:disable:next function_body_length
     func send(
         prompt: String,
         projectRoot: String,
-        familiarID: String? = nil
+        familiarID: String? = nil,
+        familiar: FamiliarIdentity? = nil,
+        familiarProfile: FamiliarProfileKey? = nil
     ) async {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedRoot = projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedFamiliarID = Self.normalizedFamiliarID(familiarID)
+        let presentation = CompanionFamiliarPresentationContext(
+            familiar: familiar,
+            profile: familiarProfile
+        )
+        let context = CompanionSendContext(
+            prompt: trimmedPrompt,
+            projectRoot: trimmedRoot,
+            familiarID: normalizedFamiliarID,
+            familiarPresentation: presentation
+        )
         guard !trimmedPrompt.isEmpty, !isBusy, pendingCleanup == nil else { return }
         guard Self.isAbsoluteHostPath(trimmedRoot) else {
             retryFamiliarID = nil
+            retryFamiliarPresentation = .empty
             fail(
                 "Enter an absolute project path on the daemon host.",
                 retryPrompt: nil
@@ -122,6 +165,7 @@ final class CompanionChatModel: ObservableObject {
         isBusy = true
         retryProjectRoot = trimmedRoot
         retryFamiliarID = normalizedFamiliarID
+        retryFamiliarPresentation = presentation
         guard let verified = await verifiedPairing(
             reportFailure: true,
             generation: generation
@@ -136,21 +180,18 @@ final class CompanionChatModel: ObservableObject {
         canRetry = false
         retryPrompt = nil
         retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
         retriesPolling = false
         do {
             try await performSend(
-                prompt: trimmedPrompt,
-                projectRoot: trimmedRoot,
-                familiarID: normalizedFamiliarID,
+                context: context,
                 pairing: verified,
                 generation: generation
             )
         } catch {
             handleSendFailure(
                 error,
-                prompt: trimmedPrompt,
-                projectRoot: trimmedRoot,
-                familiarID: normalizedFamiliarID,
+                context: context,
                 generation: generation
             )
         }
@@ -164,6 +205,7 @@ extension CompanionChatModel {
             let prompt = retryPrompt
             let projectRoot = retryProjectRoot
             let familiarID = retryFamiliarID
+            let familiarPresentation = retryFamiliarPresentation
             operationGeneration &+= 1
             let generation = operationGeneration
             pollTask?.cancel()
@@ -174,10 +216,13 @@ extension CompanionChatModel {
                   let prompt else { return }
             retryPrompt = nil
             retryFamiliarID = nil
+            retryFamiliarPresentation = .empty
             await send(
                 prompt: prompt,
                 projectRoot: projectRoot,
-                familiarID: familiarID
+                familiarID: familiarID,
+                familiar: familiarPresentation.familiar,
+                familiarProfile: familiarPresentation.profile
             )
             return
         }
@@ -187,12 +232,16 @@ extension CompanionChatModel {
         }
         guard let prompt = retryPrompt else { return }
         let familiarID = retryFamiliarID
+        let familiarPresentation = retryFamiliarPresentation
         retryPrompt = nil
         retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
         await send(
             prompt: prompt,
             projectRoot: retryProjectRoot,
-            familiarID: familiarID
+            familiarID: familiarID,
+            familiar: familiarPresentation.familiar,
+            familiarProfile: familiarPresentation.profile
         )
     }
 
@@ -274,13 +323,12 @@ extension CompanionChatModel {
         let pairingToKill = pairing
         pollTask?.cancel()
         pollTask = nil
-        session = nil
-        sessionProjectRoot = nil
-        sessionFamiliarID = nil
+        clearSessionBinding()
         canRetry = false
         retriesPolling = false
         retryPrompt = nil
         retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
 
         if let sessionToKill {
             await beginCleanup(
@@ -305,9 +353,7 @@ extension CompanionChatModel {
         pollTask?.cancel()
         pollTask = nil
         pairing = nil
-        session = nil
-        sessionProjectRoot = nil
-        sessionFamiliarID = nil
+        clearSessionBinding()
         accumulatedEvents = []
         cursor = 0
         lastCompletedResultSeq = 0
@@ -317,6 +363,7 @@ extension CompanionChatModel {
         retryPrompt = nil
         retryProjectRoot = ""
         retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
         items = []
         canRetry = false
         pendingCleanupCompletionText = nil
@@ -333,4 +380,47 @@ extension CompanionChatModel {
             isBusy = launchInFlight
         }
     }
+
+    func pinSessionFamiliar(
+        id familiarID: String?,
+        presentation: CompanionFamiliarPresentationContext,
+        pairing: DaemonPairing
+    ) {
+        sessionFamiliarID = familiarID
+        pinnedSessionFamiliar = Self.validatedSessionFamiliar(
+            id: familiarID,
+            presentation: presentation,
+            pairing: pairing
+        )
+    }
+
+    func clearSessionBinding() {
+        session = nil
+        sessionProjectRoot = nil
+        sessionFamiliarID = nil
+        pinnedSessionFamiliar = nil
+    }
+
+    static func validatedSessionFamiliar(
+        id familiarID: String?,
+        presentation: CompanionFamiliarPresentationContext,
+        pairing: DaemonPairing
+    ) -> FamiliarIdentity? {
+        guard let familiarID else { return nil }
+        let fallback = FamiliarIdentity(
+            id: familiarID,
+            displayName: familiarID,
+            emoji: nil,
+            role: nil
+        )
+        guard let familiar = presentation.familiar,
+              familiar.id.caseInsensitiveCompare(familiarID) == .orderedSame,
+              presentation.profile?.normalized == .companion(pairing: pairing)
+        else {
+            return fallback
+        }
+        return familiar
+    }
 }
+
+// swiftlint:enable file_length

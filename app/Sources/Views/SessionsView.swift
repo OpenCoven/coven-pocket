@@ -4,7 +4,7 @@ import SwiftUI
 /// confirmation), context menu to fork a copy at the session's head.
 struct SessionsView: View {
     @ObservedObject var model: ChatModel
-    @Binding var settings: ChatSettings
+    let settings: ChatSettings
     @Environment(\.dismiss) private var dismiss
 
     @State private var sessions: [ChatSessionSummary] = []
@@ -61,15 +61,10 @@ struct SessionsView: View {
             ForEach(sessions) { summary in
                 Button {
                     Task {
-                        let current = settings
                         if await model.resume(
                             summary,
-                            settings: current
+                            settings: settings
                         ) {
-                            settings = ChatModel.settingsForResume(
-                                summary,
-                                current: settings
-                            )
                             dismiss()
                         }
                     }

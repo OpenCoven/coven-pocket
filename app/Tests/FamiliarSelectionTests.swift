@@ -391,6 +391,38 @@ final class FamiliarSelectionTests: XCTestCase {
         XCTAssertEqual(seal?.binding, .activeConversation)
     }
 
+    func testResumedIdentitySealAndPickerKeepSeparateActiveAndNextValues() throws {
+        try withDefaults { defaults in
+            let profile = FamiliarProfileKey.codex(profileID: "profile-a")
+            let forge = familiarIdentity(id: "forge", name: "Forge")
+            let store = FamiliarSelectionStore(defaults: defaults)
+            try store.save(forge, for: profile)
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+            model.activate(profile)
+
+            let pickerValue = ChatFamiliarProfile.synchronize(
+                profile,
+                model: model,
+                currentFamiliarID: "forge",
+                preserveCurrent: true
+            )
+            let seal = FamiliarSealResolver.onDevice(
+                activeFamiliar: familiarIdentity(id: "sage", name: "Sage"),
+                hasActiveSession: true,
+                selectedFamiliar: model.selectedFamiliar,
+                roster: []
+            )
+
+            XCTAssertEqual(pickerValue, "forge")
+            XCTAssertEqual(model.selectedFamiliar, forge)
+            XCTAssertEqual(seal?.displayName, "Sage")
+            XCTAssertEqual(seal?.binding, .activeConversation)
+        }
+    }
+
     func testIdentitySealDoesNotUseNextSelectionForIdentityLessActiveConversation() {
         let seal = FamiliarSealResolver.onDevice(
             activeFamiliar: nil,
@@ -425,7 +457,10 @@ final class FamiliarSelectionTests: XCTestCase {
 
     func testCompanionIdentitySealFallsBackToBoundID() {
         let seal = FamiliarSealResolver.companion(
-            sessionFamiliarID: "archived-familiar",
+            activeFamiliar: familiarIdentity(
+                id: "archived-familiar",
+                name: "archived-familiar"
+            ),
             hasActiveSession: true,
             selectedFamiliar: nil,
             roster: []
@@ -438,7 +473,7 @@ final class FamiliarSelectionTests: XCTestCase {
 
     func testCompanionIdentitySealDoesNotUseNextSelectionForIdentityLessActiveConversation() {
         let seal = FamiliarSealResolver.companion(
-            sessionFamiliarID: nil,
+            activeFamiliar: nil,
             hasActiveSession: true,
             selectedFamiliar: familiarIdentity(
                 id: "forge",
@@ -453,7 +488,7 @@ final class FamiliarSelectionTests: XCTestCase {
 
     func testCompanionIdentitySealUsesSelectionForNextConversation() {
         let seal = FamiliarSealResolver.companion(
-            sessionFamiliarID: nil,
+            activeFamiliar: nil,
             hasActiveSession: false,
             selectedFamiliar: familiarIdentity(
                 id: "forge",
@@ -466,6 +501,191 @@ final class FamiliarSelectionTests: XCTestCase {
         XCTAssertEqual(seal?.displayName, "Forge")
         XCTAssertEqual(seal?.role, "Implementation")
         XCTAssertEqual(seal?.binding, .nextSession)
+    }
+
+    func testCompanionActiveSealNeverConsultsCurrentRoster() {
+        let seal = FamiliarSealResolver.companion(
+            activeFamiliar: familiarIdentity(
+                id: "sage",
+                name: "Sage on A",
+                emoji: "🅰️",
+                role: "A role"
+            ),
+            hasActiveSession: true,
+            selectedFamiliar: familiarIdentity(
+                id: "sage",
+                name: "Sage on B",
+                emoji: "🅱️",
+                role: "B role"
+            ),
+            roster: [
+                remoteFamiliar(
+                    id: "sage",
+                    name: "Sage on B",
+                    emoji: "🅱️",
+                    role: "B role"
+                )
+            ]
+        )
+
+        XCTAssertEqual(seal?.displayName, "Sage on A")
+        XCTAssertEqual(seal?.glyph, "🅰️")
+        XCTAssertEqual(seal?.role, "A role")
+        XCTAssertEqual(seal?.binding, .activeConversation)
+    }
+
+    func testRefreshCoordinatorStopsBeforeRosterForStaleAvailability() async {
+        var synchronizations = 0
+        var rosterRefreshes = 0
+        var finalSynchronizations = 0
+
+        let published = await FamiliarContextRefreshCoordinator.refresh(
+            availability: { false },
+            synchronizeAfterAvailability: { synchronizations += 1 },
+            roster: {
+                rosterRefreshes += 1
+                return true
+            },
+            synchronizeAfterRoster: { finalSynchronizations += 1 }
+        )
+
+        XCTAssertFalse(published)
+        XCTAssertEqual(synchronizations, 0)
+        XCTAssertEqual(rosterRefreshes, 0)
+        XCTAssertEqual(finalSynchronizations, 0)
+    }
+
+    func testRefreshCoordinatorStopsWhenCancelledAfterAvailability() async {
+        var synchronizations = 0
+        var rosterRefreshes = 0
+
+        let pipeline = Task {
+            await FamiliarContextRefreshCoordinator.refresh(
+                availability: {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return true
+                },
+                synchronizeAfterAvailability: { synchronizations += 1 },
+                roster: {
+                    rosterRefreshes += 1
+                    return true
+                },
+                synchronizeAfterRoster: {}
+            )
+        }
+        let published = await pipeline.value
+
+        XCTAssertFalse(published)
+        XCTAssertEqual(synchronizations, 0)
+        XCTAssertEqual(rosterRefreshes, 0)
+    }
+
+    func testRefreshCoordinatorStopsBeforeFinalSyncForStaleRoster() async {
+        var synchronizations = 0
+        var rosterRefreshes = 0
+        var finalSynchronizations = 0
+
+        let published = await FamiliarContextRefreshCoordinator.refresh(
+            availability: { true },
+            synchronizeAfterAvailability: { synchronizations += 1 },
+            roster: {
+                rosterRefreshes += 1
+                return false
+            },
+            synchronizeAfterRoster: { finalSynchronizations += 1 }
+        )
+
+        XCTAssertFalse(published)
+        XCTAssertEqual(synchronizations, 1)
+        XCTAssertEqual(rosterRefreshes, 1)
+        XCTAssertEqual(finalSynchronizations, 0)
+    }
+
+    func testRefreshCoordinatorStopsWhenCancelledAfterRoster() async {
+        var finalSynchronizations = 0
+
+        let pipeline = Task {
+            await FamiliarContextRefreshCoordinator.refresh(
+                availability: { true },
+                synchronizeAfterAvailability: {},
+                roster: {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return true
+                },
+                synchronizeAfterRoster: { finalSynchronizations += 1 }
+            )
+        }
+        let published = await pipeline.value
+
+        XCTAssertFalse(published)
+        XCTAssertEqual(finalSynchronizations, 0)
+    }
+
+    // swiftlint:disable:next function_body_length
+    func testNewerRefreshCoordinatorPipelineWinsDeterministically() async {
+        let firstAvailabilityRequested = XCTestExpectation(
+            description: "first availability requested"
+        )
+        let secondRosterRequested = XCTestExpectation(
+            description: "second roster requested"
+        )
+        var firstAvailabilityContinuation: CheckedContinuation<Bool, Never>?
+        var secondRosterContinuation: CheckedContinuation<Bool, Never>?
+        var firstRosterRefreshes = 0
+        var firstFinalSynchronizations = 0
+        var secondSynchronizations = 0
+        var secondFinalSynchronizations = 0
+
+        let first = Task {
+            await FamiliarContextRefreshCoordinator.refresh(
+                availability: {
+                    firstAvailabilityRequested.fulfill()
+                    return await withCheckedContinuation { continuation in
+                        firstAvailabilityContinuation = continuation
+                    }
+                },
+                synchronizeAfterAvailability: {},
+                roster: {
+                    firstRosterRefreshes += 1
+                    return true
+                },
+                synchronizeAfterRoster: {
+                    firstFinalSynchronizations += 1
+                }
+            )
+        }
+        await fulfillment(of: [firstAvailabilityRequested], timeout: 1)
+
+        let second = Task {
+            await FamiliarContextRefreshCoordinator.refresh(
+                availability: { true },
+                synchronizeAfterAvailability: {
+                    secondSynchronizations += 1
+                },
+                roster: {
+                    secondRosterRequested.fulfill()
+                    return await withCheckedContinuation { continuation in
+                        secondRosterContinuation = continuation
+                    }
+                },
+                synchronizeAfterRoster: {
+                    secondFinalSynchronizations += 1
+                }
+            )
+        }
+        await fulfillment(of: [secondRosterRequested], timeout: 1)
+
+        secondRosterContinuation?.resume(returning: true)
+        let secondPublished = await second.value
+        firstAvailabilityContinuation?.resume(returning: false)
+        let firstPublished = await first.value
+
+        XCTAssertTrue(secondPublished)
+        XCTAssertFalse(firstPublished)
+        XCTAssertEqual(firstRosterRefreshes, 0)
+        XCTAssertEqual(firstFinalSynchronizations, 0)
+        XCTAssertEqual(secondSynchronizations, 1)
+        XCTAssertEqual(secondFinalSynchronizations, 1)
     }
 
     func testCodexSelectionRoundTripsExactSnapshot() throws {
@@ -627,17 +847,94 @@ final class FamiliarSelectionTests: XCTestCase {
             client.resumeLastFamiliars(
                 returning: [remoteFamiliar(id: "b", name: "B Familiar")]
             )
-            await secondRefresh.value
+            let secondPublished = await secondRefresh.value
 
             client.resumeNextFamiliars(
                 returning: [remoteFamiliar(id: "a", name: "A Familiar")]
             )
-            await firstRefresh.value
+            let firstPublished = await firstRefresh.value
 
+            XCTAssertTrue(secondPublished)
+            XCTAssertFalse(firstPublished)
             XCTAssertEqual(model.companionProfile, .companion(host: "b.local", port: 7002))
             XCTAssertEqual(model.activeProfile, .companion(host: "b.local", port: 7002))
             XCTAssertEqual(model.roster.map(\.id), ["b"])
             XCTAssertEqual(model.state, .loaded)
+        }
+    }
+
+    func testOlderRosterPipelineSkipsFinalSyncWhileNewerPipelineWins() async throws {
+        try await withDefaultsAsync { defaults in
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.suspendsFamiliars = true
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(.codex(profileID: "codex-a"))
+            var firstFinalSynchronizations = 0
+            var secondFinalSynchronizations = 0
+
+            let firstRoster = client.expectFamiliars("first roster requested")
+            let first = Task {
+                await FamiliarContextRefreshCoordinator.refresh(
+                    availability: { true },
+                    synchronizeAfterAvailability: {},
+                    roster: { await model.refresh() },
+                    synchronizeAfterRoster: {
+                        firstFinalSynchronizations += 1
+                    }
+                )
+            }
+            await fulfillment(of: [firstRoster], timeout: 1)
+
+            let secondRoster = client.expectFamiliars("second roster requested")
+            let second = Task {
+                await FamiliarContextRefreshCoordinator.refresh(
+                    availability: { true },
+                    synchronizeAfterAvailability: {},
+                    roster: { await model.refresh() },
+                    synchronizeAfterRoster: {
+                        secondFinalSynchronizations += 1
+                    }
+                )
+            }
+            await fulfillment(of: [secondRoster], timeout: 1)
+
+            client.resumeLastFamiliars(
+                returning: [remoteFamiliar(id: "new", name: "New")]
+            )
+            let secondPublished = await second.value
+            client.resumeNextFamiliars(
+                returning: [remoteFamiliar(id: "old", name: "Old")]
+            )
+            let firstPublished = await first.value
+
+            XCTAssertTrue(secondPublished)
+            XCTAssertFalse(firstPublished)
+            XCTAssertEqual(firstFinalSynchronizations, 0)
+            XCTAssertEqual(secondFinalSynchronizations, 1)
+            XCTAssertEqual(model.roster.map(\.id), ["new"])
+        }
+    }
+
+    func testCancelledRosterRefreshReturnsFalse() async throws {
+        try await withDefaultsAsync { defaults in
+            let client = FakeFamiliarRosterClient(gate: .ready(daemonPairing()))
+            client.suspendsFamiliars = true
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(.codex(profileID: "codex-a"))
+
+            let requested = client.expectFamiliars()
+            let refresh = Task { await model.refresh() }
+            await fulfillment(of: [requested], timeout: 1)
+
+            refresh.cancel()
+            client.resumeNextFamiliars(
+                returning: [remoteFamiliar(id: "raven", name: "Raven")]
+            )
+
+            let published = await refresh.value
+            XCTAssertFalse(published)
+            XCTAssertEqual(model.state, .loading)
+            XCTAssertTrue(model.roster.isEmpty)
         }
     }
 
@@ -743,8 +1040,9 @@ final class FamiliarSelectionTests: XCTestCase {
             model.select(id: "raven", for: profile)
 
             client.familiarResult = .failure(FakeFamiliarRosterError.transport)
-            await model.refresh()
+            let published = await model.refresh()
 
+            XCTAssertTrue(published)
             XCTAssertEqual(model.roster.map(\.id), ["raven"])
             XCTAssertEqual(model.selectedFamiliar?.id, "raven")
             XCTAssertEqual(

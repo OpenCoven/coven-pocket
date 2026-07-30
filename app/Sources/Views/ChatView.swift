@@ -121,7 +121,7 @@ struct ChatView: View {
                         )
                     }
                 } else {
-                    SessionsView(model: model, settings: $settings)
+                    SessionsView(model: model, settings: settings)
                 }
             }
             .sheet(isPresented: $showShare) {
@@ -142,10 +142,10 @@ struct ChatView: View {
                 }
             }
             .onChange(of: settings.backend) {
-                synchronizeFamiliarProfile(useActiveConversation: true)
+                synchronizeFamiliarProfile()
             }
             .onChange(of: client.codexAccount?.profileId) {
-                synchronizeFamiliarProfile(preserveCurrent: false)
+                synchronizeFamiliarProfile()
             }
             .onChange(of: companionModel.availability) {
                 normalizeBackendSelection()
@@ -181,7 +181,7 @@ private extension ChatView {
         switch settings.backend {
         case .companionClaude:
             return FamiliarSealResolver.companion(
-                sessionFamiliarID: companionModel.activeSessionFamiliarID,
+                activeFamiliar: companionModel.sessionFamiliar,
                 hasActiveSession: companionModel.hasActiveSession,
                 selectedFamiliar: familiarModel.selectedFamiliar,
                 roster: familiarModel.roster
@@ -193,19 +193,6 @@ private extension ChatView {
                 selectedFamiliar: familiarModel.selectedFamiliar,
                 roster: familiarModel.roster
             )
-        }
-    }
-
-    var hasActiveConversation: Bool {
-        settings.backend == .companionClaude ? companionModel.hasActiveSession : model.hasActiveSession
-    }
-
-    var activeConversationFamiliarID: String? {
-        switch settings.backend {
-        case .companionClaude:
-            return companionModel.activeSessionFamiliarID
-        case .codex:
-            return model.activeFamiliar?.id
         }
     }
 
@@ -235,12 +222,7 @@ private extension ChatView {
                 let summary = await model.storedSessions()
                     .first(where: { $0.sessionId == sessionID })
             else { return }
-            if await model.resume(summary, settings: currentSettings) {
-                settings = ChatModel.settingsForResume(
-                    summary,
-                    current: settings
-                )
-            }
+            _ = await model.resume(summary, settings: currentSettings)
         }
     }
 
@@ -334,7 +316,9 @@ private extension ChatView {
             await companionModel.send(
                 prompt: text,
                 projectRoot: settings.daemonProjectRoot,
-                familiarID: settings.familiarID
+                familiarID: settings.familiarID,
+                familiar: familiarModel.selectedFamiliar,
+                familiarProfile: familiarModel.activeProfile
             )
         case .codex:
             await model.send(
@@ -389,27 +373,29 @@ private extension ChatView {
         }
     }
 
-    private func synchronizeFamiliarProfile(
-        preserveCurrent: Bool? = nil,
-        useActiveConversation: Bool = false
-    ) {
-        let shouldPreserve = preserveCurrent ?? hasActiveConversation
+    private func synchronizeFamiliarProfile() {
         settings.familiarID = ChatFamiliarProfile.synchronize(
             activeFamiliarProfile,
-            model: familiarModel,
-            currentFamiliarID: useActiveConversation && shouldPreserve
-                ? activeConversationFamiliarID
-                : settings.familiarID,
-            preserveCurrent: shouldPreserve
+            model: familiarModel
         )
     }
 
     private func refreshFamiliarContext() async {
-        await companionModel.refreshAvailability()
-        normalizeBackendSelection()
-        synchronizeFamiliarProfile()
-        await familiarModel.refresh()
-        synchronizeFamiliarProfile()
+        await FamiliarContextRefreshCoordinator.refresh(
+            availability: {
+                await companionModel.refreshAvailability()
+            },
+            synchronizeAfterAvailability: {
+                normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            },
+            roster: {
+                await familiarModel.refresh()
+            },
+            synchronizeAfterRoster: {
+                synchronizeFamiliarProfile()
+            }
+        )
     }
 }
 #Preview {

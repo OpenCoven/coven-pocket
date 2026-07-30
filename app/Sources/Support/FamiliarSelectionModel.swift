@@ -121,6 +121,26 @@ struct FamiliarSelectionStore {
 }
 
 @MainActor
+enum FamiliarContextRefreshCoordinator {
+    @discardableResult
+    static func refresh(
+        availability: () async -> Bool,
+        synchronizeAfterAvailability: () -> Void,
+        roster: () async -> Bool,
+        synchronizeAfterRoster: () -> Void
+    ) async -> Bool {
+        guard await availability() else { return false }
+        guard !Task.isCancelled else { return false }
+        synchronizeAfterAvailability()
+        guard !Task.isCancelled else { return false }
+        guard await roster() else { return false }
+        guard !Task.isCancelled else { return false }
+        synchronizeAfterRoster()
+        return true
+    }
+}
+
+@MainActor
 protocol FamiliarRosterClient: AnyObject {
     func gate() async -> CompanionModel.SessionGate
     func familiars(pairing: DaemonPairing) async throws -> [RemoteFamiliar]
@@ -222,20 +242,25 @@ final class FamiliarSelectionModel: ObservableObject {
         restoreRefreshFailure(for: normalizedProfile)
     }
 
-    func refresh() async {
+    @discardableResult
+    func refresh() async -> Bool {
+        guard !Task.isCancelled else { return false }
         let refreshGeneration = beginRefresh()
         let gate = await client.gate()
-        guard refreshGeneration == generation else { return }
+        guard refreshGeneration == generation,
+              !Task.isCancelled else { return false }
 
         switch gate {
         case .notPaired:
             publishRefreshFailure(
                 "Pair with a daemon to load familiars."
             )
+            return true
         case let .blocked(reason, hint):
             publishRefreshFailure("\(reason) \(hint)")
+            return true
         case let .ready(pairing):
-            await refresh(
+            return await refresh(
                 pairing: pairing,
                 generation: refreshGeneration
             )
@@ -303,7 +328,7 @@ final class FamiliarSelectionModel: ObservableObject {
     private func refresh(
         pairing: DaemonPairing,
         generation refreshGeneration: UInt64
-    ) async {
+    ) async -> Bool {
         let endpoint = FamiliarProfileKey.companion(pairing: pairing)
         companionProfile = endpoint
         if case .companion = activeProfile {
@@ -317,16 +342,20 @@ final class FamiliarSelectionModel: ObservableObject {
 
         do {
             let fetched = try await client.familiars(pairing: pairing)
-            guard refreshGeneration == generation else { return }
+            guard refreshGeneration == generation,
+                  !Task.isCancelled else { return false }
             lastRefreshFailure = nil
             let sorted = Self.sorted(fetched)
             endpointRosterCache[endpoint] = sorted
             latestValidatedRoster = sorted
             roster = sorted
             reconcileActiveSelection(with: sorted)
+            return true
         } catch {
-            guard refreshGeneration == generation else { return }
+            guard refreshGeneration == generation,
+                  !Task.isCancelled else { return false }
             publishRefreshFailure(error.localizedDescription)
+            return true
         }
     }
 

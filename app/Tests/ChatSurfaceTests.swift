@@ -331,23 +331,31 @@ final class ChatSurfaceTests: XCTestCase {
         )
     }
 
-    func testSessionsViewOnlySynchronizesSettingsAfterSuccessfulResume() throws {
+    func testSessionResumeViewsKeepNextFamiliarSelectionUntouched() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let source = try String(
+        let sessions = try String(
             contentsOf: root.appendingPathComponent(
                 "Sources/Views/SessionsView.swift"
             ),
             encoding: .utf8
         )
+        let chat = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatView.swift"
+            ),
+            encoding: .utf8
+        )
 
-        XCTAssertTrue(source.contains("@Binding var settings: ChatSettings"))
-        XCTAssertTrue(source.contains("if await model.resume("))
-        XCTAssertTrue(source.contains("ChatModel.settingsForResume("))
+        XCTAssertTrue(sessions.contains("let settings: ChatSettings"))
+        XCTAssertFalse(sessions.contains("@Binding var settings: ChatSettings"))
+        XCTAssertTrue(sessions.contains("if await model.resume("))
+        XCTAssertFalse(sessions.contains("settings = ChatModel.settingsForResume("))
+        XCTAssertFalse(chat.contains("settings = ChatModel.settingsForResume("))
     }
 
-    func testBackendChangesAndClearUseCoherentFamiliarRouting() throws {
+    func testChatSurfacesAlwaysSynchronizeProfileAsNextFamiliar() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -364,23 +372,14 @@ final class ChatSurfaceTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(
-            chat.contains(
-                "synchronizeFamiliarProfile(useActiveConversation: true)"
-            )
-        )
-        XCTAssertTrue(
-            settings.contains(
-                "synchronizeFamiliarProfile(useActiveConversation: true)"
-            )
-        )
-        XCTAssertTrue(
-            settings.contains(
-                "model.reset()\n"
-                    + "                            synchronizeFamiliarProfile("
-                    + "preserveCurrent: false)"
-            )
-        )
+        XCTAssertFalse(chat.contains("useActiveConversation"))
+        XCTAssertFalse(chat.contains("hasActiveConversation"))
+        XCTAssertFalse(chat.contains("activeConversationFamiliarID"))
+        XCTAssertFalse(settings.contains("useActiveConversation"))
+        XCTAssertFalse(settings.contains("hasActiveConversation"))
+        XCTAssertFalse(settings.contains("activeConversationFamiliarID"))
+        XCTAssertTrue(chat.contains("synchronizeFamiliarProfile()"))
+        XCTAssertTrue(settings.contains("synchronizeFamiliarProfile()"))
     }
 
     func testStartChatCreatesIdleSession() async throws {
@@ -723,7 +722,8 @@ final class ChatSurfaceTests: XCTestCase {
         let resumeSettings = ChatSettings(
             backend: .codex,
             model: "resume",
-            daemonProjectRoot: ""
+            daemonProjectRoot: "",
+            familiarID: "forge"
         )
         let sendSettings = ChatSettings(
             backend: .codex,
@@ -753,6 +753,7 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertTrue(model.isBusy, "a stale resume must not finish the newer send")
         XCTAssertTrue(model.items.isEmpty, "a stale resume must not restore its transcript")
         XCTAssertNil(model.activeFamiliar)
+        XCTAssertEqual(resumeSettings.familiarID, "forge")
 
         boundary.finishStart(with: StubChatSession())
         await freshSend.value
@@ -792,6 +793,85 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testIdentitylessResumeReusesSessionThenFreshStartUsesSelectedForge() async {
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [StubChatSession()]
+        boundary.startSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+        let nextSettings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "forge"
+        )
+
+        let resumed = await model.resume(
+            makeSummary(familiar: nil),
+            settings: nextSettings
+        )
+        XCTAssertTrue(resumed)
+        await model.send(
+            prompt: "continue",
+            settings: nextSettings,
+            selectedFamiliar: forge
+        )
+
+        XCTAssertEqual(boundary.startCallCount, 0)
+        XCTAssertNil(model.activeFamiliar)
+
+        var changedSettings = nextSettings
+        changedSettings.model = "new-model"
+        await model.send(
+            prompt: "fresh",
+            settings: changedSettings,
+            selectedFamiliar: forge
+        )
+
+        XCTAssertEqual(boundary.startFamiliars, [forge])
+        XCTAssertEqual(model.activeFamiliar, forge)
+    }
+
+    @MainActor
+    func testSageResumeReusesSessionThenFreshStartUsesSelectedForge() async {
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [StubChatSession()]
+        boundary.startSessions = [StubChatSession()]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+        let nextSettings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "forge"
+        )
+
+        let resumed = await model.resume(
+            makeSummary(familiar: sage),
+            settings: nextSettings
+        )
+        XCTAssertTrue(resumed)
+        await model.send(
+            prompt: "continue",
+            settings: nextSettings,
+            selectedFamiliar: forge
+        )
+
+        XCTAssertEqual(boundary.startCallCount, 0)
+        XCTAssertEqual(model.activeFamiliar, sage)
+
+        var changedSettings = nextSettings
+        changedSettings.model = "new-model"
+        await model.send(
+            prompt: "fresh",
+            settings: changedSettings,
+            selectedFamiliar: forge
+        )
+
+        XCTAssertEqual(boundary.startFamiliars, [forge])
+        XCTAssertEqual(model.activeFamiliar, forge)
+    }
+
+    @MainActor
     func testFailedResumeReturnsFalseWithoutPublishingFamiliar() async {
         enum ResumeFailure: LocalizedError {
             case failed
@@ -810,16 +890,18 @@ final class ChatSurfaceTests: XCTestCase {
         let summary = makeSummary(
             familiar: familiarIdentity(id: "sage", name: "Sage")
         )
+        let nextSettings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: "forge"
+        )
 
         let resumed = await model.resume(
             summary,
-            settings: ChatSettings(
-                backend: .codex,
-                model: "test",
-                familiarID: "forge"
-            )
+            settings: nextSettings
         )
         XCTAssertFalse(resumed)
+        XCTAssertEqual(nextSettings.familiarID, "forge")
         XCTAssertNil(model.activeFamiliar)
         XCTAssertEqual(model.items.last?.text, "Resume failed.")
     }
