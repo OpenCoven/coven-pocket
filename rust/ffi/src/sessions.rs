@@ -7,6 +7,7 @@
 //! {storage_dir}/transcripts/{uuid}.jsonl   — engine-format JSONL transcript (full fidelity)
 //! {storage_dir}/metadata/{uuid}.familiar.json — pinned familiar identity snapshot
 //! {storage_dir}/.session-lifecycle/pending-forks/{uuid}.pending — incomplete fork quarantine
+//! {storage_dir}/.session-lifecycle/pending-deletions/{uuid}.pending — incomplete deletion
 //! ```
 //!
 //! Transcripts use the engine's `session_storage` wire format, so files are
@@ -75,6 +76,10 @@ static DIRECTORY_SYNC_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize
 
 #[cfg(test)]
 static FILE_REMOVE_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static FILE_CREATE_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Summary row for the session browser.
@@ -435,6 +440,10 @@ impl CheckedStorage {
         self.child_path(&self.lifecycle_dir()?, "pending-forks")
     }
 
+    fn pending_deletions_dir(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.lifecycle_dir()?, "pending-deletions")
+    }
+
     fn fork_staging_root(&self) -> Result<PathBuf, PocketError> {
         self.child_path(&self.root, ".fork-staging")
     }
@@ -462,6 +471,14 @@ impl CheckedStorage {
         self.child_path(&self.pending_forks_dir()?, &format!("{session_id}.pending"))
     }
 
+    fn pending_deletion_marker(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(
+            &self.pending_deletions_dir()?,
+            &format!("{session_id}.pending"),
+        )
+    }
+
     fn index_file(&self, suffix: &str) -> Result<PathBuf, PocketError> {
         self.child_path(&self.root, &format!("index.sqlite{suffix}"))
     }
@@ -485,8 +502,9 @@ impl CheckedStorage {
         }
         let lifecycle = self.lifecycle_dir()?;
         if self.validate_directory(&lifecycle, true)? {
-            let pending = self.pending_forks_dir()?;
-            self.validate_directory(&pending, true)?;
+            for pending in [self.pending_forks_dir()?, self.pending_deletions_dir()?] {
+                self.validate_directory(&pending, true)?;
+            }
         }
         self.validate_sqlite_files()
     }
@@ -586,6 +604,16 @@ fn pending_forks_dir(root: &Path) -> PathBuf {
 #[cfg(test)]
 fn pending_fork_marker(root: &Path, session_id: &str) -> PathBuf {
     pending_forks_dir(root).join(format!("{session_id}.pending"))
+}
+
+#[cfg(test)]
+fn pending_deletions_dir(root: &Path) -> PathBuf {
+    root.join(".session-lifecycle").join("pending-deletions")
+}
+
+#[cfg(test)]
+fn pending_deletion_marker(root: &Path, session_id: &str) -> PathBuf {
+    pending_deletions_dir(root).join(format!("{session_id}.pending"))
 }
 
 #[cfg(test)]
@@ -722,6 +750,22 @@ fn ensure_durable_directory(
     }
 }
 
+fn remove_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let mut failures = FILE_REMOVE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(remaining) = failures.get_mut(path) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(std::io::Error::other("injected file removal failure"));
+            }
+        }
+    }
+    std::fs::remove_file(path)
+}
+
 fn remove_file_durably_if_present(
     storage: &CheckedStorage,
     path: &Path,
@@ -736,23 +780,7 @@ fn remove_file_durably_if_present(
         return sync_directory(storage, directory, sync_context);
     }
     storage.validate_regular_file(path, false)?;
-    #[cfg(test)]
-    let remove_result = {
-        let mut failures = FILE_REMOVE_FAILURES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match failures.get_mut(path) {
-            Some(remaining) if *remaining > 0 => {
-                *remaining -= 1;
-                Err(std::io::Error::other("injected file removal failure"))
-            }
-            _ => std::fs::remove_file(path),
-        }
-    };
-    #[cfg(not(test))]
-    let remove_result = std::fs::remove_file(path);
-
-    match remove_result {
+    match remove_file(path) {
         Ok(()) => sync_directory(storage, directory, sync_context),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             sync_directory_if_present(storage, directory, sync_context)
@@ -844,7 +872,7 @@ fn remove_tree_durably_if_present(
     };
     for file in plan.files {
         storage.validate_regular_file(&file, false)?;
-        std::fs::remove_file(&file).map_err(|err| engine_err(remove_context, err))?;
+        remove_file(&file).map_err(|err| engine_err(remove_context, err))?;
     }
     for directory in plan.directories {
         storage.validate_directory(&directory, false)?;
@@ -1075,6 +1103,171 @@ fn pending_fork_ids_checked(storage: &CheckedStorage) -> Result<Vec<String>, Poc
             persistence_err(
                 &path,
                 format!("invalid pending fork marker {file_name:?}: {err}"),
+            )
+        })?;
+        session_ids.push(session_id.to_string());
+    }
+    session_ids.sort();
+    Ok(session_ids)
+}
+
+fn create_pending_deletion_marker_checked(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let lifecycle_directory = storage.lifecycle_dir()?;
+    let directory = storage.pending_deletions_dir()?;
+    ensure_durable_directory(
+        storage,
+        storage.root(),
+        &lifecycle_directory,
+        "cannot create pending deletion lifecycle directory",
+        "cannot sync pending deletion lifecycle directory creation",
+    )?;
+    ensure_durable_directory(
+        storage,
+        &lifecycle_directory,
+        &directory,
+        "cannot create pending deletion marker directory",
+        "cannot sync pending deletion marker directory creation",
+    )?;
+    let marker = storage.pending_deletion_marker(session_id)?;
+    storage.validate_regular_file(&marker, true)?;
+    #[cfg(test)]
+    {
+        let mut failures = FILE_CREATE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(remaining) = failures.get_mut(&marker) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(engine_err(
+                    "cannot create pending deletion marker",
+                    std::io::Error::other("injected pending deletion marker creation failure"),
+                ));
+            }
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|err| engine_err("cannot create pending deletion marker", err))?;
+    storage.validate_regular_file(&marker, false)?;
+    let create_result = (|| -> Result<(), PocketError> {
+        file.sync_all()
+            .map_err(|err| engine_err("cannot sync pending deletion marker", err))?;
+        sync_directory(
+            storage,
+            &directory,
+            "cannot sync pending deletion marker directory",
+        )
+    })();
+    if let Err(create_err) = create_result {
+        return match remove_file_durably_if_present(
+            storage,
+            &marker,
+            &directory,
+            "cannot clean pending deletion marker",
+            "cannot sync pending deletion marker cleanup",
+        ) {
+            Ok(()) => Err(create_err),
+            Err(cleanup_err) => Err(PocketError::Engine {
+                message: format!("{create_err}; cleanup also failed: {cleanup_err}"),
+            }),
+        };
+    }
+    Ok(())
+}
+
+fn ensure_pending_deletion_marker_checked(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let marker = storage.pending_deletion_marker(session_id)?;
+    if storage.validate_regular_file(&marker, true)? {
+        storage.validate_regular_file(&marker, false)?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&marker)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| engine_err("cannot sync pending deletion marker", err))?;
+        sync_directory(
+            storage,
+            &storage.pending_deletions_dir()?,
+            "cannot sync pending deletion marker directory",
+        )
+    } else {
+        create_pending_deletion_marker_checked(storage, session_id)
+    }
+}
+
+fn remove_pending_deletion_marker_checked(
+    storage: &CheckedStorage,
+    session_id: &str,
+    missing_ok: bool,
+) -> Result<(), PocketError> {
+    let directory = storage.pending_deletions_dir()?;
+    let marker = storage.pending_deletion_marker(session_id)?;
+    if !storage.validate_regular_file(&marker, true)? {
+        if missing_ok {
+            return sync_directory_if_present(
+                storage,
+                &directory,
+                "cannot sync absent pending deletion marker",
+            );
+        }
+        return Err(engine_err(
+            "cannot remove pending deletion marker",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+    }
+    storage.validate_regular_file(&marker, false)?;
+    match remove_file(&marker) {
+        Ok(()) => {}
+        Err(err) if missing_ok && err.kind() == std::io::ErrorKind::NotFound => {
+            return sync_directory_if_present(
+                storage,
+                &directory,
+                "cannot sync absent pending deletion marker",
+            );
+        }
+        Err(err) => return Err(engine_err("cannot remove pending deletion marker", err)),
+    }
+    sync_directory(
+        storage,
+        &directory,
+        "cannot sync pending deletion marker removal",
+    )
+}
+
+fn pending_deletion_ids_checked(storage: &CheckedStorage) -> Result<Vec<String>, PocketError> {
+    let directory = storage.pending_deletions_dir()?;
+    if !storage.validate_directory(&directory, true)? {
+        return Ok(Vec::new());
+    }
+    storage.validate_directory(&directory, false)?;
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|err| engine_err("cannot read pending deletion markers", err))?;
+    let mut session_ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| engine_err("cannot read pending deletion marker", err))?;
+        let path = entry.path();
+        storage.validate_regular_file(&path, false)?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str().ok_or_else(|| {
+            persistence_err(&path, "pending deletion marker name is not valid UTF-8")
+        })?;
+        let session_id = file_name.strip_suffix(".pending").ok_or_else(|| {
+            persistence_err(
+                &path,
+                format!("invalid pending deletion marker name {file_name:?}"),
+            )
+        })?;
+        validate_session_id(session_id).map_err(|err| {
+            persistence_err(
+                &path,
+                format!("invalid pending deletion marker {file_name:?}: {err}"),
             )
         })?;
         session_ids.push(session_id.to_string());
@@ -1319,7 +1512,7 @@ impl SessionPersistence {
         let storage = CheckedStorage::open(storage_dir)?;
         let key = session_key(storage.root(), &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-        recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
+        recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
         match lifecycle.sessions.get(&key) {
             Some(SessionLifecycleState::Active { .. }) => {
                 return Err(PocketError::Engine {
@@ -1327,10 +1520,14 @@ impl SessionPersistence {
                 });
             }
             Some(SessionLifecycleState::Tombstoned) => {
-                cleanup_session_artifacts(&storage, &session_id).map_err(|err| {
-                    PocketError::Engine {
-                        message: format!("cannot clear deleted session before UUID reuse: {err}"),
-                    }
+                begin_session_deletion(&storage, &session_id)?;
+                cleanup_session_artifacts(
+                    &storage,
+                    &session_id,
+                    SessionCleanupMarker::PendingDeletion,
+                )
+                .map_err(|err| PocketError::Engine {
+                    message: format!("cannot clear deleted session before UUID reuse: {err}"),
                 })?;
             }
             Some(SessionLifecycleState::PendingFork) => {
@@ -1372,7 +1569,7 @@ impl SessionPersistence {
         let storage = CheckedStorage::open(storage_dir)?;
         let key = session_key(storage.root(), &session_id);
         let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-        recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
+        recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
         ensure_session_available(&lifecycle, &key)?;
         if matches!(
             lifecycle.sessions.get(&key),
@@ -1519,7 +1716,7 @@ async fn load_session_messages_at_root(
 pub async fn list_sessions(storage_dir: &str) -> Result<Vec<ChatSessionSummary>, PocketError> {
     let storage = CheckedStorage::open(storage_dir)?;
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
+    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
     list_sessions_unlocked(&storage, &lifecycle)
 }
 
@@ -1557,43 +1754,27 @@ fn list_sessions_unlocked(
         .collect()
 }
 
-/// Drop a session from the index and delete its transcript file.
-pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
-    validate_session_id(session_id)?;
-    let storage = CheckedStorage::open(storage_dir)?;
-    let key = session_key(storage.root(), session_id);
-    let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    let in_memory_pending = matches!(
-        lifecycle.sessions.get(&key),
-        Some(SessionLifecycleState::PendingFork)
-    );
-    let mut is_pending = preflight_session_artifacts(&storage, session_id)?.marker_exists;
-    if in_memory_pending && !is_pending {
-        ensure_pending_fork_marker_checked(&storage, session_id)?;
-        preflight_session_artifacts(&storage, session_id)?;
-        is_pending = true;
-    }
-    lifecycle.sessions.insert(
-        key.clone(),
-        if is_pending {
-            SessionLifecycleState::PendingFork
-        } else {
-            SessionLifecycleState::Tombstoned
-        },
-    );
-    match cleanup_session_artifacts(&storage, session_id) {
-        Ok(()) => {
-            lifecycle
-                .sessions
-                .insert(key, SessionLifecycleState::Tombstoned);
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
+struct SessionArtifactPreflight {
+    transcript_exists: bool,
+    familiar_exists: bool,
+    stage_exists: bool,
+    pending_fork_marker_exists: bool,
+    pending_deletion_marker_exists: bool,
 }
 
-struct SessionArtifactPreflight {
-    marker_exists: bool,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SessionCleanupMarker {
+    PendingDeletion,
+    PendingFork,
+}
+
+impl SessionArtifactPreflight {
+    fn marker_exists(&self, marker: SessionCleanupMarker) -> bool {
+        match marker {
+            SessionCleanupMarker::PendingDeletion => self.pending_deletion_marker_exists,
+            SessionCleanupMarker::PendingFork => self.pending_fork_marker_exists,
+        }
+    }
 }
 
 fn preflight_session_artifacts(
@@ -1603,21 +1784,143 @@ fn preflight_session_artifacts(
     validate_session_id(session_id)?;
     storage.validate_fixed_layout()?;
     storage.validate_sqlite_files()?;
-    storage.validate_regular_file(&storage.transcript_file(session_id)?, true)?;
-    storage.validate_regular_file(&storage.familiar_file(session_id)?, true)?;
-    let marker = storage.pending_fork_marker(session_id)?;
-    let marker_exists = storage.validate_regular_file(&marker, true)?;
+    let transcript_exists =
+        storage.validate_regular_file(&storage.transcript_file(session_id)?, true)?;
+    let familiar_exists =
+        storage.validate_regular_file(&storage.familiar_file(session_id)?, true)?;
+    let pending_fork_marker_exists =
+        storage.validate_regular_file(&storage.pending_fork_marker(session_id)?, true)?;
+    let pending_deletion_marker_exists =
+        storage.validate_regular_file(&storage.pending_deletion_marker(session_id)?, true)?;
     let stage_directory = storage.fork_staging_dir(session_id)?;
-    preflight_removal_tree(storage, &stage_directory)?;
-    Ok(SessionArtifactPreflight { marker_exists })
+    let stage_exists = preflight_removal_tree(storage, &stage_directory)?.is_some();
+    Ok(SessionArtifactPreflight {
+        transcript_exists,
+        familiar_exists,
+        stage_exists,
+        pending_fork_marker_exists,
+        pending_deletion_marker_exists,
+    })
+}
+
+fn ensure_cleanup_marker(
+    storage: &CheckedStorage,
+    session_id: &str,
+    marker: SessionCleanupMarker,
+) -> Result<(), PocketError> {
+    match marker {
+        SessionCleanupMarker::PendingDeletion => {
+            ensure_pending_deletion_marker_checked(storage, session_id)
+        }
+        SessionCleanupMarker::PendingFork => {
+            ensure_pending_fork_marker_checked(storage, session_id)
+        }
+    }
+}
+
+fn remove_cleanup_marker(
+    storage: &CheckedStorage,
+    session_id: &str,
+    marker: SessionCleanupMarker,
+) -> Result<(), PocketError> {
+    match marker {
+        SessionCleanupMarker::PendingDeletion => {
+            remove_pending_deletion_marker_checked(storage, session_id, false)
+        }
+        SessionCleanupMarker::PendingFork => {
+            remove_pending_fork_marker_checked(storage, session_id, false)
+        }
+    }
+}
+
+fn cleanup_error(
+    storage: &CheckedStorage,
+    session_id: &str,
+    marker: SessionCleanupMarker,
+    mut errors: Vec<String>,
+) -> PocketError {
+    if let Err(err) = ensure_cleanup_marker(storage, session_id, marker) {
+        errors.push(format!("cannot preserve cleanup marker: {err}"));
+    }
+    PocketError::Engine {
+        message: format!("cannot delete all session artifacts: {}", errors.join("; ")),
+    }
+}
+
+fn verify_session_artifacts_absent(
+    storage: &CheckedStorage,
+    session_id: &str,
+    marker: SessionCleanupMarker,
+) -> Result<(), PocketError> {
+    let preflight = preflight_session_artifacts(storage, session_id)?;
+    if !preflight.marker_exists(marker) {
+        return Err(PocketError::Engine {
+            message: format!("cleanup marker for session {session_id} is missing"),
+        });
+    }
+    let rows = checked_index_store(storage)?
+        .list_sessions()
+        .map_err(|err| engine_err("cannot verify deleted session index", err))?;
+    validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
+    if rows.iter().any(|row| row.id == session_id) {
+        return Err(PocketError::Engine {
+            message: format!("session {session_id} remains in the session index"),
+        });
+    }
+    if preflight.transcript_exists {
+        return Err(PocketError::Engine {
+            message: format!("transcript for session {session_id} remains after cleanup"),
+        });
+    }
+    if preflight.familiar_exists {
+        return Err(PocketError::Engine {
+            message: format!("familiar metadata for session {session_id} remains after cleanup"),
+        });
+    }
+    if preflight.stage_exists {
+        return Err(PocketError::Engine {
+            message: format!("fork staging for session {session_id} remains after cleanup"),
+        });
+    }
+    if marker == SessionCleanupMarker::PendingDeletion && preflight.pending_fork_marker_exists {
+        return Err(PocketError::Engine {
+            message: format!("pending fork marker for session {session_id} remains after cleanup"),
+        });
+    }
+    Ok(())
+}
+
+fn begin_session_deletion(storage: &CheckedStorage, session_id: &str) -> Result<(), PocketError> {
+    let preflight = preflight_session_artifacts(storage, session_id)?;
+    if preflight.pending_deletion_marker_exists {
+        ensure_pending_deletion_marker_checked(storage, session_id)
+    } else {
+        create_pending_deletion_marker_checked(storage, session_id)
+    }
 }
 
 fn cleanup_session_artifacts(
     storage: &CheckedStorage,
     session_id: &str,
+    marker: SessionCleanupMarker,
 ) -> Result<(), PocketError> {
+    ensure_cleanup_marker(storage, session_id, marker)?;
     let preflight = preflight_session_artifacts(storage, session_id)?;
-    delete_index_session(storage, session_id, "cannot delete session index")?;
+    if marker == SessionCleanupMarker::PendingFork && preflight.pending_deletion_marker_exists {
+        return Err(PocketError::Engine {
+            message: format!(
+                "pending deletion supersedes pending fork cleanup for session {session_id}"
+            ),
+        });
+    }
+    if let Err(err) = delete_index_session(storage, session_id, "cannot delete session index") {
+        return Err(cleanup_error(
+            storage,
+            session_id,
+            marker,
+            vec![err.to_string()],
+        ));
+    }
 
     let mut errors = Vec::new();
     let transcript_directory = storage.transcripts_dir()?;
@@ -1637,29 +1940,47 @@ fn cleanup_session_artifacts(
     if let Err(err) = remove_fork_staging_artifacts(storage, session_id) {
         errors.push(err.to_string());
     }
-    if errors.is_empty() && preflight.marker_exists {
+    if marker == SessionCleanupMarker::PendingDeletion && preflight.pending_fork_marker_exists {
         if let Err(err) = remove_pending_fork_marker_checked(storage, session_id, true) {
             errors.push(err.to_string());
-            if let Err(restore_err) = ensure_pending_fork_marker_checked(storage, session_id) {
-                errors.push(restore_err.to_string());
-            }
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(PocketError::Engine {
-            message: format!("cannot delete all session artifacts: {}", errors.join("; ")),
-        })
+    if !errors.is_empty() {
+        return Err(cleanup_error(storage, session_id, marker, errors));
     }
+    if let Err(err) = verify_session_artifacts_absent(storage, session_id, marker) {
+        return Err(cleanup_error(
+            storage,
+            session_id,
+            marker,
+            vec![err.to_string()],
+        ));
+    }
+    if let Err(err) = remove_cleanup_marker(storage, session_id, marker) {
+        return Err(cleanup_error(
+            storage,
+            session_id,
+            marker,
+            vec![err.to_string()],
+        ));
+    }
+    Ok(())
 }
 
-fn recover_pending_forks_unlocked(
+fn recover_pending_lifecycle_unlocked(
     storage: &CheckedStorage,
     lifecycle: &mut SessionLifecycle,
 ) -> Result<(), PocketError> {
-    let pending_ids = pending_fork_ids_checked(storage)?;
+    let pending_deletion_ids = pending_deletion_ids_checked(storage)?;
+    let pending_fork_ids = pending_fork_ids_checked(storage)?;
     preflight_fork_staging_entries(storage)?;
+    let mut pending_ids = pending_deletion_ids.clone();
+    for session_id in &pending_fork_ids {
+        if !pending_ids.contains(session_id) {
+            pending_ids.push(session_id.clone());
+        }
+    }
+    pending_ids.sort();
     for session_id in &pending_ids {
         preflight_session_artifacts(storage, session_id)?;
     }
@@ -1669,7 +1990,8 @@ fn recover_pending_forks_unlocked(
                 lifecycle.sessions.get(*key),
                 Some(SessionLifecycleState::PendingFork)
             )
-            && !pending_ids.contains(&key.session_id)
+            && !pending_fork_ids.contains(&key.session_id)
+            && !pending_deletion_ids.contains(&key.session_id)
     }) {
         return Err(PocketError::Engine {
             message: format!(
@@ -1679,12 +2001,40 @@ fn recover_pending_forks_unlocked(
         });
     }
 
-    for session_id in &pending_ids {
+    for session_id in &pending_deletion_ids {
+        lifecycle.sessions.insert(
+            session_key(storage.root(), session_id),
+            SessionLifecycleState::Tombstoned,
+        );
+    }
+    for session_id in &pending_fork_ids {
+        if pending_deletion_ids.contains(session_id) {
+            continue;
+        }
         let key = session_key(storage.root(), session_id);
         lifecycle
             .sessions
             .insert(key.clone(), SessionLifecycleState::PendingFork);
-        if let Err(err) = cleanup_session_artifacts(storage, session_id) {
+    }
+
+    for session_id in &pending_deletion_ids {
+        if let Err(err) =
+            cleanup_session_artifacts(storage, session_id, SessionCleanupMarker::PendingDeletion)
+        {
+            return Err(PocketError::Engine {
+                message: format!("cannot recover pending deletion {session_id}: {err}"),
+            });
+        }
+    }
+
+    for session_id in &pending_fork_ids {
+        if pending_deletion_ids.contains(session_id) {
+            continue;
+        }
+        let key = session_key(storage.root(), session_id);
+        if let Err(err) =
+            cleanup_session_artifacts(storage, session_id, SessionCleanupMarker::PendingFork)
+        {
             return Err(PocketError::Engine {
                 message: format!("cannot recover pending fork {session_id}: {err}"),
             });
@@ -1699,6 +2049,44 @@ fn recover_pending_forks_unlocked(
     Ok(())
 }
 
+/// Drop a session from the index and delete its persisted artifacts.
+pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
+    validate_session_id(session_id)?;
+    let storage = CheckedStorage::open(storage_dir)?;
+    let key = session_key(storage.root(), session_id);
+    let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
+    if let Err(start_err) = begin_session_deletion(&storage, session_id) {
+        let marker_state = storage
+            .pending_deletion_marker(session_id)
+            .and_then(|marker| storage.validate_regular_file(&marker, true));
+        match marker_state {
+            Ok(true) => {
+                lifecycle
+                    .sessions
+                    .insert(key, SessionLifecycleState::Tombstoned);
+            }
+            Ok(false) => {}
+            Err(marker_err) => {
+                lifecycle
+                    .sessions
+                    .insert(key, SessionLifecycleState::Tombstoned);
+                return Err(PocketError::Engine {
+                    message: format!(
+                        "{start_err}; cannot verify failed pending deletion marker rollback: \
+                         {marker_err}"
+                    ),
+                });
+            }
+        }
+        return Err(start_err);
+    }
+    lifecycle
+        .sessions
+        .insert(key, SessionLifecycleState::Tombstoned);
+    cleanup_session_artifacts(&storage, session_id, SessionCleanupMarker::PendingDeletion)
+}
+
 /// Copy a session's transcript under a fresh id at its current head.
 /// Returns the new session id.
 pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String, PocketError> {
@@ -1706,7 +2094,7 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
+    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
     ensure_session_available(&lifecycle, &key)?;
     fork_session_unlocked(&storage, session_id, &mut lifecycle, None).await
 }
@@ -1727,7 +2115,7 @@ async fn fork_session_with_stage_pause(
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    recover_pending_forks_unlocked(&storage, &mut lifecycle)?;
+    recover_pending_lifecycle_unlocked(&storage, &mut lifecycle)?;
     ensure_session_available(&lifecycle, &key)?;
     fork_session_unlocked(&storage, session_id, &mut lifecycle, Some(stage_pause)).await
 }
@@ -1835,7 +2223,16 @@ impl ForkStage {
         if !self.armed {
             return Ok(());
         }
-        preflight_session_artifacts(&self.storage, &self.session_id)?;
+        let preflight = preflight_session_artifacts(&self.storage, &self.session_id)?;
+        if preflight.pending_deletion_marker_exists {
+            self.armed = false;
+            return Err(PocketError::Engine {
+                message: format!(
+                    "pending deletion supersedes fork cleanup for session {}",
+                    self.session_id
+                ),
+            });
+        }
         let mut errors = Vec::new();
         if self.index_may_exist {
             if self.pending_marker.is_some() {
@@ -2016,9 +2413,11 @@ async fn fork_session_unlocked(
         lifecycle.sessions.get(&key),
         Some(SessionLifecycleState::Tombstoned)
     ) {
-        cleanup_session_artifacts(storage, &new_id).map_err(|err| PocketError::Engine {
-            message: format!("cannot clear deleted fork UUID collision: {err}"),
-        })?;
+        begin_session_deletion(storage, &new_id)?;
+        cleanup_session_artifacts(storage, &new_id, SessionCleanupMarker::PendingDeletion)
+            .map_err(|err| PocketError::Engine {
+                message: format!("cannot clear deleted fork UUID collision: {err}"),
+            })?;
         lifecycle.sessions.remove(&key);
     }
 
@@ -2341,6 +2740,13 @@ mod tests {
             .insert(path.to_path_buf(), count);
     }
 
+    fn fail_file_create(path: &Path, count: usize) {
+        FILE_CREATE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf(), count);
+    }
+
     async fn clear_module_state_for_root(root: &Path) {
         SESSION_LIFECYCLE_LOCK
             .write()
@@ -2446,6 +2852,52 @@ mod tests {
             .unwrap();
         drop(persistence);
         session_id
+    }
+
+    async fn create_deletion_fixture(storage: &Path) -> (String, SessionPersistence, PathBuf) {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence = SessionPersistence::create(
+            &storage.display().to_string(),
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        persistence
+            .persist_new(&[Message::user("sensitive conversation")])
+            .await
+            .unwrap();
+        let stage = fork_staging_dir(storage, &session_id);
+        std::fs::create_dir_all(&stage).unwrap();
+        let staged_file = stage.join("stale");
+        std::fs::write(&staged_file, b"staged sensitive data").unwrap();
+        (session_id, persistence, staged_file)
+    }
+
+    fn index_contains(root: &Path, session_id: &str) -> bool {
+        index_store(root)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == session_id)
+    }
+
+    fn assert_deletion_fixture_present(storage: &Path, session_id: &str, staged_file: &Path) {
+        assert!(index_contains(storage, session_id));
+        assert!(transcript_file(storage, session_id).exists());
+        assert!(familiar_file(storage, session_id).exists());
+        assert!(staged_file.exists());
+    }
+
+    fn assert_deletion_targets_absent(storage: &Path, session_id: &str) {
+        assert!(!index_contains(storage, session_id));
+        assert!(!transcript_file(storage, session_id).exists());
+        assert!(!familiar_file(storage, session_id).exists());
+        assert!(!fork_staging_dir(storage, session_id).exists());
+        assert!(!pending_fork_marker(storage, session_id).exists());
+        assert!(!pending_deletion_marker(storage, session_id).exists());
     }
 
     #[test]
@@ -3369,6 +3821,418 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_deletion_recovers_transcript_remove_failure_after_index_delete() {
+        let storage = test_storage("pending-deletion-transcript-remove");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let transcript = transcript_file(&storage, &session_id);
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_file_remove(&transcript, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err.to_string().contains("cannot delete transcript"));
+        assert!(!index_contains(&storage, &session_id));
+        assert!(transcript.exists());
+        assert!(marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &session_id)),
+            Some(SessionLifecycleState::Tombstoned)
+        ));
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_recovers_transcript_directory_sync_failure() {
+        let storage = test_storage("pending-deletion-transcript-sync");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let transcript_directory = storage.join("transcripts");
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_directory_sync(&transcript_directory, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err.to_string().contains("cannot sync transcript removal"));
+        assert!(!index_contains(&storage, &session_id));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_recovers_sidecar_remove_failure() {
+        let storage = test_storage("pending-deletion-sidecar-remove");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let sidecar = familiar_file(&storage, &session_id);
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_file_remove(&sidecar, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err.to_string().contains("cannot delete familiar metadata"));
+        assert!(sidecar.exists());
+        assert!(marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_recovers_fork_stage_cleanup_failure() {
+        let storage = test_storage("pending-deletion-stage-remove");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, staged_file) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_file_remove(&staged_file, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cannot delete fork staging artifacts"));
+        assert!(staged_file.exists());
+        assert!(marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_marker_create_failure_preserves_session_and_artifacts() {
+        let storage = test_storage("pending-deletion-marker-create");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, staged_file) = create_deletion_fixture(&storage).await;
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_file_create(&marker, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("injected pending deletion marker creation failure"));
+        assert!(!marker.exists());
+        assert_deletion_fixture_present(&storage, &session_id, &staged_file);
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &session_id)),
+            Some(SessionLifecycleState::Active { .. })
+        ));
+
+        FILE_CREATE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&marker);
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_marker_directory_sync_failure_preserves_session_and_artifacts() {
+        let storage = test_storage("pending-deletion-marker-sync");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, staged_file) = create_deletion_fixture(&storage).await;
+        let marker_directory = pending_deletions_dir(&storage);
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_directory_sync(&marker_directory, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cannot sync pending deletion marker directory"));
+        assert!(!marker.exists());
+        assert_deletion_fixture_present(&storage, &session_id, &staged_file);
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &session_id)),
+            Some(SessionLifecycleState::Active { .. })
+        ));
+
+        DIRECTORY_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&marker_directory);
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_failed_marker_rollback_fences_writer_and_recovers() {
+        let storage = test_storage("pending-deletion-marker-rollback");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, staged_file) = create_deletion_fixture(&storage).await;
+        let marker_directory = pending_deletions_dir(&storage);
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_directory_sync(&marker_directory, 1);
+        fail_file_remove(&marker, 1);
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cannot sync pending deletion marker directory"));
+        assert!(err.to_string().contains("cleanup also failed"));
+        assert!(err.to_string().contains("injected file removal failure"));
+        assert!(marker.exists());
+        assert_deletion_fixture_present(&storage, &session_id, &staged_file);
+
+        let writer_err = persistence
+            .persist_new(&[
+                Message::user("sensitive conversation"),
+                Message::assistant("stale append"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(writer_err.to_string().contains("was deleted"));
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_deletion_directory_symlink_fails_closed_before_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("pending-deletion-directory-symlink");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, staged_file) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let (external, sentinel) = external_sentinel("pending-deletion-directory-target");
+        let lifecycle = storage.join(".session-lifecycle");
+        std::fs::create_dir_all(&lifecycle).unwrap();
+        let directory = pending_deletions_dir(&storage);
+        symlink(&external, &directory).unwrap();
+
+        let result = delete_session(&storage_str, &session_id).await;
+        assert_unsafe_storage_path(result, &directory, "symlink");
+        assert_external_sentinel_only(&external, &sentinel);
+        assert_external_sentinel_only(&external, &sentinel);
+        remove_symlink_if_present(&directory);
+        assert_deletion_fixture_present(&storage, &session_id, &staged_file);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_deletion_marker_symlink_fails_closed_before_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("pending-deletion-marker-symlink");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, staged_file) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let (external, sentinel) = external_sentinel("pending-deletion-marker-target");
+        let directory = pending_deletions_dir(&storage);
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = pending_deletion_marker(&storage, &session_id);
+        symlink(&sentinel, &marker).unwrap();
+
+        let result = delete_session(&storage_str, &session_id).await;
+
+        assert_unsafe_storage_path(result, &marker, "symlink");
+        assert_external_sentinel(&sentinel);
+        assert_deletion_fixture_present(&storage, &session_id, &staged_file);
+
+        remove_symlink_if_present(&marker);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_malformed_marker_preflights_entire_batch_before_mutation() {
+        let storage = test_storage("pending-deletion-malformed-batch");
+        let storage_str = storage.display().to_string();
+        let (first_id, first, first_stage) = create_deletion_fixture(&storage).await;
+        let (second_id, second, second_stage) = create_deletion_fixture(&storage).await;
+        drop(first);
+        drop(second);
+        let directory = pending_deletions_dir(&storage);
+        std::fs::create_dir_all(&directory).unwrap();
+        let valid_marker = pending_deletion_marker(&storage, &first_id);
+        std::fs::write(&valid_marker, b"").unwrap();
+        let malformed_marker = directory.join("not-a-uuid.pending");
+        std::fs::write(&malformed_marker, b"").unwrap();
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("malformed pending-deletion marker must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("invalid pending deletion marker"));
+        assert_deletion_fixture_present(&storage, &first_id, &first_stage);
+        assert_deletion_fixture_present(&storage, &second_id, &second_stage);
+        assert!(valid_marker.exists());
+        assert!(malformed_marker.exists());
+
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_repeated_recovery_failure_remains_retryable() {
+        let storage = test_storage("pending-deletion-repeated-recovery");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+        let transcript = transcript_file(&storage, &session_id);
+        let marker = pending_deletion_marker(&storage, &session_id);
+        fail_file_remove(&transcript, 3);
+
+        delete_session(&storage_str, &session_id).await.unwrap_err();
+        assert!(marker.exists());
+        assert!(transcript.exists());
+
+        for _ in 0..2 {
+            clear_module_state_for_root(&storage).await;
+            let err = match list_sessions(&storage_str).await {
+                Ok(_) => panic!("pending deletion recovery failure must fail list"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("cannot recover pending deletion"));
+            assert!(marker.exists());
+            assert!(transcript.exists());
+            assert!(!index_contains(&storage, &session_id));
+        }
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_success_removes_marker_last() {
+        let storage = test_storage("pending-deletion-success");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        drop(persistence);
+
+        delete_session(&storage_str, &session_id).await.unwrap();
+
+        assert_deletion_targets_absent(&storage, &session_id);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_supersedes_pending_fork_recovery_for_same_destination() {
+        let storage = test_storage("pending-deletion-supersedes-fork");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source = SessionPersistence::create(
+            &storage_str,
+            source_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        source
+            .persist_new(&[Message::user("source message")])
+            .await
+            .unwrap();
+
+        configure_session_faults(&storage, true, 1);
+        fork_session(&storage_str, &source_id).await.unwrap_err();
+        let fork_id = indexed_fork_id(&storage, &source_id);
+        let deletion_directory = pending_deletions_dir(&storage);
+        std::fs::create_dir_all(&deletion_directory).unwrap();
+        std::fs::write(pending_deletion_marker(&storage, &fork_id), b"").unwrap();
+        assert!(pending_fork_marker(&storage, &fork_id).exists());
+
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, source_id);
+        assert_deletion_targets_absent(&storage, &fork_id);
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &fork_id)),
+            Some(SessionLifecycleState::Tombstoned)
+        ));
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_deletion_fences_surviving_writer_before_failed_cleanup_returns() {
+        let storage = test_storage("pending-deletion-writer-fence");
+        let storage_str = storage.display().to_string();
+        let (session_id, persistence, _) = create_deletion_fixture(&storage).await;
+        let transcript = transcript_file(&storage, &session_id);
+        fail_file_remove(&transcript, 1);
+
+        delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        let err = persistence
+            .persist_new(&[
+                Message::user("sensitive conversation"),
+                Message::assistant("stale append"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("was deleted"));
+        assert!(pending_deletion_marker(&storage, &session_id).exists());
+        assert_eq!(
+            load_session_messages_at_root(&storage, &session_id)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn list_sessions_includes_pinned_familiar_and_old_sessions_use_none() {
         let storage = test_storage("list-metadata");
         let storage_str = storage.display().to_string();
@@ -4182,7 +5046,7 @@ mod tests {
 
         let mut lifecycle = SessionLifecycle::default();
         let checked_storage = CheckedStorage::from_root(&storage).unwrap();
-        recover_pending_forks_unlocked(&checked_storage, &mut lifecycle).unwrap();
+        recover_pending_lifecycle_unlocked(&checked_storage, &mut lifecycle).unwrap();
         assert!(!pending_fork_marker(&storage, &fork_id).exists());
         assert!(!stage_root.exists());
 
