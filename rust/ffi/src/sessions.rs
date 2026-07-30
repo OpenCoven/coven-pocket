@@ -69,6 +69,10 @@ static DIRECTORY_SYNC_EVENTS: LazyLock<std::sync::Mutex<Vec<PathBuf>>> =
 static DIRECTORY_SYNC_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+static FILE_REMOVE_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// Summary row for the session browser.
 #[derive(uniffi::Record)]
 pub struct ChatSessionSummary {
@@ -311,7 +315,23 @@ fn remove_file_durably_if_present(
     remove_context: &str,
     sync_context: &str,
 ) -> Result<(), PocketError> {
-    match std::fs::remove_file(path) {
+    #[cfg(test)]
+    let remove_result = {
+        let mut failures = FILE_REMOVE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failures.get_mut(path) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                Err(std::io::Error::other("injected file removal failure"))
+            }
+            _ => std::fs::remove_file(path),
+        }
+    };
+    #[cfg(not(test))]
+    let remove_result = std::fs::remove_file(path);
+
+    match remove_result {
         Ok(()) => sync_directory(directory, sync_context),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             sync_directory_if_present(directory, sync_context)
@@ -544,6 +564,7 @@ fn save_familiar_metadata_at_root(
         uuid::Uuid::new_v4()
     ));
 
+    let mut destination_installed = false;
     let write_result = (|| -> Result<(), PocketError> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -556,6 +577,7 @@ fn save_familiar_metadata_at_root(
             .map_err(|err| engine_err("cannot sync temporary familiar metadata", err))?;
         std::fs::rename(&temporary, &destination)
             .map_err(|err| engine_err("cannot install familiar metadata", err))?;
+        destination_installed = true;
         sync_directory(
             &metadata_dir,
             "cannot sync installed familiar metadata directory",
@@ -563,11 +585,24 @@ fn save_familiar_metadata_at_root(
     })();
 
     if let Err(write_err) = write_result {
+        let (rollback_path, remove_context, sync_context) = if destination_installed {
+            (
+                &destination,
+                "cannot roll back installed familiar metadata",
+                "cannot sync familiar metadata rollback",
+            )
+        } else {
+            (
+                &temporary,
+                "cannot clean temporary familiar metadata",
+                "cannot sync temporary familiar metadata cleanup",
+            )
+        };
         return match remove_file_durably_if_present(
-            &temporary,
+            rollback_path,
             &metadata_dir,
-            "cannot clean temporary familiar metadata",
-            "cannot sync temporary familiar metadata cleanup",
+            remove_context,
+            sync_context,
         ) {
             Ok(()) => Err(write_err),
             Err(cleanup_err) => Err(PocketError::Engine {
@@ -1537,6 +1572,13 @@ mod tests {
             .insert(path.to_path_buf(), count);
     }
 
+    fn fail_file_remove(path: &Path, count: usize) {
+        FILE_REMOVE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf(), count);
+    }
+
     async fn clear_module_state_for_root(root: &Path) {
         SESSION_LIFECYCLE_LOCK
             .write()
@@ -1679,6 +1721,214 @@ mod tests {
                 storage.join("metadata"),
                 storage.join("metadata")
             ]
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_rolls_back_sidecar_after_post_rename_directory_sync_failure() {
+        let storage = test_storage("metadata-post-rename-sync");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let metadata_dir = storage.join("metadata");
+        let destination = familiar_file(&storage, &session_id);
+        fail_directory_sync(&metadata_dir, 1);
+
+        let err = match SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        {
+            Ok(_) => panic!("post-rename directory sync failure must fail create"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("cannot sync installed familiar metadata directory"));
+        assert!(err.to_string().contains("injected directory sync failure"));
+        assert!(!destination.exists());
+        assert!(std::fs::read_dir(&metadata_dir).unwrap().next().is_none());
+        assert!(!SESSION_LIFECYCLE_LOCK
+            .read()
+            .await
+            .sessions
+            .contains_key(&session_key(&storage, &session_id)));
+        assert!(index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_reports_combined_error_when_sidecar_rollback_remove_fails() {
+        let storage = test_storage("metadata-rollback-remove-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let metadata_dir = storage.join("metadata");
+        let destination = familiar_file(&storage, &session_id);
+        fail_directory_sync(&metadata_dir, 1);
+        fail_file_remove(&destination, 1);
+
+        let err = match SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        {
+            Ok(_) => panic!("rollback removal failure must fail create"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains("cannot sync installed familiar metadata directory"));
+        assert!(message.contains("injected directory sync failure"));
+        assert!(message.contains("rollback also failed"));
+        assert!(message.contains("cannot roll back installed familiar metadata"));
+        assert!(message.contains("injected file removal failure"));
+        assert!(destination.exists());
+        assert_eq!(
+            std::fs::read_dir(&metadata_dir)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!SESSION_LIFECYCLE_LOCK
+            .read()
+            .await
+            .sessions
+            .contains_key(&session_key(&storage, &session_id)));
+        assert!(index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .is_empty());
+
+        FILE_REMOVE_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&destination);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_reports_combined_error_when_sidecar_rollback_sync_fails() {
+        let storage = test_storage("metadata-rollback-sync-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let metadata_dir = storage.join("metadata");
+        let destination = familiar_file(&storage, &session_id);
+        fail_directory_sync(&metadata_dir, 2);
+
+        let err = match SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        {
+            Ok(_) => panic!("rollback directory sync failure must fail create"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+
+        assert!(message.contains("cannot sync installed familiar metadata directory"));
+        assert!(message.contains("rollback also failed"));
+        assert!(message.contains("cannot sync familiar metadata rollback"));
+        assert!(!destination.exists());
+        assert!(std::fs::read_dir(&metadata_dir).unwrap().next().is_none());
+        assert!(!SESSION_LIFECYCLE_LOCK
+            .read()
+            .await
+            .sessions
+            .contains_key(&session_key(&storage, &session_id)));
+        assert!(index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_rename_failure_cleans_only_temporary_sidecar() {
+        let storage = test_storage("metadata-rename-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let metadata_dir = storage.join("metadata");
+        let destination = familiar_file(&storage, &session_id);
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let err = match SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        {
+            Ok(_) => panic!("rename over a directory must fail create"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("cannot install familiar metadata"));
+        assert!(destination.is_dir());
+        let entries = std::fs::read_dir(&metadata_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), destination);
+        assert!(!SESSION_LIFECYCLE_LOCK
+            .read()
+            .await
+            .sessions
+            .contains_key(&session_key(&storage, &session_id)));
+        assert!(index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn pending_marker_directory_sync_failure_removes_marker_durably() {
+        let storage = test_storage("pending-marker-sync-failure");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let marker_directory = pending_forks_dir(&storage);
+        fail_directory_sync(&marker_directory, 1);
+
+        let err = create_pending_fork_marker(&storage, &session_id).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cannot sync pending fork marker directory"));
+        assert!(err.to_string().contains("injected directory sync failure"));
+        assert!(!pending_fork_marker(&storage, &session_id).exists());
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
+        assert_eq!(
+            DIRECTORY_SYNC_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|path| path.as_path() == marker_directory)
+                .count(),
+            2
         );
 
         std::fs::remove_dir_all(storage).unwrap();
@@ -1937,6 +2187,100 @@ mod tests {
         assert!(!fork_sidecar.exists());
 
         std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    async fn assert_fork_directory_sync_failure_rolls_back(
+        label: &str,
+        directory_name: &str,
+        expected_context: &str,
+    ) {
+        let storage = test_storage(label);
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source = SessionPersistence::create(
+            &storage_str,
+            source_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        source
+            .persist_new(&[Message::user("source message")])
+            .await
+            .unwrap();
+        fail_directory_sync(&storage.join(directory_name), 1);
+
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+
+        assert!(err.to_string().contains(expected_context));
+        assert!(err.to_string().contains("injected directory sync failure"));
+        assert_eq!(
+            index_store(&storage)
+                .unwrap()
+                .list_sessions()
+                .unwrap()
+                .len(),
+            1
+        );
+        let transcript_names = std::fs::read_dir(storage.join("transcripts"))
+            .unwrap()
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            transcript_names,
+            [std::ffi::OsString::from(format!("{source_id}.jsonl"))]
+        );
+        let metadata_names = std::fs::read_dir(storage.join("metadata"))
+            .unwrap()
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            metadata_names,
+            [std::ffi::OsString::from(format!(
+                "{source_id}.familiar.json"
+            ))]
+        );
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
+        assert!(!storage.join(".fork-staging").exists());
+        let lifecycle = SESSION_LIFECYCLE_LOCK.read().await;
+        assert_eq!(
+            lifecycle
+                .sessions
+                .iter()
+                .filter(|(key, _)| key.root == storage)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            lifecycle.sessions.get(&session_key(&storage, &source_id)),
+            Some(SessionLifecycleState::Active(_))
+        ));
+        drop(lifecycle);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_transcript_directory_sync_failure_rolls_back_published_destination() {
+        assert_fork_directory_sync_failure_rolls_back(
+            "fork-transcript-sync-rollback",
+            "transcripts",
+            "cannot make published fork transcript durable",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fork_metadata_directory_sync_failure_rolls_back_published_destinations() {
+        assert_fork_directory_sync_failure_rolls_back(
+            "fork-metadata-sync-rollback",
+            "metadata",
+            "cannot make published fork metadata durable",
+        )
+        .await;
     }
 
     #[tokio::test]
