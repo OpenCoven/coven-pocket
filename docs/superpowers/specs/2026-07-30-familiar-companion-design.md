@@ -69,8 +69,7 @@ Add a UniFFI `RemoteFamiliar` record containing:
 - optional `role`
 - optional `description`
 - optional `pronouns`
-- canonical `access`
-- optional `model`
+- optional `icon`
 
 The Rust daemon client adds `GET /api/v1/familiars`, using the existing bounded
 HTTP transport and structured error handling. Missing optional fields decode
@@ -101,14 +100,14 @@ The daemon process ID and start time are deliberately excluded: a normal
 daemon restart must not erase the user's choice. Changing host or port selects
 a distinct profile.
 
-Each stored selection includes the ID, display name, and role used for identity
-injection. Other roster fields are display metadata only. "None" is an explicit
-selection and removes the stored entry for that profile.
+Each stored selection includes the ID, display name, emoji, and role used for
+identity and display. Other roster fields are display metadata only. "None" is
+an explicit selection and removes the stored entry for that profile.
 
 Roster refresh always passes through `CompanionModel.gateForSessionTraffic()`.
 Stale asynchronous refreshes use a generation check and cannot overwrite a
 newer endpoint's roster or selection. A selected ID missing from a fresh roster
-is cleared for that daemon profile; an offline cached snapshot remains valid
+is cleared for the active profile; an offline cached snapshot remains valid
 only until a successful roster refresh proves it was removed.
 
 ### Session identity
@@ -125,10 +124,10 @@ The Rust chat session appends the same concise identity block used by Coven:
 ```
 
 When no role exists, the role clause is omitted. Familiar text is data: it
-does not replace the platform sandbox note, change tool registration, or alter
-the active permission mode. The familiar's daemon `access` and `model` fields
-are shown for context but do not grant capabilities or silently override the
-user's selected model.
+does not replace the platform sandbox note, change tool registration, alter the
+active permission mode, or override the user's selected model. The daemon's
+current roster endpoint does not expose access or model fields, so Pocket
+neither infers nor displays them.
 
 For companion Claude, Pocket sends only the selected familiar ID. The daemon
 injects its current identity representation and rejects stale/unknown IDs.
@@ -148,7 +147,7 @@ cleanup path before launching the replacement.
 Chat Settings gains a `Familiar` section:
 
 - a picker with "None" plus the current daemon roster;
-- compact name, emoji, role, and access presentation;
+- compact name, emoji/icon, and role presentation;
 - loading and actionable pairing/refresh failures; and
 - a short note that familiars shape identity but do not widen iOS permissions.
 
@@ -179,8 +178,8 @@ seven-name art ships in this change.
   selection without claiming the roster is current.
 - Unknown daemon familiar IDs fail the launch visibly; there is no launch
   without identity and no fallback to cached prompt injection.
-- Malformed roster entries are skipped individually; a malformed top-level
-  response fails the request.
+- Blank or duplicate familiar IDs and malformed top-level roster responses
+  fail the request rather than publishing an ambiguous partial roster.
 - Persistence decode failure resets only familiar preferences and reports no
   success-shaped state.
 - Stale refresh, launch, and cleanup outcomes cannot publish over a newer
