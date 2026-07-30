@@ -2934,7 +2934,9 @@ async fn resolve_pending_index_transcript(
         }
         let record = work.record.clone();
         match find_pending_index_record_in_transcript(storage, &record).await? {
-            PendingTranscriptMatch::TranscriptAbsent | PendingTranscriptMatch::MessageAbsent => {
+            PendingTranscriptMatch::TranscriptAbsent
+            | PendingTranscriptMatch::TranscriptEmpty
+            | PendingTranscriptMatch::MessageAbsent => {
                 remove_pending_index_record(storage, &record, true)?;
                 state.pending_index.pop_front();
             }
@@ -3078,6 +3080,7 @@ async fn load_session_transcript_at_storage(
 
 enum PendingTranscriptMatch {
     TranscriptAbsent,
+    TranscriptEmpty,
     MessageAbsent,
     Present,
 }
@@ -3091,6 +3094,9 @@ async fn find_pending_index_record_in_transcript(
     else {
         return Ok(PendingTranscriptMatch::TranscriptAbsent);
     };
+    if loaded.entries.is_empty() {
+        return Ok(PendingTranscriptMatch::TranscriptEmpty);
+    }
     let mut found = false;
     for entry in &loaded.entries {
         if entry.uuid() != Some(record.message_uuid.as_str()) {
@@ -3261,7 +3267,7 @@ fn preflight_storage_recovery(
 
 async fn recover_pending_index_plan(
     storage: &CheckedStorage,
-    lifecycle: &SessionLifecycle,
+    lifecycle: &mut SessionLifecycle,
     plan: PendingIndexRecoveryPlan,
 ) -> Result<(), PocketError> {
     let directory = storage.pending_index_dir()?;
@@ -3289,9 +3295,8 @@ async fn recover_pending_index_plan(
             continue;
         }
         match find_pending_index_record_in_transcript(storage, &record).await? {
-            PendingTranscriptMatch::TranscriptAbsent => {
-                remove_speculative_empty_index_session(storage, &record.session_id)?;
-                remove_pending_index_record(storage, &record, false)?;
+            PendingTranscriptMatch::TranscriptAbsent | PendingTranscriptMatch::TranscriptEmpty => {
+                recover_absent_pending_index_record(storage, lifecycle, &record)?;
             }
             PendingTranscriptMatch::MessageAbsent => {
                 remove_pending_index_record(storage, &record, false)?;
@@ -3314,27 +3319,57 @@ async fn recover_pending_index_plan(
     Ok(())
 }
 
-fn remove_speculative_empty_index_session(
+enum AbsentPendingIndexRecovery {
+    RemoveIntentOnly,
+    DeleteUnpublishedSession,
+}
+
+fn classify_absent_pending_index_recovery(
     storage: &CheckedStorage,
     session_id: &str,
-) -> Result<(), PocketError> {
+) -> Result<AbsentPendingIndexRecovery, PocketError> {
     let store = checked_index_store(storage)?;
     storage.validate_sqlite_files()?;
     let rows = store
         .list_sessions()
         .map_err(|err| engine_err("cannot inspect speculative session index", err))?;
     validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
-    if rows
-        .iter()
-        .any(|row| row.id == session_id && row.message_count == 0)
-    {
-        delete_index_session(
-            storage,
-            session_id,
-            "cannot remove speculative empty session index",
-        )?;
+    Ok(
+        if rows
+            .iter()
+            .any(|row| row.id == session_id && row.message_count == 0)
+        {
+            AbsentPendingIndexRecovery::DeleteUnpublishedSession
+        } else {
+            AbsentPendingIndexRecovery::RemoveIntentOnly
+        },
+    )
+}
+
+fn recover_absent_pending_index_record(
+    storage: &CheckedStorage,
+    lifecycle: &mut SessionLifecycle,
+    record: &PendingIndexRecord,
+) -> Result<(), PocketError> {
+    match classify_absent_pending_index_recovery(storage, &record.session_id)? {
+        AbsentPendingIndexRecovery::RemoveIntentOnly => {
+            remove_pending_index_record(storage, record, false)
+        }
+        AbsentPendingIndexRecovery::DeleteUnpublishedSession => {
+            begin_session_deletion_and_tombstone(storage, lifecycle, &record.session_id)?;
+            cleanup_session_artifacts(
+                storage,
+                &record.session_id,
+                SessionCleanupMarker::PendingDeletion,
+            )
+            .map_err(|err| PocketError::Engine {
+                message: format!(
+                    "cannot recover unpublished first-turn session {}: {err}",
+                    record.session_id
+                ),
+            })
+        }
     }
-    Ok(())
 }
 
 async fn recover_storage_unlocked(
@@ -3583,6 +3618,43 @@ fn begin_session_deletion(storage: &CheckedStorage, session_id: &str) -> Result<
     }
 }
 
+fn begin_session_deletion_and_tombstone(
+    storage: &CheckedStorage,
+    lifecycle: &mut SessionLifecycle,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let key = session_key(storage.root(), session_id);
+    if let Err(start_err) = begin_session_deletion(storage, session_id) {
+        let marker_state = storage
+            .pending_deletion_marker(session_id)
+            .and_then(|marker| storage.validate_regular_file(&marker, true));
+        match marker_state {
+            Ok(true) => {
+                lifecycle
+                    .sessions
+                    .insert(key, SessionLifecycleState::Tombstoned);
+            }
+            Ok(false) => {}
+            Err(marker_err) => {
+                lifecycle
+                    .sessions
+                    .insert(key, SessionLifecycleState::Tombstoned);
+                return Err(PocketError::Engine {
+                    message: format!(
+                        "{start_err}; cannot verify failed pending deletion marker rollback: \
+                         {marker_err}"
+                    ),
+                });
+            }
+        }
+        return Err(start_err);
+    }
+    lifecycle
+        .sessions
+        .insert(key, SessionLifecycleState::Tombstoned);
+    Ok(())
+}
+
 fn cleanup_session_artifacts(
     storage: &CheckedStorage,
     session_id: &str,
@@ -3765,7 +3837,6 @@ fn recover_pending_lifecycle_plan(
 pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), PocketError> {
     validate_session_id(session_id)?;
     let storage = CheckedStorage::open(storage_dir)?;
-    let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
     let recovery = preflight_storage_recovery(&storage, &lifecycle)?;
     recover_pending_lifecycle_plan(&storage, &mut lifecycle, recovery.lifecycle)?;
@@ -3784,35 +3855,8 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
             .filter(|path| *path != target_temporary)
             .collect(),
     };
-    recover_pending_index_plan(&storage, &lifecycle, remaining_pending_index).await?;
-    if let Err(start_err) = begin_session_deletion(&storage, session_id) {
-        let marker_state = storage
-            .pending_deletion_marker(session_id)
-            .and_then(|marker| storage.validate_regular_file(&marker, true));
-        match marker_state {
-            Ok(true) => {
-                lifecycle
-                    .sessions
-                    .insert(key, SessionLifecycleState::Tombstoned);
-            }
-            Ok(false) => {}
-            Err(marker_err) => {
-                lifecycle
-                    .sessions
-                    .insert(key, SessionLifecycleState::Tombstoned);
-                return Err(PocketError::Engine {
-                    message: format!(
-                        "{start_err}; cannot verify failed pending deletion marker rollback: \
-                         {marker_err}"
-                    ),
-                });
-            }
-        }
-        return Err(start_err);
-    }
-    lifecycle
-        .sessions
-        .insert(key, SessionLifecycleState::Tombstoned);
+    recover_pending_index_plan(&storage, &mut lifecycle, remaining_pending_index).await?;
+    begin_session_deletion_and_tombstone(&storage, &mut lifecycle, session_id)?;
     cleanup_session_artifacts(&storage, session_id, SessionCleanupMarker::PendingDeletion)
 }
 
@@ -4628,6 +4672,32 @@ mod tests {
         std::fs::File::open(&directory).unwrap().sync_all().unwrap();
     }
 
+    fn seed_legacy_first_turn_ghost(
+        root: &Path,
+        session_id: &str,
+        message_uuid: &str,
+        transcript_bytes: &[u8],
+    ) {
+        index_store(root)
+            .unwrap()
+            .save_session(session_id, Some("Pending"), "model")
+            .unwrap();
+        let storage = CheckedStorage::from_root(root).unwrap();
+        write_session_model_record(&storage, session_id, "model").unwrap();
+        seed_index_baseline_record(root, session_id);
+        save_familiar_metadata_at_root(root, session_id, Some(&familiar())).unwrap();
+        seed_pending_index_record(root, session_id, message_uuid, "user", "never appended");
+        let directory = root.join("transcripts");
+        std::fs::create_dir_all(&directory).unwrap();
+        let transcript = transcript_file(root, session_id);
+        std::fs::write(&transcript, transcript_bytes).unwrap();
+        std::fs::File::open(&transcript)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+    }
+
     async fn seed_transcript(root: &Path, session_id: &str, messages: &[Message]) -> Vec<String> {
         let directory = root.join("transcripts");
         std::fs::create_dir_all(&directory).unwrap();
@@ -4885,6 +4955,9 @@ mod tests {
         assert!(!fork_staging_dir(storage, session_id).exists());
         assert!(!pending_fork_marker(storage, session_id).exists());
         assert!(!pending_deletion_marker(storage, session_id).exists());
+        assert!(!pending_index_marker(storage, session_id).exists());
+        assert!(!session_model_marker(storage, session_id).exists());
+        assert!(!index_baseline_marker(storage, session_id).exists());
     }
 
     #[test]
@@ -5723,6 +5796,266 @@ mod tests {
         assert!(!index_contains(&storage, &session_id));
         assert_eq!(indexed_message_count(&storage, &session_id), 0);
         assert!(message_index_attempts_for(&storage).is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_deletes_legacy_first_turn_ghost_with_empty_transcript() {
+        let storage = test_storage("persist-legacy-empty-first-turn-ghost");
+        let storage_str = storage.display().to_string();
+        let unrelated_id = uuid::Uuid::new_v4().to_string();
+        let unrelated = SessionPersistence::create(
+            &storage_str,
+            unrelated_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        unrelated
+            .persist_new(&[Message::user("unrelated survives")])
+            .await
+            .unwrap();
+        drop(unrelated);
+        let unrelated_fields = indexed_session_fields(&storage, &unrelated_id).unwrap();
+        let unrelated_transcript = std::fs::read(transcript_file(&storage, &unrelated_id)).unwrap();
+        let unrelated_sidecar = std::fs::read(familiar_file(&storage, &unrelated_id)).unwrap();
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_legacy_first_turn_ghost(
+            &storage,
+            &session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            b"",
+        );
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [unrelated_id.as_str()]
+        );
+        assert_deletion_targets_absent(&storage, &session_id);
+        assert_eq!(
+            indexed_session_fields(&storage, &unrelated_id),
+            Some(unrelated_fields)
+        );
+        assert_eq!(
+            std::fs::read(transcript_file(&storage, &unrelated_id)).unwrap(),
+            unrelated_transcript
+        );
+        assert_eq!(
+            std::fs::read(familiar_file(&storage, &unrelated_id)).unwrap(),
+            unrelated_sidecar
+        );
+
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, unrelated_id);
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_deletes_legacy_first_turn_ghost_after_partial_tail_repair() {
+        let storage = test_storage("persist-legacy-partial-first-turn-ghost");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_legacy_first_turn_ghost(
+            &storage,
+            &session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            br#"{"type":"user","uuid":"partial"#,
+        );
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_first_turn_ghost_cleanup_retries_under_pending_deletion_marker() {
+        let storage = test_storage("persist-legacy-first-turn-ghost-retry");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_legacy_first_turn_ghost(
+            &storage,
+            &session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            b"",
+        );
+        let transcript = transcript_file(&storage, &session_id);
+        let external = storage.join("external-artifact");
+        std::fs::write(&external, b"preserve me").unwrap();
+        fail_file_remove(&transcript, 2);
+
+        for _ in 0..2 {
+            let err = match list_sessions(&storage_str).await {
+                Ok(_) => panic!("incomplete ghost cleanup must fail recovery"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("cannot delete transcript"));
+            assert!(pending_deletion_marker(&storage, &session_id).is_file());
+            assert!(!pending_index_marker(&storage, &session_id).exists());
+            assert!(!index_baseline_marker(&storage, &session_id).exists());
+            assert!(!session_model_marker(&storage, &session_id).exists());
+            assert!(!familiar_file(&storage, &session_id).exists());
+            assert!(!index_contains(&storage, &session_id));
+            assert!(transcript.is_file());
+            assert_eq!(std::fs::read(&external).unwrap(), b"preserve me");
+            assert!(matches!(
+                SESSION_LIFECYCLE_LOCK
+                    .read()
+                    .await
+                    .sessions
+                    .get(&session_key(&storage, &session_id)),
+                Some(SessionLifecycleState::Tombstoned)
+            ));
+            clear_module_state_for_root(&storage).await;
+        }
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+        assert_eq!(std::fs::read(&external).unwrap(), b"preserve me");
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn absent_new_protocol_first_append_removes_only_pending_intent() {
+        let storage = test_storage("persist-new-protocol-absent-first-append");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence = SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        let message = Message::user("never appended");
+        let record = PendingIndexRecord::from_message(
+            &session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            &message,
+            "model",
+            "never appended",
+        );
+        write_pending_index_record(&persistence.storage, &record).unwrap();
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(session_model_marker(&storage, &session_id).is_file());
+        assert!(familiar_file(&storage, &session_id).is_file());
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(session_model_marker(&storage, &session_id).is_file());
+        assert!(familiar_file(&storage, &session_id).is_file());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_count_row_with_nonempty_transcript_is_retained_for_reconciliation() {
+        let storage = test_storage("persist-zero-count-nonempty-reconcile");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_legacy_session(
+            &storage,
+            &session_id,
+            &[Message::user("durable transcript")],
+        )
+        .await;
+        save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
+        seed_pending_index_record(
+            &storage,
+            &session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            "assistant",
+            "missing later append",
+        );
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].message_count, 0);
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(transcript_file(&storage, &session_id).is_file());
+        assert!(familiar_file(&storage, &session_id).is_file());
+
+        clear_module_state_for_root(&storage).await;
+        let (resumed, messages, familiar) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(familiar.is_some());
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        drop(resumed);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_indexed_session_without_pending_intent_is_not_deleted() {
+        let storage = test_storage("persist-valid-empty-indexed-session");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&session_id, Some("Empty"), "model")
+            .unwrap();
+        seed_index_baseline_record(&storage, &session_id);
+        save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
+        let transcript_directory = storage.join("transcripts");
+        std::fs::create_dir_all(&transcript_directory).unwrap();
+        std::fs::File::create(transcript_file(&storage, &session_id)).unwrap();
+
+        let (persistence, messages, familiar) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        assert!(messages.is_empty());
+        assert!(familiar.is_some());
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].message_count, 0);
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(transcript_file(&storage, &session_id).is_file());
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(familiar_file(&storage, &session_id).is_file());
+
+        persistence
+            .persist_new(&[Message::user("first valid append")])
+            .await
+            .unwrap();
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+        drop(persistence);
 
         std::fs::remove_dir_all(storage).unwrap();
     }
