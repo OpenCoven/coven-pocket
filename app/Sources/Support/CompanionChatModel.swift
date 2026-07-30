@@ -22,6 +22,7 @@ struct CompanionSendContext: Equatable {
 @MainActor
 final class CompanionChatModel: ObservableObject {
     enum Availability: Equatable {
+        case idle
         case checking
         case ready(DaemonPairing)
         case blocked(reason: String, hint: String)
@@ -30,7 +31,7 @@ final class CompanionChatModel: ObservableObject {
     @Published var items: [ChatItem] = []
     @Published var isBusy = false
     @Published var canRetry = false
-    @Published var availability: Availability = .checking {
+    @Published var availability: Availability = .idle {
         didSet {
             if let terminal = availability.terminal {
                 lastTerminalAvailability = terminal
@@ -120,24 +121,52 @@ final class CompanionChatModel: ObservableObject {
     @discardableResult
     func refreshAvailability() async -> Bool {
         guard !Task.isCancelled else { return false }
-        let priorAvailability = lastTerminalAvailability
-        let generation = beginAvailabilityCheck()
-        let gate = await client.sessionGate()
-        guard generation == availabilityGeneration else { return false }
-        guard !Task.isCancelled else {
-            if let priorAvailability {
-                availability = priorAvailability
-            }
-            return false
-        }
-        availability = Self.availability(from: gate)
-        return true
+        return await availabilityGate(while: { true }) != nil
     }
 
     func beginAvailabilityCheck() -> UInt64 {
         availabilityGeneration &+= 1
         availability = .checking
         return availabilityGeneration
+    }
+
+    func availabilityGate(
+        while isOperationCurrent: () -> Bool
+    ) async -> CompanionModel.SessionGate? {
+        let generation = beginAvailabilityCheck()
+        var publishedTerminal = false
+        defer {
+            completeAvailabilityCheck(
+                generation: generation,
+                publishedTerminal: publishedTerminal
+            )
+        }
+        return await withTaskCancellationHandler {
+            let gate = await client.sessionGate()
+            guard generation == availabilityGeneration,
+                  isOperationCurrent(),
+                  !Task.isCancelled else { return nil }
+            availability = Self.availability(from: gate)
+            publishedTerminal = true
+            return gate
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.restoreAvailability(for: generation)
+            }
+        }
+    }
+
+    private func completeAvailabilityCheck(
+        generation: UInt64,
+        publishedTerminal: Bool
+    ) {
+        guard !publishedTerminal else { return }
+        restoreAvailability(for: generation)
+    }
+
+    private func restoreAvailability(for generation: UInt64) {
+        guard generation == availabilityGeneration else { return }
+        availability = lastTerminalAvailability ?? .idle
     }
 
     // swiftlint:disable:next function_body_length
@@ -214,7 +243,7 @@ final class CompanionChatModel: ObservableObject {
 private extension CompanionChatModel.Availability {
     var terminal: Self? {
         switch self {
-        case .checking:
+        case .idle, .checking:
             return nil
         case .ready, .blocked:
             return self

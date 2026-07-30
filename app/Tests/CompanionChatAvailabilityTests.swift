@@ -102,7 +102,7 @@ final class CompanionChatAvailabilityTests: XCTestCase {
         XCTAssertFalse(model.items.contains { $0.kind == .error })
     }
 
-    func testInvalidatedInitialCheckSafelyRemainsChecking() async {
+    func testStoppedInitialSendGateRestoresIdle() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
         client.suspendsGate = true
         let model = CompanionChatModel(client: client)
@@ -118,7 +118,7 @@ final class CompanionChatAvailabilityTests: XCTestCase {
         )
         await send.value
 
-        XCTAssertEqual(model.availability, .checking)
+        XCTAssertEqual(model.availability, .idle)
         XCTAssertFalse(model.isAvailable)
         XCTAssertTrue(client.launchedPrompts.isEmpty)
         XCTAssertFalse(model.items.contains { $0.kind == .error })

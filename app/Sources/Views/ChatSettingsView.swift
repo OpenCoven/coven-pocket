@@ -180,6 +180,18 @@ struct ChatSettingsView: View {
             }
 
         switch companionModel.availability {
+        case .idle:
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Daemon availability not checked")
+                    Text("Verify the daemon to enable Companion chat.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "questionmark.circle")
+                    .foregroundStyle(.secondary)
+            }
         case .checking:
             Label("Checking the daemon…", systemImage: "antenna.radiowaves.left.and.right")
                 .foregroundStyle(.secondary)

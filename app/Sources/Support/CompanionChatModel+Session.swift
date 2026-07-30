@@ -230,17 +230,9 @@ extension CompanionChatModel {
         reportFailure: Bool,
         generation: UInt64
     ) async -> DaemonPairing? {
-        let priorAvailability = lastTerminalAvailability
-        let availabilityRequest = beginAvailabilityCheck()
-        let gate = await client.sessionGate()
-        guard availabilityRequest == availabilityGeneration else { return nil }
-        guard generation == operationGeneration, !Task.isCancelled else {
-            if let priorAvailability {
-                availability = priorAvailability
-            }
-            return nil
-        }
-        availability = Self.availability(from: gate)
+        guard let gate = await availabilityGate(
+            while: { generation == operationGeneration }
+        ) else { return nil }
         switch gate {
         case let .ready(pairing):
             return pairing

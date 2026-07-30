@@ -162,6 +162,14 @@ final class FamiliarSelectionTests: XCTestCase {
             ChatFamiliarProfile.active(
                 backend: .companionClaude,
                 codexProfileID: nil,
+                companionAvailability: .idle,
+                previous: companion
+            )
+        )
+        XCTAssertNil(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
                 companionAvailability: .blocked(
                     reason: "Unavailable",
                     hint: "Retry."

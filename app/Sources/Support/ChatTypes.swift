@@ -122,7 +122,7 @@ enum ChatFamiliarProfile {
             case .checking:
                 guard case .companion = previous else { return nil }
                 return previous
-            case .blocked:
+            case .idle, .blocked:
                 return nil
             }
         }
