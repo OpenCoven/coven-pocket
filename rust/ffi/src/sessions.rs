@@ -19,10 +19,12 @@
 //! the JSONL file is the source of truth for restores. Message appends publish
 //! a versioned pending-index record before touching JSONL, sync the append,
 //! publish the session row, replay `save_message` idempotently, and remove the
-//! record last. Routine
-//! recovery enumerates only those records; legacy transcripts reconcile once
-//! on explicit resume or fork and then receive an index-baseline marker, so
-//! stale legacy browser counts self-heal without making listing scan history.
+//! record last. Routine recovery enumerates those records plus at most the
+//! 100 browser-visible zero-count rows that lack every lifecycle/index marker.
+//! Only those legacy candidates read transcripts: empty pre-marker ghosts are
+//! durably deleted, while nonempty transcripts reconcile once and receive an
+//! index-baseline marker. Other legacy transcripts reconcile on explicit
+//! resume or fork, so stale counts self-heal without a full-history scan.
 //! If the SQLite cache is recreated, all baselines are invalidated without
 //! reading transcripts; each session rebuilds lazily on its next resume/fork.
 //!
@@ -32,7 +34,7 @@
 //! Atomic message-row/count commits remain the engine's responsibility
 //! (coven-code PR #172); Pocket never reaches around `save_message`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
@@ -48,6 +50,7 @@ use crate::remote::FamiliarIdentity;
 use crate::PocketError;
 
 const INDEX_RECORD_VERSION: u32 = 1;
+const LEGACY_RECONCILIATION_MODEL_MARKER: &str = "\0coven-pocket-legacy-index-reconciliation-v1";
 const MAX_BASELINE_RECORD_BYTES: u64 = 4 * 1024;
 const MAX_SESSION_MODEL_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_INDEX_RECORD_ENVELOPE_BYTES: u64 = 4 * 1024;
@@ -3130,6 +3133,146 @@ impl LoadedSessionTranscript {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LegacyTranscriptRepair {
+    None,
+    AppendFinalNewline,
+    TruncateTail,
+}
+
+enum LegacyTranscriptInspection {
+    Absent,
+    Present {
+        repair: LegacyTranscriptRepair,
+        has_repaired_content: bool,
+        loaded: LoadedSessionTranscript,
+    },
+}
+
+fn validate_legacy_transcript_json(path: &Path, bytes: &[u8]) -> Result<(), PocketError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|err| persistence_err(path, format!("malformed transcript UTF-8: {err}")))?;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        serde_json::from_str::<TranscriptEntry>(trimmed).map_err(|err| {
+            persistence_err(
+                path,
+                format!("malformed transcript JSONL at line {}: {err}", index + 1),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_transcript_entries(
+    path: &Path,
+    session_id: &str,
+    entries: &[TranscriptEntry],
+) -> Result<(), PocketError> {
+    let mut message_uuids = HashSet::new();
+    for entry in entries {
+        let message = match entry {
+            TranscriptEntry::User(message) | TranscriptEntry::Assistant(message) => message,
+            _ => continue,
+        };
+        if message.session_id != session_id {
+            return Err(persistence_err(
+                path,
+                format!(
+                    "malformed transcript entry belongs to session {} instead of {session_id}",
+                    message.session_id
+                ),
+            ));
+        }
+        let message_uuid = message.uuid.as_deref().ok_or_else(|| {
+            persistence_err(path, "malformed transcript message is missing its UUID")
+        })?;
+        uuid::Uuid::parse_str(message_uuid).map_err(|_| {
+            persistence_err(
+                path,
+                format!("malformed transcript message UUID {message_uuid}"),
+            )
+        })?;
+        if !message_uuids.insert(message_uuid) {
+            return Err(persistence_err(
+                path,
+                format!("malformed transcript repeats message UUID {message_uuid}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn inspect_legacy_transcript_at_storage(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<LegacyTranscriptInspection, PocketError> {
+    let path = storage.transcript_file(session_id)?;
+    if !storage.validate_regular_file(&path, true)? {
+        return Ok(LegacyTranscriptInspection::Absent);
+    }
+    storage.validate_regular_file(&path, false)?;
+    let len = std::fs::symlink_metadata(&path)
+        .map_err(|err| engine_err("cannot inspect legacy transcript", err))?
+        .len();
+    if len > MAX_TRANSCRIPT_BYTES {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot inspect legacy transcript: transcript file too large ({len} bytes, max \
+                 {MAX_TRANSCRIPT_BYTES})"
+            ),
+        });
+    }
+    let capacity =
+        usize::try_from(len).map_err(|err| engine_err("cannot inspect legacy transcript", err))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    std::fs::File::open(&path)
+        .map_err(|err| engine_err("cannot inspect legacy transcript", err))?
+        .take(MAX_TRANSCRIPT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| engine_err("cannot inspect legacy transcript", err))?;
+    if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot inspect legacy transcript: transcript grew beyond the size limit while \
+                 reading (max {MAX_TRANSCRIPT_BYTES} bytes)"
+            ),
+        });
+    }
+
+    let (repair, repaired_bytes) = if bytes.last().is_none_or(|byte| *byte == b'\n') {
+        (LegacyTranscriptRepair::None, bytes.as_slice())
+    } else {
+        let tail_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let tail = &bytes[tail_start..];
+        if serde_json::from_slice::<serde_json::Value>(tail).is_ok() {
+            (LegacyTranscriptRepair::AppendFinalNewline, bytes.as_slice())
+        } else {
+            (LegacyTranscriptRepair::TruncateTail, &bytes[..tail_start])
+        }
+    };
+    validate_legacy_transcript_json(&path, repaired_bytes)?;
+    storage.validate_regular_file(&path, false)?;
+    let entries = load_transcript(&path)
+        .await
+        .map_err(|err| engine_err("cannot load legacy transcript", err))?;
+    validate_legacy_transcript_entries(&path, session_id, &entries)?;
+    let messages = messages_from_transcript(&entries);
+    Ok(LegacyTranscriptInspection::Present {
+        repair,
+        has_repaired_content: repaired_bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace()),
+        loaded: LoadedSessionTranscript { entries, messages },
+    })
+}
+
 async fn load_existing_session_transcript_at_storage(
     storage: &CheckedStorage,
     session_id: &str,
@@ -3265,9 +3408,19 @@ struct OversizedPendingIndexRecord {
     size: u64,
 }
 
+struct LegacyZeroCountCandidate {
+    session_id: String,
+    model: String,
+}
+
+struct LegacyZeroCountMigrationPlan {
+    candidates: Vec<LegacyZeroCountCandidate>,
+}
+
 struct StorageRecoveryPlan {
     lifecycle: PendingLifecycleRecoveryPlan,
     pending_index: PendingIndexRecoveryPlan,
+    legacy_zero_count: LegacyZeroCountMigrationPlan,
 }
 
 fn preflight_pending_index_recovery(
@@ -3361,6 +3514,10 @@ fn preflight_pending_index_recovery(
         read_session_model_record(storage, &record.session_id)?;
         read_index_baseline(storage, &record.session_id)?;
     }
+    for record in &records {
+        read_session_model_record(storage, &record.session_id)?;
+        read_index_baseline(storage, &record.session_id)?;
+    }
     Ok(PendingIndexRecoveryPlan {
         records,
         oversized_records,
@@ -3368,15 +3525,77 @@ fn preflight_pending_index_recovery(
     })
 }
 
-fn preflight_storage_recovery(
+fn preflight_legacy_zero_count_markers(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<bool, PocketError> {
+    let pending_fork =
+        storage.validate_regular_file(&storage.pending_fork_marker(session_id)?, true)?;
+    let pending_deletion =
+        storage.validate_regular_file(&storage.pending_deletion_marker(session_id)?, true)?;
+    let pending_index =
+        storage.validate_regular_file(&storage.pending_index_record(session_id)?, true)?;
+    storage.validate_regular_file(&storage.pending_index_temporary(session_id)?, true)?;
+    let baseline =
+        storage.validate_regular_file(&storage.index_baseline_record(session_id)?, true)?;
+    storage.validate_regular_file(&storage.index_baseline_temporary(session_id)?, true)?;
+    if baseline {
+        read_index_baseline(storage, session_id)?;
+    }
+    Ok(pending_fork || pending_deletion || pending_index || baseline)
+}
+
+async fn preflight_legacy_zero_count_migration(
+    storage: &CheckedStorage,
+    lifecycle: &SessionLifecycle,
+) -> Result<LegacyZeroCountMigrationPlan, PocketError> {
+    let store = checked_index_store(storage)?;
+    storage.validate_sqlite_files()?;
+    let rows = store
+        .list_sessions()
+        .map_err(|err| engine_err("cannot list legacy migration candidates", err))?;
+    validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
+    let mut candidates = Vec::new();
+    for row in rows.into_iter().filter(|row| row.message_count == 0) {
+        if lifecycle
+            .sessions
+            .contains_key(&session_key(storage.root(), &row.id))
+        {
+            continue;
+        }
+        if preflight_legacy_zero_count_markers(storage, &row.id)? {
+            continue;
+        }
+        let artifacts = preflight_session_artifacts(storage, &row.id)?;
+        if artifacts.pending_fork_marker_exists
+            || artifacts.pending_deletion_marker_exists
+            || artifacts.pending_index_record_exists
+            || artifacts.index_baseline_record_exists
+        {
+            continue;
+        }
+        read_session_model_record(storage, &row.id)?;
+        load_familiar_metadata_at_storage(storage, &row.id)?;
+        inspect_legacy_transcript_at_storage(storage, &row.id).await?;
+        candidates.push(LegacyZeroCountCandidate {
+            session_id: row.id,
+            model: row.model,
+        });
+    }
+    Ok(LegacyZeroCountMigrationPlan { candidates })
+}
+
+async fn preflight_storage_recovery(
     storage: &CheckedStorage,
     lifecycle: &SessionLifecycle,
 ) -> Result<StorageRecoveryPlan, PocketError> {
     let lifecycle_plan = preflight_pending_lifecycle_recovery(storage, lifecycle)?;
     let pending_index = preflight_pending_index_recovery(storage)?;
+    let legacy_zero_count = preflight_legacy_zero_count_migration(storage, lifecycle).await?;
     Ok(StorageRecoveryPlan {
         lifecycle: lifecycle_plan,
         pending_index,
+        legacy_zero_count,
     })
 }
 
@@ -3496,6 +3715,95 @@ fn recover_oversized_pending_index_transcript(
     remove_oversized_pending_index_record(storage, record)
 }
 
+fn legacy_pending_reconciliation_model(
+    storage: &CheckedStorage,
+    record: &PendingIndexRecord,
+) -> Result<Option<String>, PocketError> {
+    if record.model != LEGACY_RECONCILIATION_MODEL_MARKER {
+        return Ok(None);
+    }
+    let model = read_session_model_record(storage, &record.session_id)?.ok_or_else(|| {
+        PocketError::Engine {
+            message: format!(
+                "cannot recover legacy index reconciliation for session {} without durable model \
+                 metadata",
+                record.session_id
+            ),
+        }
+    })?;
+    Ok(Some(model.model))
+}
+
+async fn recover_legacy_pending_reconciliation(
+    storage: &CheckedStorage,
+    record: &PendingIndexRecord,
+    model: String,
+) -> Result<(), PocketError> {
+    match find_pending_index_record_in_transcript(storage, record).await? {
+        PendingTranscriptMatch::Present => {}
+        PendingTranscriptMatch::TranscriptAbsent
+        | PendingTranscriptMatch::TranscriptEmpty
+        | PendingTranscriptMatch::MessageAbsent => {
+            return Err(PocketError::Engine {
+                message: format!(
+                    "cannot recover legacy index reconciliation for session {}: durable message \
+                     {} is missing from the transcript",
+                    record.session_id, record.message_uuid
+                ),
+            });
+        }
+    }
+    let inspection = inspect_legacy_transcript_at_storage(storage, &record.session_id).await?;
+    let loaded = match inspection {
+        LegacyTranscriptInspection::Present {
+            repair: LegacyTranscriptRepair::None,
+            has_repaired_content: true,
+            loaded,
+        } => loaded,
+        LegacyTranscriptInspection::Present {
+            has_repaired_content: true,
+            ..
+        } => {
+            let path = storage.transcript_file(&record.session_id)?;
+            repair_incomplete_transcript_tail(storage, &path)?;
+            match inspect_legacy_transcript_at_storage(storage, &record.session_id).await? {
+                LegacyTranscriptInspection::Present {
+                    repair: LegacyTranscriptRepair::None,
+                    has_repaired_content: true,
+                    loaded,
+                } => loaded,
+                _ => {
+                    return Err(PocketError::Engine {
+                        message: format!(
+                            "cannot recover legacy index reconciliation for session {}: \
+                             transcript repair did not converge",
+                            record.session_id
+                        ),
+                    });
+                }
+            }
+        }
+        LegacyTranscriptInspection::Absent
+        | LegacyTranscriptInspection::Present {
+            has_repaired_content: false,
+            ..
+        } => {
+            return Err(PocketError::Engine {
+                message: format!(
+                    "cannot recover legacy index reconciliation for session {}: transcript is \
+                     empty",
+                    record.session_id
+                ),
+            });
+        }
+    };
+    let candidate = LegacyZeroCountCandidate {
+        session_id: record.session_id.clone(),
+        model,
+    };
+    reconcile_legacy_zero_count_candidate(storage, &candidate, &loaded)
+}
+
 async fn recover_pending_index_plan(
     storage: &CheckedStorage,
     lifecycle: &mut SessionLifecycle,
@@ -3553,6 +3861,10 @@ async fn recover_pending_index_plan(
             Some(SessionLifecycleState::Tombstoned | SessionLifecycleState::PendingFork)
         ) {
             remove_pending_index_record(storage, &record, false)?;
+            continue;
+        }
+        if let Some(model) = legacy_pending_reconciliation_model(storage, &record)? {
+            recover_legacy_pending_reconciliation(storage, &record, model).await?;
             continue;
         }
         match find_pending_index_record_in_transcript(storage, &record).await? {
@@ -3633,13 +3945,156 @@ fn recover_absent_pending_index_record(
     }
 }
 
+fn legacy_reconciliation_record(
+    candidate: &LegacyZeroCountCandidate,
+    loaded: &LoadedSessionTranscript,
+) -> Result<Option<PendingIndexRecord>, PocketError> {
+    let title = derive_title(&loaded.messages);
+    for entry in &loaded.entries {
+        if let Some(mut record) = PendingIndexRecord::from_entry(&candidate.session_id, entry)? {
+            record.model = LEGACY_RECONCILIATION_MODEL_MARKER.to_string();
+            record.title.clone_from(&title);
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
+fn reconcile_legacy_zero_count_candidate(
+    storage: &CheckedStorage,
+    candidate: &LegacyZeroCountCandidate,
+    loaded: &LoadedSessionTranscript,
+) -> Result<(), PocketError> {
+    write_session_model_record(storage, &candidate.session_id, &candidate.model)?;
+    let title = derive_title(&loaded.messages);
+    let Some(recovery_record) = legacy_reconciliation_record(candidate, loaded)? else {
+        let store = checked_index_store(storage)?;
+        save_index_session(
+            storage,
+            &store,
+            &candidate.session_id,
+            Some(&title),
+            &candidate.model,
+            "cannot reconcile legacy zero-count session index",
+        )?;
+        return write_index_baseline(storage, &candidate.session_id);
+    };
+
+    write_pending_index_record(storage, &recovery_record)?;
+    delete_index_session(
+        storage,
+        &candidate.session_id,
+        "cannot reset legacy zero-count session index",
+    )?;
+    let store = checked_index_store(storage)?;
+    save_index_session(
+        storage,
+        &store,
+        &candidate.session_id,
+        Some(&title),
+        &candidate.model,
+        "cannot reconcile legacy zero-count session index",
+    )?;
+    reconcile_loaded_transcript(storage, &store, &candidate.session_id, loaded)?;
+    write_index_baseline(storage, &candidate.session_id)?;
+    remove_pending_index_record(storage, &recovery_record, false)
+}
+
+async fn recover_legacy_zero_count_candidate(
+    storage: &CheckedStorage,
+    lifecycle: &mut SessionLifecycle,
+    candidate: &LegacyZeroCountCandidate,
+) -> Result<(), PocketError> {
+    let key = session_key(storage.root(), &candidate.session_id);
+    if lifecycle.sessions.contains_key(&key)
+        || preflight_legacy_zero_count_markers(storage, &candidate.session_id)?
+    {
+        return Ok(());
+    }
+
+    let inspection = inspect_legacy_transcript_at_storage(storage, &candidate.session_id).await?;
+    match inspection {
+        LegacyTranscriptInspection::Absent
+        | LegacyTranscriptInspection::Present {
+            has_repaired_content: false,
+            ..
+        } => {
+            begin_session_deletion_and_tombstone(storage, lifecycle, &candidate.session_id)?;
+            cleanup_session_artifacts(
+                storage,
+                &candidate.session_id,
+                SessionCleanupMarker::PendingDeletion,
+            )
+            .map_err(|err| PocketError::Engine {
+                message: format!(
+                    "cannot migrate unpublished legacy session {}: {err}",
+                    candidate.session_id
+                ),
+            })
+        }
+        LegacyTranscriptInspection::Present {
+            repair,
+            has_repaired_content: true,
+            loaded,
+        } => {
+            let loaded = if repair == LegacyTranscriptRepair::None {
+                loaded
+            } else {
+                let path = storage.transcript_file(&candidate.session_id)?;
+                repair_incomplete_transcript_tail(storage, &path)?;
+                match inspect_legacy_transcript_at_storage(storage, &candidate.session_id).await? {
+                    LegacyTranscriptInspection::Present {
+                        repair: LegacyTranscriptRepair::None,
+                        has_repaired_content: true,
+                        loaded,
+                    } => loaded,
+                    LegacyTranscriptInspection::Absent
+                    | LegacyTranscriptInspection::Present {
+                        has_repaired_content: false,
+                        ..
+                    } => {
+                        return Err(PocketError::Engine {
+                            message: format!(
+                                "legacy transcript {} became empty during reconciliation",
+                                candidate.session_id
+                            ),
+                        });
+                    }
+                    LegacyTranscriptInspection::Present { .. } => {
+                        return Err(PocketError::Engine {
+                            message: format!(
+                                "legacy transcript {} still requires repair after reconciliation \
+                                 preflight",
+                                candidate.session_id
+                            ),
+                        });
+                    }
+                }
+            };
+            reconcile_legacy_zero_count_candidate(storage, candidate, &loaded)
+        }
+    }
+}
+
+async fn recover_legacy_zero_count_migration_plan(
+    storage: &CheckedStorage,
+    lifecycle: &mut SessionLifecycle,
+    plan: LegacyZeroCountMigrationPlan,
+) -> Result<(), PocketError> {
+    for candidate in plan.candidates {
+        recover_legacy_zero_count_candidate(storage, lifecycle, &candidate).await?;
+    }
+    Ok(())
+}
+
 async fn recover_storage_unlocked(
     storage: &CheckedStorage,
     lifecycle: &mut SessionLifecycle,
 ) -> Result<(), PocketError> {
-    let plan = preflight_storage_recovery(storage, lifecycle)?;
+    let plan = preflight_storage_recovery(storage, lifecycle).await?;
     recover_pending_lifecycle_plan(storage, lifecycle, plan.lifecycle)?;
-    recover_pending_index_plan(storage, lifecycle, plan.pending_index).await
+    recover_pending_index_plan(storage, lifecycle, plan.pending_index).await?;
+    recover_legacy_zero_count_migration_plan(storage, lifecycle, plan.legacy_zero_count).await
 }
 
 #[cfg(test)]
@@ -4099,7 +4554,7 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
     validate_session_id(session_id)?;
     let storage = CheckedStorage::open(storage_dir)?;
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    let recovery = preflight_storage_recovery(&storage, &lifecycle)?;
+    let recovery = preflight_storage_recovery(&storage, &lifecycle).await?;
     recover_pending_lifecycle_plan(&storage, &mut lifecycle, recovery.lifecycle)?;
     let target_temporary = storage.pending_index_temporary(session_id)?;
     let remaining_pending_index = PendingIndexRecoveryPlan {
@@ -4123,6 +4578,16 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
             .collect(),
     };
     recover_pending_index_plan(&storage, &mut lifecycle, remaining_pending_index).await?;
+    let remaining_legacy_zero_count = LegacyZeroCountMigrationPlan {
+        candidates: recovery
+            .legacy_zero_count
+            .candidates
+            .into_iter()
+            .filter(|candidate| candidate.session_id != session_id)
+            .collect(),
+    };
+    recover_legacy_zero_count_migration_plan(&storage, &mut lifecycle, remaining_legacy_zero_count)
+        .await?;
     begin_session_deletion_and_tombstone(&storage, &mut lifecycle, session_id)?;
     cleanup_session_artifacts(&storage, session_id, SessionCleanupMarker::PendingDeletion)
 }
@@ -4901,6 +5366,10 @@ mod tests {
         index_baselines_dir(root).join(format!("{session_id}.json"))
     }
 
+    fn index_baseline_temporary(root: &Path, session_id: &str) -> PathBuf {
+        index_baselines_dir(root).join(format!(".{session_id}.json.tmp"))
+    }
+
     fn seed_index_baseline_record(root: &Path, session_id: &str) {
         let directory = index_baselines_dir(root);
         std::fs::create_dir_all(&directory).unwrap();
@@ -5043,6 +5512,17 @@ mod tests {
             .save_session(session_id, Some("Legacy"), "model")
             .unwrap();
         seed_transcript(root, session_id, messages).await
+    }
+
+    fn seed_pre_marker_session_row(root: &Path, session_id: &str, title: &str, model: &str) {
+        index_store(root)
+            .unwrap()
+            .save_session(session_id, Some(title), model)
+            .unwrap();
+        assert!(!pending_fork_marker(root, session_id).exists());
+        assert!(!pending_deletion_marker(root, session_id).exists());
+        assert!(!pending_index_marker(root, session_id).exists());
+        assert!(!index_baseline_marker(root, session_id).exists());
     }
 
     fn directory_syncs_for(root: &Path) -> Vec<PathBuf> {
@@ -6181,10 +6661,10 @@ mod tests {
             let text = format!("session {index}");
             let uuids =
                 seed_legacy_session(&storage, &session_id, &[Message::user(text.clone())]).await;
+            seed_index_baseline_record(&storage, &session_id);
             sessions.push((session_id, uuids[0].clone(), text));
         }
         let (target_id, target_uuid, target_text) = sessions.last().unwrap().clone();
-        seed_index_baseline_record(&storage, &target_id);
         seed_pending_index_record(&storage, &target_id, &target_uuid, "user", &target_text);
         clear_message_index_attempts(&storage);
 
@@ -6376,14 +6856,12 @@ mod tests {
         save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
         seed_oversized_pending_index_record(&storage, &session_id);
         for index in 0..100 {
+            let unrelated_id = uuid::Uuid::new_v4().to_string();
             index_store(&storage)
                 .unwrap()
-                .save_session(
-                    &uuid::Uuid::new_v4().to_string(),
-                    Some(&format!("unrelated {index}")),
-                    "model",
-                )
+                .save_session(&unrelated_id, Some(&format!("unrelated {index}")), "model")
                 .unwrap();
+            seed_index_baseline_record(&storage, &unrelated_id);
         }
         assert!(index_search_contains(&storage, "Speculative", &session_id));
 
@@ -6416,14 +6894,16 @@ mod tests {
         seed_index_baseline_record(&storage, &session_id);
         seed_legacy_widened_band_pending_index_record(&storage, &session_id);
         for index in 0..100 {
+            let unrelated_id = uuid::Uuid::new_v4().to_string();
             index_store(&storage)
                 .unwrap()
                 .save_session(
-                    &uuid::Uuid::new_v4().to_string(),
+                    &unrelated_id,
                     Some(&format!("newer unrelated {index}")),
                     "model",
                 )
                 .unwrap();
+            seed_index_baseline_record(&storage, &unrelated_id);
         }
         assert!(index_search_contains(
             &storage,
@@ -6579,6 +7059,425 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_zero_count_migration_removes_missing_transcript_ghost() {
+        let storage = test_storage("legacy-zero-missing-transcript");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Legacy ghost", "legacy-model");
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_removes_stale_baseline_temporary() {
+        let storage = test_storage("legacy-zero-stale-baseline-temporary");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Legacy ghost", "legacy-model");
+        let directory = index_baselines_dir(&storage);
+        std::fs::create_dir_all(&directory).unwrap();
+        let temporary = index_baseline_temporary(&storage, &session_id);
+        std::fs::write(&temporary, b"{\"version\":1").unwrap();
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+        assert!(!temporary.exists());
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_zero_count_migration_rejects_oversized_transcript_before_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let storage = test_storage("legacy-zero-oversized-transcript");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Oversized legacy", "legacy-model");
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        std::fs::File::create(&transcript)
+            .unwrap()
+            .set_len(MAX_TRANSCRIPT_BYTES + 1)
+            .unwrap();
+        std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("oversized legacy transcript must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("transcript file too large"));
+        assert!(index_contains(&storage, &session_id));
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert_eq!(
+            std::fs::metadata(&transcript).unwrap().len(),
+            MAX_TRANSCRIPT_BYTES + 1
+        );
+
+        std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_durably_deletes_empty_transcript() {
+        let storage = test_storage("legacy-zero-empty-transcript");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Legacy empty", "legacy-model");
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        std::fs::File::create(&transcript)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        std::fs::File::open(&transcripts)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_repairs_partial_first_line_then_deletes() {
+        let storage = test_storage("legacy-zero-partial-transcript");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Legacy partial", "legacy-model");
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let transcript = transcript_file(&storage, &session_id);
+        std::fs::write(&transcript, br#"{"type":"user","uuid":"partial"#).unwrap();
+        std::fs::File::open(&transcript)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        std::fs::File::open(&transcripts)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_reconciles_nonempty_transcript_once() {
+        let storage = test_storage("legacy-zero-nonempty-transcript");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Stale title", "legacy-model");
+        let uuids = seed_transcript(
+            &storage,
+            &session_id,
+            &[
+                Message::assistant("preface"),
+                Message::user("Recovered legacy title\nignored"),
+            ],
+        )
+        .await;
+        save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
+        clear_message_index_attempts(&storage);
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].title, "Recovered legacy title");
+        assert_eq!(listed[0].model, "legacy-model");
+        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(listed[0].familiar, Some(familiar()));
+        assert_eq!(message_index_attempt_uuids(&storage, &session_id), uuids);
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(session_model_marker(&storage, &session_id).is_file());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(transcript_file(&storage, &session_id).is_file());
+
+        clear_message_index_attempts(&storage);
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 2);
+        assert!(message_index_attempts_for(&storage).is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_reconciliation_fault_retries_from_pending_index() {
+        let storage = test_storage("legacy-zero-reconcile-restart");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Stale title", "legacy-model");
+        let uuids = seed_transcript(
+            &storage,
+            &session_id,
+            &[Message::user("Recovered after fault")],
+        )
+        .await;
+        fail_session_index(&storage, 1);
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("legacy reconciliation fault must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("cannot reconcile legacy zero-count session index"));
+        assert!(pending_index_marker(&storage, &session_id).is_file());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(!index_baseline_marker(&storage, &session_id).exists());
+        assert!(transcript_file(&storage, &session_id).is_file());
+
+        clear_module_state_for_root(&storage).await;
+        clear_message_index_attempts(&storage);
+        let listed = list_sessions(&storage_str).await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].title, "Recovered after fault");
+        assert_eq!(listed[0].model, "legacy-model");
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(message_index_attempt_uuids(&storage, &session_id), uuids);
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_fault_leaves_deletion_marker_for_restart() {
+        let storage = test_storage("legacy-zero-deletion-restart");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Legacy crash", "legacy-model");
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::File::create(transcript_file(&storage, &session_id)).unwrap();
+        configure_session_faults(&storage, false, 1);
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("legacy deletion fault must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("cannot delete session index"));
+        assert!(pending_deletion_marker(&storage, &session_id).is_file());
+        assert!(index_contains(&storage, &session_id));
+        assert!(matches!(
+            SESSION_LIFECYCLE_LOCK
+                .read()
+                .await
+                .sessions
+                .get(&session_key(&storage, &session_id)),
+            Some(SessionLifecycleState::Tombstoned)
+        ));
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert_deletion_targets_absent(&storage, &session_id);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_does_not_read_one_hundred_nonzero_transcripts() {
+        let storage = test_storage("legacy-zero-bounded-candidates");
+        let storage_str = storage.display().to_string();
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        for index in 0..100 {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let message_id = uuid::Uuid::new_v4().to_string();
+            let store = index_store(&storage).unwrap();
+            store
+                .save_session(
+                    &session_id,
+                    Some(&format!("Indexed session {index}")),
+                    "model",
+                )
+                .unwrap();
+            store
+                .save_message(
+                    &session_id,
+                    &message_id,
+                    "user",
+                    &format!("indexed message {index}"),
+                    None,
+                )
+                .unwrap();
+            std::fs::create_dir(transcript_file(&storage, &session_id)).unwrap();
+        }
+        let ghost_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &ghost_id, "Newest ghost", "legacy-model");
+        clear_message_index_attempts(&storage);
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+
+        assert_eq!(listed.len(), 100);
+        assert!(listed.iter().all(|session| session.session_id != ghost_id));
+        assert!(!index_contains(&storage, &ghost_id));
+        assert!(message_index_attempts_for(&storage).is_empty());
+        assert_eq!(
+            std::fs::read_dir(&transcripts).unwrap().count(),
+            100,
+            "normal nonzero transcript sentinels must remain untouched"
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_zero_count_migration_rejects_symlink_candidate_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("legacy-zero-symlink-candidate");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &session_id, "Unsafe legacy", "legacy-model");
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let (external, sentinel) = external_sentinel("legacy-zero-symlink-target");
+        let transcript = transcript_file(&storage, &session_id);
+        symlink(&sentinel, &transcript).unwrap();
+
+        let result = list_sessions(&storage_str).await;
+
+        assert_external_sentinel(&sentinel);
+        assert_unsafe_storage_path(result, &transcript, "symlink");
+        assert!(index_contains(&storage, &session_id));
+        assert!(transcript.is_symlink());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+
+        remove_symlink_if_present(&transcript);
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_rejects_malformed_candidate_before_mutation() {
+        let storage = test_storage("legacy-zero-malformed-candidate");
+        let storage_str = storage.display().to_string();
+        let malformed_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &malformed_id, "Malformed legacy", "legacy-model");
+        let transcripts = storage.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let malformed_transcript = transcript_file(&storage, &malformed_id);
+        std::fs::write(&malformed_transcript, b"not-json\n").unwrap();
+
+        let empty_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &empty_id, "Deletable legacy", "legacy-model");
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("malformed legacy transcript must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("malformed transcript"));
+        assert!(index_contains(&storage, &malformed_id));
+        assert!(index_contains(&storage, &empty_id));
+        assert_eq!(std::fs::read(&malformed_transcript).unwrap(), b"not-json\n");
+        assert!(!pending_deletion_marker(&storage, &malformed_id).exists());
+        assert!(!pending_deletion_marker(&storage, &empty_id).exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_rejects_malformed_familiar_before_mutation() {
+        let storage = test_storage("legacy-zero-malformed-familiar");
+        let storage_str = storage.display().to_string();
+        let malformed_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(
+            &storage,
+            &malformed_id,
+            "Malformed familiar",
+            "legacy-model",
+        );
+        std::fs::create_dir_all(storage.join("metadata")).unwrap();
+        let sidecar = familiar_file(&storage, &malformed_id);
+        std::fs::write(&sidecar, b"not-json").unwrap();
+
+        let empty_id = uuid::Uuid::new_v4().to_string();
+        seed_pre_marker_session_row(&storage, &empty_id, "Deletable legacy", "legacy-model");
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("malformed legacy familiar must fail recovery"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("cannot parse familiar metadata"));
+        assert!(index_contains(&storage, &malformed_id));
+        assert!(index_contains(&storage, &empty_id));
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"not-json");
+        assert!(!pending_deletion_marker(&storage, &malformed_id).exists());
+        assert!(!pending_deletion_marker(&storage, &empty_id).exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_migration_leaves_active_unindexed_session_untouched() {
+        let storage = test_storage("legacy-zero-active-unindexed");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence = SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "new-model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!index_contains(&storage, &session_id));
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(session_model_marker(&storage, &session_id).is_file());
+        assert!(familiar_file(&storage, &session_id).is_file());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+
+        persistence
+            .persist_new(&[Message::user("first new-protocol message")])
+            .await
+            .unwrap();
+        assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn absent_new_protocol_first_append_removes_only_pending_intent() {
         let storage = test_storage("persist-new-protocol-absent-first-append");
         let storage_str = storage.display().to_string();
@@ -6616,6 +7515,44 @@ mod tests {
         assert!(list_sessions(&storage_str).await.unwrap().is_empty());
         assert!(!pending_deletion_marker(&storage, &session_id).exists());
         assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert!(session_model_marker(&storage, &session_id).is_file());
+        assert!(familiar_file(&storage, &session_id).is_file());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn absent_new_protocol_intent_without_baseline_is_not_legacy_migration() {
+        let storage = test_storage("persist-new-protocol-absent-no-baseline");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence = SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+        let message = Message::user("never appended");
+        let record = PendingIndexRecord::from_message(
+            &session_id,
+            &uuid::Uuid::new_v4().to_string(),
+            &message,
+            "model",
+            "never appended",
+        );
+        write_pending_index_record(&persistence.storage, &record).unwrap();
+        remove_sqlite_cache(&storage);
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!pending_deletion_marker(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!index_baseline_marker(&storage, &session_id).exists());
         assert!(session_model_marker(&storage, &session_id).is_file());
         assert!(familiar_file(&storage, &session_id).is_file());
 
@@ -7287,7 +8224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_resume_reconciles_once_then_uses_durable_baseline() {
+    async fn legacy_recovery_reconciles_once_then_uses_durable_baseline() {
         let storage = test_storage("persist-legacy-resume-baseline");
         let storage_str = storage.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -7301,15 +8238,18 @@ mod tests {
 
         let listed = list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].message_count, 0);
-        assert!(message_index_attempts_for(&storage).is_empty());
+        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(message_index_attempt_uuids(&storage, &session_id), uuids);
+        assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+        clear_message_index_attempts(&storage);
 
         let (first, messages, _) =
             SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
                 .await
                 .unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(message_index_attempt_uuids(&storage, &session_id), uuids);
+        assert!(message_index_attempts_for(&storage).is_empty());
         assert!(index_baseline_marker(&storage, &session_id).is_file());
         assert_eq!(indexed_message_count(&storage, &session_id), 2);
         drop(first);
@@ -9036,6 +9976,8 @@ mod tests {
             .save_session(&pinned_id, Some("Pinned"), "model")
             .unwrap();
         store.save_session(&old_id, Some("Old"), "model").unwrap();
+        seed_index_baseline_record(&storage, &pinned_id);
+        seed_index_baseline_record(&storage, &old_id);
         let identity = familiar();
         save_familiar_metadata(&storage_str, &pinned_id, Some(&identity)).unwrap();
 
