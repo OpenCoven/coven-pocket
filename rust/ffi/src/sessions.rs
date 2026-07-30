@@ -76,6 +76,18 @@ fn index_store(root: &Path) -> Result<SqliteSessionStore, PocketError> {
         .map_err(|e| engine_err("cannot open session index", e))
 }
 
+fn indexed_session_model(root: &Path, session_id: &str) -> Result<String, PocketError> {
+    index_store(root)?
+        .list_sessions()
+        .map_err(|e| engine_err("cannot list sessions", e))
+        .map(|rows| {
+            rows.into_iter()
+                .find(|row| row.id == session_id)
+                .map(|row| row.model)
+                .unwrap_or_default()
+        })
+}
+
 fn transcript_file(root: &Path, session_id: &str) -> PathBuf {
     root.join("transcripts").join(format!("{session_id}.jsonl"))
 }
@@ -374,11 +386,7 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
     let root = storage_root(storage_dir)?;
 
     // Model comes from the source's index row; the transcript doesn't carry it.
-    let model = list_sessions(storage_dir)?
-        .into_iter()
-        .find(|s| s.session_id == session_id)
-        .map(|s| s.model)
-        .unwrap_or_default();
+    let model = indexed_session_model(&root, session_id)?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
     let path = transcript_file(&root, &new_id);
@@ -407,7 +415,9 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
     }
     if let Err(copy_err) = copy_familiar_metadata(storage_dir, session_id, &new_id) {
         return match delete_session(storage_dir, &new_id) {
-            Ok(()) => Err(copy_err),
+            Ok(()) => Err(PocketError::Engine {
+                message: format!("cannot copy familiar metadata: {copy_err}; fork rolled back"),
+            }),
             Err(rollback_err) => Err(PocketError::Engine {
                 message: format!(
                     "cannot copy familiar metadata: {copy_err}; fork rollback also failed: \
@@ -612,6 +622,7 @@ mod tests {
         let storage = test_storage("fork-rollback");
         let storage_str = storage.display().to_string();
         let source_id = uuid::Uuid::new_v4().to_string();
+        let source_transcript = format!("{source_id}.jsonl");
         let persistence =
             SessionPersistence::create(&storage_str, source_id.clone(), "model".to_string())
                 .unwrap();
@@ -624,9 +635,25 @@ mod tests {
 
         let err = fork_session(&storage_str, &source_id).await.unwrap_err();
         assert!(err.to_string().contains("cannot parse familiar metadata"));
-        let rows = index_store(&storage).unwrap().list_sessions().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, source_id);
+        assert!(err.to_string().contains("fork rolled back"));
+
+        std::fs::remove_file(familiar_file(&storage, &source_id)).unwrap();
+        let listed = list_sessions(&storage_str).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, source_id);
+
+        let mut transcripts = std::fs::read_dir(storage.join("transcripts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        transcripts.sort();
+        assert_eq!(transcripts, [std::ffi::OsString::from(source_transcript)]);
+
+        let metadata = std::fs::read_dir(storage.join("metadata"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(metadata.is_empty());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
