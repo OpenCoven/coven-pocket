@@ -61,6 +61,14 @@ struct SessionTestFaults {
 static SESSION_TEST_FAULTS: LazyLock<std::sync::Mutex<HashMap<PathBuf, SessionTestFaults>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+static DIRECTORY_SYNC_EVENTS: LazyLock<std::sync::Mutex<Vec<PathBuf>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+static DIRECTORY_SYNC_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// Summary row for the session browser.
 #[derive(uniffi::Record)]
 pub struct ChatSessionSummary {
@@ -231,56 +239,132 @@ fn ensure_persistence_active(
     }
 }
 
-fn remove_file_if_present(path: &Path, context: &str) -> Result<(), PocketError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(engine_err(context, err)),
-    }
-}
-
-fn remove_dir_if_present(path: &Path, context: &str) -> Result<(), PocketError> {
-    match std::fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(engine_err(context, err)),
-    }
-}
-
-fn remove_dir_all_if_present(path: &Path, context: &str) -> Result<(), PocketError> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(engine_err(context, err)),
-    }
-}
-
 fn sync_directory(path: &Path, context: &str) -> Result<(), PocketError> {
+    #[cfg(test)]
+    {
+        DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_path_buf());
+        let mut failures = DIRECTORY_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(remaining) = failures.get_mut(path) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(engine_err(
+                    context,
+                    std::io::Error::other("injected directory sync failure"),
+                ));
+            }
+        }
+    }
+
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|err| engine_err(context, err))
 }
 
+fn sync_directory_if_present(path: &Path, context: &str) -> Result<(), PocketError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => sync_directory(path, context),
+        Ok(_) => Err(PocketError::Engine {
+            message: format!("{} is not a directory", path.display()),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(engine_err(context, err)),
+    }
+}
+
 fn ensure_durable_directory(
     parent: &Path,
     directory: &Path,
-    context: &str,
+    create_context: &str,
+    sync_context: &str,
 ) -> Result<(), PocketError> {
     match std::fs::create_dir(directory) {
-        Ok(()) => sync_directory(parent, context),
+        Ok(()) => sync_directory(parent, sync_context),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = std::fs::metadata(directory)
-                .map_err(|metadata_err| engine_err(context, metadata_err))?;
+                .map_err(|metadata_err| engine_err(create_context, metadata_err))?;
             if metadata.is_dir() {
-                Ok(())
+                sync_directory(parent, sync_context)
             } else {
                 Err(PocketError::Engine {
                     message: format!("{} is not a directory", directory.display()),
                 })
             }
         }
-        Err(err) => Err(engine_err(context, err)),
+        Err(err) => Err(engine_err(create_context, err)),
     }
+}
+
+fn remove_file_durably_if_present(
+    path: &Path,
+    directory: &Path,
+    remove_context: &str,
+    sync_context: &str,
+) -> Result<(), PocketError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_directory(directory, sync_context),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            sync_directory_if_present(directory, sync_context)
+        }
+        Err(err) => Err(engine_err(remove_context, err)),
+    }
+}
+
+fn remove_dir_durably_if_present(
+    path: &Path,
+    parent: &Path,
+    remove_context: &str,
+    sync_context: &str,
+) -> Result<(), PocketError> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => sync_directory(parent, sync_context),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            sync_directory_if_present(parent, sync_context)
+        }
+        Err(err) => Err(engine_err(remove_context, err)),
+    }
+}
+
+fn remove_dir_all_durably_if_present(
+    path: &Path,
+    parent: &Path,
+    remove_context: &str,
+    sync_context: &str,
+) -> Result<(), PocketError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => sync_directory(parent, sync_context),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            sync_directory_if_present(parent, sync_context)
+        }
+        Err(err) => Err(engine_err(remove_context, err)),
+    }
+}
+
+fn remove_empty_fork_staging_root(root: &Path) -> Result<(), PocketError> {
+    let stage_root = root.join(".fork-staging");
+    match std::fs::remove_dir(&stage_root) {
+        Ok(()) => sync_directory(root, "cannot sync fork staging root removal"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            sync_directory(root, "cannot sync absent fork staging root")
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(err) => Err(engine_err("cannot remove fork staging root", err)),
+    }
+}
+
+fn remove_fork_staging_artifacts(root: &Path, session_id: &str) -> Result<(), PocketError> {
+    let stage_root = root.join(".fork-staging");
+    remove_dir_all_durably_if_present(
+        &fork_staging_dir(root, session_id),
+        &stage_root,
+        "cannot delete fork staging artifacts",
+        "cannot sync fork staging artifact removal",
+    )?;
+    remove_empty_fork_staging_root(root)
 }
 
 fn write_new_file(path: &Path, bytes: &[u8], context: &str) -> Result<(), PocketError> {
@@ -302,15 +386,39 @@ fn create_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), Pocke
         root,
         &lifecycle_directory,
         "cannot create pending fork lifecycle directory",
+        "cannot sync pending fork lifecycle directory creation",
     )?;
     ensure_durable_directory(
         &lifecycle_directory,
         &directory,
         "cannot create pending fork marker directory",
+        "cannot sync pending fork marker directory creation",
     )?;
     let marker = pending_fork_marker(root, session_id);
-    write_new_file(&marker, b"", "pending fork marker")?;
-    sync_directory(&directory, "cannot sync pending fork marker directory")
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|err| engine_err("cannot create pending fork marker", err))?;
+    let create_result = (|| -> Result<(), PocketError> {
+        file.sync_all()
+            .map_err(|err| engine_err("cannot sync pending fork marker", err))?;
+        sync_directory(&directory, "cannot sync pending fork marker directory")
+    })();
+    if let Err(create_err) = create_result {
+        return match remove_file_durably_if_present(
+            &marker,
+            &directory,
+            "cannot clean pending fork marker",
+            "cannot sync pending fork marker cleanup",
+        ) {
+            Ok(()) => Err(create_err),
+            Err(cleanup_err) => Err(PocketError::Engine {
+                message: format!("{create_err}; cleanup also failed: {cleanup_err}"),
+            }),
+        };
+    }
+    Ok(())
 }
 
 fn ensure_pending_fork_marker(root: &Path, session_id: &str) -> Result<(), PocketError> {
@@ -345,7 +453,12 @@ fn remove_pending_fork_marker(
     let marker = pending_fork_marker(root, session_id);
     match std::fs::remove_file(&marker) {
         Ok(()) => {}
-        Err(err) if missing_ok && err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if missing_ok && err.kind() == std::io::ErrorKind::NotFound => {
+            return sync_directory(
+                &pending_forks_dir(root),
+                "cannot sync absent pending fork marker",
+            );
+        }
         Err(err) => return Err(engine_err("cannot remove pending fork marker", err)),
     }
     sync_directory(
@@ -403,14 +516,23 @@ fn save_familiar_metadata_at_root(
 ) -> Result<(), PocketError> {
     let destination = familiar_file(root, session_id);
     let Some(familiar) = familiar else {
-        return remove_file_if_present(&destination, "cannot delete familiar metadata");
+        return remove_file_durably_if_present(
+            &destination,
+            &root.join("metadata"),
+            "cannot delete familiar metadata",
+            "cannot sync familiar metadata removal",
+        );
     };
 
     let bytes = serde_json::to_vec(familiar)
         .map_err(|err| engine_err("cannot serialize familiar metadata", err))?;
     let metadata_dir = root.join("metadata");
-    std::fs::create_dir_all(&metadata_dir)
-        .map_err(|err| engine_err("cannot create metadata dir", err))?;
+    ensure_durable_directory(
+        root,
+        &metadata_dir,
+        "cannot create metadata dir",
+        "cannot sync metadata directory creation",
+    )?;
     let temporary = metadata_dir.join(format!(
         ".{session_id}.familiar.{}.tmp",
         uuid::Uuid::new_v4()
@@ -427,12 +549,20 @@ fn save_familiar_metadata_at_root(
         file.sync_all()
             .map_err(|err| engine_err("cannot sync temporary familiar metadata", err))?;
         std::fs::rename(&temporary, &destination)
-            .map_err(|err| engine_err("cannot install familiar metadata", err))
+            .map_err(|err| engine_err("cannot install familiar metadata", err))?;
+        sync_directory(
+            &metadata_dir,
+            "cannot sync installed familiar metadata directory",
+        )
     })();
 
     if let Err(write_err) = write_result {
-        return match remove_file_if_present(&temporary, "cannot clean temporary familiar metadata")
-        {
+        return match remove_file_durably_if_present(
+            &temporary,
+            &metadata_dir,
+            "cannot clean temporary familiar metadata",
+            "cannot sync temporary familiar metadata cleanup",
+        ) {
             Ok(()) => Err(write_err),
             Err(cleanup_err) => Err(PocketError::Engine {
                 message: format!("{write_err}; rollback also failed: {cleanup_err}"),
@@ -785,19 +915,18 @@ fn cleanup_session_artifacts(root: &Path, session_id: &str) -> Result<(), Pocket
         .try_exists()
         .map_err(|err| engine_err("cannot inspect pending fork marker", err))?;
     let mut errors = Vec::new();
-    if let Err(err) = remove_file_if_present(
+    if let Err(err) = remove_file_durably_if_present(
         &transcript_file(root, session_id),
+        &root.join("transcripts"),
         "cannot delete transcript",
+        "cannot sync transcript removal",
     ) {
         errors.push(err.to_string());
     }
     if let Err(err) = save_familiar_metadata_at_root(root, session_id, None) {
         errors.push(err.to_string());
     }
-    if let Err(err) = remove_dir_all_if_present(
-        &fork_staging_dir(root, session_id),
-        "cannot delete fork staging artifacts",
-    ) {
+    if let Err(err) = remove_fork_staging_artifacts(root, session_id) {
         errors.push(err.to_string());
     }
     if errors.is_empty() && marker_exists {
@@ -901,32 +1030,14 @@ struct ForkStage {
     published_metadata: Option<PathBuf>,
     pending_marker: Option<PathBuf>,
     index_may_exist: bool,
+    staging_may_exist: bool,
     armed: bool,
 }
 
 impl ForkStage {
-    fn create(root: &Path, new_id: &str) -> Result<Self, PocketError> {
-        let stage_root = root.join(".fork-staging");
-        std::fs::create_dir_all(&stage_root)
-            .map_err(|err| engine_err("cannot create fork staging root", err))?;
-        let directory = stage_root.join(new_id);
-        if let Err(create_err) = std::fs::create_dir(&directory) {
-            let primary = engine_err("cannot create fork staging directory", create_err);
-            return match std::fs::remove_dir(&stage_root) {
-                Ok(()) => Err(primary),
-                Err(cleanup_err)
-                    if matches!(
-                        cleanup_err.kind(),
-                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    Err(primary)
-                }
-                Err(cleanup_err) => Err(PocketError::Engine {
-                    message: format!("{primary}; staging root cleanup also failed: {cleanup_err}"),
-                }),
-            };
-        }
+    fn begin(root: &Path, new_id: &str) -> Result<Self, PocketError> {
+        let directory = fork_staging_dir(root, new_id);
+        create_pending_fork_marker(root, new_id)?;
         Ok(Self {
             root: root.to_path_buf(),
             session_id: new_id.to_string(),
@@ -935,10 +1046,43 @@ impl ForkStage {
             directory,
             published_transcript: None,
             published_metadata: None,
-            pending_marker: None,
+            pending_marker: Some(pending_fork_marker(root, new_id)),
             index_may_exist: false,
+            staging_may_exist: false,
             armed: true,
         })
+    }
+
+    fn create_staging_directory(&mut self) -> Result<(), PocketError> {
+        let stage_root = self.directory.parent().ok_or_else(|| PocketError::Engine {
+            message: format!(
+                "fork staging directory has no parent: {}",
+                self.directory.display()
+            ),
+        })?;
+        ensure_durable_directory(
+            &self.root,
+            stage_root,
+            "cannot create fork staging root",
+            "cannot sync fork staging root creation",
+        )?;
+        self.staging_may_exist = true;
+        std::fs::create_dir(&self.directory)
+            .map_err(|err| engine_err("cannot create fork staging directory", err))?;
+        sync_directory(stage_root, "cannot sync fork staging directory creation")
+    }
+
+    #[cfg(test)]
+    fn create(root: &Path, new_id: &str) -> Result<Self, PocketError> {
+        let mut stage = Self::begin(root, new_id)?;
+        if let Err(err) = stage.create_staging_directory() {
+            return Err(fork_stage_error(
+                "cannot initialize fork staging",
+                err,
+                &mut stage,
+            ));
+        }
+        Ok(stage)
     }
 
     fn stage_metadata(&mut self, bytes: &[u8]) -> Result<(), PocketError> {
@@ -955,11 +1099,6 @@ impl ForkStage {
             .join(format!("{}.familiar.json", self.session_id));
         self.metadata = Some(metadata.clone());
         write(&metadata, bytes, "staged fork familiar metadata")
-    }
-
-    fn create_pending_marker(&mut self) -> Result<(), PocketError> {
-        self.pending_marker = Some(pending_fork_marker(&self.root, &self.session_id));
-        create_pending_fork_marker(&self.root, &self.session_id)
     }
 
     fn remove_pending_marker_for_commit(&mut self) -> Result<(), PocketError> {
@@ -993,44 +1132,37 @@ impl ForkStage {
                 }
             }
         }
-        for (path, context) in [
+        for (path, directory, remove_context, sync_context) in [
             (
                 self.published_metadata.take(),
+                self.root.join("metadata"),
                 "cannot clean published fork metadata",
+                "cannot sync published fork metadata cleanup",
             ),
             (
                 self.published_transcript.take(),
+                self.root.join("transcripts"),
                 "cannot clean published fork transcript",
-            ),
-            (
-                self.metadata.take(),
-                "cannot clean staged fork familiar metadata",
-            ),
-            (
-                Some(self.transcript.clone()),
-                "cannot clean staged fork transcript",
+                "cannot sync published fork transcript cleanup",
             ),
         ] {
             if let Some(path) = path {
-                if let Err(err) = remove_file_if_present(&path, context) {
+                if let Err(err) =
+                    remove_file_durably_if_present(&path, &directory, remove_context, sync_context)
+                {
                     errors.push(err.to_string());
                 }
             }
         }
-        if let Err(err) =
-            remove_dir_all_if_present(&self.directory, "cannot clean fork staging dir")
-        {
-            errors.push(err.to_string());
-        }
-        if let Some(stage_root) = self.directory.parent() {
-            match std::fs::remove_dir(stage_root) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(err) => {
-                    errors.push(engine_err("cannot clean fork staging root", err).to_string());
-                }
+        self.metadata = None;
+        if self.staging_may_exist {
+            if let Err(err) = remove_fork_staging_artifacts(&self.root, &self.session_id) {
+                errors.push(err.to_string());
+            } else {
+                self.staging_may_exist = false;
             }
+        } else if let Err(err) = remove_empty_fork_staging_root(&self.root) {
+            errors.push(err.to_string());
         }
         if errors.is_empty() && self.pending_marker.is_some() {
             match remove_pending_fork_marker(&self.root, &self.session_id, true) {
@@ -1059,16 +1191,19 @@ impl ForkStage {
     }
 
     fn remove_empty_staging_dirs(&self) -> Result<(), PocketError> {
-        remove_dir_if_present(&self.directory, "cannot remove empty fork staging dir")?;
-        if let Some(stage_root) = self.directory.parent() {
-            match std::fs::remove_dir(stage_root) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(err) => return Err(engine_err("cannot remove fork staging root", err)),
-            }
-        }
-        Ok(())
+        let stage_root = self.directory.parent().ok_or_else(|| PocketError::Engine {
+            message: format!(
+                "fork staging directory has no parent: {}",
+                self.directory.display()
+            ),
+        })?;
+        remove_dir_durably_if_present(
+            &self.directory,
+            stage_root,
+            "cannot remove empty fork staging dir",
+            "cannot sync empty fork staging directory removal",
+        )?;
+        remove_empty_fork_staging_root(&self.root)
     }
 }
 
@@ -1159,7 +1294,14 @@ async fn fork_session_unlocked(
     }
 
     let familiar_bytes = familiar_metadata_bytes_at_root(root, session_id)?;
-    let mut stage = ForkStage::create(root, &new_id)?;
+    let mut stage = ForkStage::begin(root, &new_id)?;
+    if let Err(err) = stage.create_staging_directory() {
+        return Err(fork_stage_error(
+            "cannot initialize fork staging",
+            err,
+            &mut stage,
+        ));
+    }
     if let Some(bytes) = familiar_bytes {
         if let Err(err) = stage.stage_metadata(&bytes) {
             return Err(fork_stage_error(
@@ -1205,15 +1347,19 @@ async fn fork_session_unlocked(
     }
 
     let transcript_destination = transcript_file(root, &new_id);
-    if let Some(parent) = transcript_destination.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| fork_stage_error("cannot create transcript dir", err, &mut stage))?;
-    }
+    let transcript_directory = root.join("transcripts");
+    ensure_durable_directory(
+        root,
+        &transcript_directory,
+        "cannot create transcript dir",
+        "cannot sync transcript directory creation",
+    )
+    .map_err(|err| fork_stage_error("cannot prepare transcript dir", err, &mut stage))?;
     std::fs::rename(&stage.transcript, &transcript_destination)
         .map_err(|err| fork_stage_error("cannot publish fork transcript", err, &mut stage))?;
     stage.published_transcript = Some(transcript_destination);
     sync_directory(
-        &root.join("transcripts"),
+        &transcript_directory,
         "cannot sync published fork transcript directory",
     )
     .map_err(|err| {
@@ -1226,16 +1372,20 @@ async fn fork_session_unlocked(
 
     if let Some(metadata) = stage.metadata.clone() {
         let metadata_destination = familiar_file(root, &new_id);
-        if let Some(parent) = metadata_destination.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| fork_stage_error("cannot create metadata dir", err, &mut stage))?;
-        }
+        let metadata_directory = root.join("metadata");
+        ensure_durable_directory(
+            root,
+            &metadata_directory,
+            "cannot create metadata dir",
+            "cannot sync metadata directory creation",
+        )
+        .map_err(|err| fork_stage_error("cannot prepare metadata dir", err, &mut stage))?;
         std::fs::rename(&metadata, &metadata_destination)
             .map_err(|err| fork_stage_error("cannot publish fork metadata", err, &mut stage))?;
         stage.metadata = None;
         stage.published_metadata = Some(metadata_destination);
         sync_directory(
-            &root.join("metadata"),
+            &metadata_directory,
             "cannot sync published fork metadata directory",
         )
         .map_err(|err| {
@@ -1250,13 +1400,6 @@ async fn fork_session_unlocked(
         .remove_empty_staging_dirs()
         .map_err(|err| fork_stage_error("cannot finalize fork staging", err, &mut stage))?;
 
-    if let Err(err) = stage.create_pending_marker() {
-        return Err(fork_stage_error(
-            "cannot create pending fork marker",
-            err,
-            &mut stage,
-        ));
-    }
     lifecycle
         .sessions
         .insert(key.clone(), SessionLifecycleState::PendingFork);
@@ -1369,6 +1512,24 @@ mod tests {
             );
     }
 
+    fn directory_syncs_for(root: &Path) -> Vec<PathBuf> {
+        let metadata = root.join("metadata");
+        DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.as_path() == root || path.as_path() == metadata)
+            .cloned()
+            .collect()
+    }
+
+    fn fail_directory_sync(path: &Path, count: usize) {
+        DIRECTORY_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf(), count);
+    }
+
     async fn clear_module_state_for_root(root: &Path) {
         SESSION_LIFECYCLE_LOCK
             .write()
@@ -1466,6 +1627,52 @@ mod tests {
         let err = load_familiar_metadata(&storage_str, &session_id).unwrap_err();
         assert!(err.to_string().contains("cannot parse familiar metadata"));
         assert!(load_familiar_metadata(&storage_str, "../invalid").is_err());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn familiar_save_and_removal_sync_required_directories_in_order() {
+        let storage = test_storage("metadata-directory-sync");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        SessionPersistence::create(
+            &storage_str,
+            session_id.clone(),
+            "model".to_string(),
+            Some(&familiar()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            directory_syncs_for(&storage),
+            [storage.clone(), storage.join("metadata")]
+        );
+
+        save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
+        assert_eq!(
+            directory_syncs_for(&storage),
+            [
+                storage.clone(),
+                storage.join("metadata"),
+                storage.clone(),
+                storage.join("metadata")
+            ]
+        );
+
+        save_familiar_metadata_at_root(&storage, &session_id, None).unwrap();
+        assert_eq!(
+            directory_syncs_for(&storage),
+            [
+                storage.clone(),
+                storage.join("metadata"),
+                storage.clone(),
+                storage.join("metadata"),
+                storage.join("metadata")
+            ]
+        );
 
         std::fs::remove_dir_all(storage).unwrap();
     }
@@ -1769,6 +1976,9 @@ mod tests {
             .join(".session-lifecycle")
             .join("pending-forks")
             .join(format!("{fork_id}.pending"));
+        let stale_stage = fork_staging_dir(&storage, &fork_id);
+        std::fs::create_dir_all(&stale_stage).unwrap();
+        std::fs::write(stale_stage.join("stale"), b"stale").unwrap();
 
         clear_module_state_for_root(&storage).await;
         configure_session_faults(&storage, false, 2);
@@ -1789,12 +1999,44 @@ mod tests {
             assert!(transcript_file(&storage, &fork_id).exists());
             assert!(familiar_file(&storage, &fork_id).exists());
             assert!(marker.exists());
+            assert!(stale_stage.exists());
         }
 
         clear_module_state_for_root(&storage).await;
         let listed = list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, source_id);
+        assert!(!storage.join(".fork-staging").exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_removes_unindexed_artifacts_seeded_during_fork_staging() {
+        let storage = test_storage("fork-marker-stage-recovery");
+        let storage_str = storage.display().to_string();
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let stage = fork_staging_dir(&storage, &fork_id);
+
+        create_pending_fork_marker(&storage, &fork_id).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join(format!("{fork_id}.jsonl")), b"staged transcript").unwrap();
+        std::fs::write(
+            stage.join(format!("{fork_id}.familiar.json")),
+            b"staged familiar",
+        )
+        .unwrap();
+        std::fs::create_dir_all(storage.join("transcripts")).unwrap();
+        std::fs::write(transcript_file(&storage, &fork_id), b"published transcript").unwrap();
+        std::fs::create_dir_all(storage.join("metadata")).unwrap();
+        std::fs::write(familiar_file(&storage, &fork_id), b"published familiar").unwrap();
+
+        clear_module_state_for_root(&storage).await;
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(!pending_fork_marker(&storage, &fork_id).exists());
+        assert!(!transcript_file(&storage, &fork_id).exists());
+        assert!(!familiar_file(&storage, &fork_id).exists());
+        assert!(!storage.join(".fork-staging").exists());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
@@ -1925,7 +2167,67 @@ mod tests {
         assert!(!staged_metadata.exists());
         assert!(!stage_directory.exists());
         assert!(!storage.join(".fork-staging").exists());
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
 
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn staging_directory_collision_cleans_marker_and_destination_artifacts() {
+        let storage = test_storage("fork-staging-collision");
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let stage_directory = fork_staging_dir(&storage, &fork_id);
+        std::fs::create_dir_all(&stage_directory).unwrap();
+        std::fs::write(stage_directory.join("stale"), b"stale").unwrap();
+
+        let err = match ForkStage::create(&storage, &fork_id) {
+            Ok(_) => panic!("staging directory collision must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("cannot create fork staging directory"));
+        assert!(!storage.join(".fork-staging").exists());
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn staging_cleanup_sync_failure_is_combined_and_left_recoverable() {
+        let storage = test_storage("fork-cleanup-sync-failure");
+        let fork_id = uuid::Uuid::new_v4().to_string();
+        let mut stage = ForkStage::create(&storage, &fork_id).unwrap();
+        let stage_root = storage.join(".fork-staging");
+        let write_err = stage
+            .stage_metadata_with(b"partial metadata", |path, _, context| {
+                std::fs::write(path, b"partial metadata")
+                    .map_err(|err| engine_err(&format!("cannot write {context}"), err))?;
+                Err(engine_err(
+                    &format!("cannot write {context}"),
+                    std::io::Error::other("injected staging write failure"),
+                ))
+            })
+            .unwrap_err();
+        fail_directory_sync(&stage_root, 1);
+
+        let err = fork_stage_error("cannot stage fork familiar metadata", write_err, &mut stage);
+
+        assert!(err.to_string().contains("injected staging write failure"));
+        assert!(err.to_string().contains("cleanup also failed"));
+        assert!(err.to_string().contains("injected directory sync failure"));
+        assert!(pending_fork_marker(&storage, &fork_id).exists());
+
+        let mut lifecycle = SessionLifecycle::default();
+        recover_pending_forks_unlocked(&storage, &mut lifecycle).unwrap();
+        assert!(!pending_fork_marker(&storage, &fork_id).exists());
+        assert!(!stage_root.exists());
+
+        DIRECTORY_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stage_root);
         std::fs::remove_dir_all(storage).unwrap();
     }
 
@@ -1967,6 +2269,9 @@ mod tests {
         });
 
         staged_rx.await.unwrap();
+        let pending_ids = pending_fork_ids(&storage).unwrap();
+        assert_eq!(pending_ids.len(), 1);
+        assert!(fork_staging_dir(&storage, &pending_ids[0]).exists());
         fork_task.abort();
         let join_err = fork_task.await.unwrap_err();
         assert!(join_err.is_cancelled());
@@ -1994,6 +2299,7 @@ mod tests {
             ))]
         );
         assert!(!storage.join(".fork-staging").exists());
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
