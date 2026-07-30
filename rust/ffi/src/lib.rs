@@ -250,6 +250,7 @@ impl PocketEngine {
         workspace_dir: String,
         permission_mode: ChatPermissionMode,
         storage_dir: Option<String>,
+        familiar: Option<FamiliarIdentity>,
         inject_context: bool,
     ) -> Result<Arc<ChatSession>, PocketError> {
         chat::start_session(
@@ -260,6 +261,7 @@ impl PocketEngine {
             workspace_dir,
             permission_mode,
             storage_dir,
+            familiar,
             inject_context,
         )
     }

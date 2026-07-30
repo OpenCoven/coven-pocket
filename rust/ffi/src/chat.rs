@@ -33,6 +33,7 @@ use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::remote::FamiliarIdentity;
 use crate::{PocketError, PocketProvider};
 
 /// The sandbox-safe tool allowlist, mirroring coven-code's hosted-repair
@@ -196,6 +197,7 @@ struct SessionConfig {
     model: String,
     effort: Option<String>,
     workspace_dir: PathBuf,
+    familiar: Option<crate::remote::FamiliarIdentity>,
     /// The workspace AGENTS.md chain + memdir notes, composed once at
     /// session creation (the per-workspace "Memory" toggle). `None` when the
     /// toggle is off or nothing is configured; turns reuse the snapshot so
@@ -399,14 +401,31 @@ impl ChatSession {
     }
 
     /// Build the client, query config, and tool context for one turn.
-    /// The Pocket platform note, plus the workspace's project context when
-    /// the memory toggle is on. The context is a session-creation snapshot;
-    /// an empty or missing AGENTS.md never blocks a chat turn.
+    /// The immutable Pocket platform note, followed by the pinned familiar
+    /// identity and the workspace's project context when configured.
     fn append_system_prompt(&self) -> String {
         let mut appended = "You are running inside Coven Pocket on iOS. Only repository file \
              tools are available (no shell, no network tools); every path must \
              stay inside the current workspace."
             .to_string();
+        if let Some(familiar) = &self.config.familiar {
+            appended.push_str("\n\n");
+            match familiar
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|role| !role.is_empty())
+            {
+                Some(role) => appended.push_str(&format!(
+                    "[Identity: You are {}, a {}. Respond as {}, not as the underlying tool.]",
+                    familiar.display_name, role, familiar.display_name
+                )),
+                None => appended.push_str(&format!(
+                    "[Identity: You are {}. Respond as {}, not as the underlying tool.]",
+                    familiar.display_name, familiar.display_name
+                )),
+            }
+        }
         if let Some(context) = &self.config.injected_context {
             appended.push_str("\n\n");
             appended.push_str(context);
@@ -545,21 +564,29 @@ pub(crate) fn start_session(
     workspace_dir: String,
     permission_mode: ChatPermissionMode,
     storage_dir: Option<String>,
+    familiar: Option<FamiliarIdentity>,
     inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = resolve_workspace(&workspace_dir)?;
     let session_id = uuid::Uuid::new_v4().to_string();
-    let persistence = storage_dir
-        .map(|dir| {
-            crate::sessions::SessionPersistence::create(&dir, session_id.clone(), model.clone())
-        })
-        .transpose()?;
+    let persistence = if let Some(storage_dir) = storage_dir.as_deref() {
+        let persistence = crate::sessions::SessionPersistence::create(
+            storage_dir,
+            session_id.clone(),
+            model.clone(),
+        )?;
+        crate::sessions::save_familiar_metadata(storage_dir, &session_id, familiar.as_ref())?;
+        Some(persistence)
+    } else {
+        None
+    };
     Ok(Arc::new(ChatSession {
         config: SessionConfig {
             provider,
             api_key,
             model,
             effort,
+            familiar,
             injected_context: snapshot_context(inject_context, &workspace),
             workspace_dir: workspace,
         },
@@ -590,6 +617,7 @@ pub(crate) async fn resume_session(
     let workspace = resolve_workspace(&workspace_dir)?;
     let (messages, last_uuid) =
         crate::sessions::load_session_messages(&storage_dir, &session_id).await?;
+    let familiar = crate::sessions::load_familiar_metadata(&storage_dir, &session_id)?;
     let persistence = crate::sessions::SessionPersistence::resumed(
         &storage_dir,
         session_id.clone(),
@@ -603,6 +631,7 @@ pub(crate) async fn resume_session(
             api_key,
             model,
             effort,
+            familiar,
             injected_context: snapshot_context(inject_context, &workspace),
             workspace_dir: workspace,
         },
@@ -1024,7 +1053,7 @@ mod tests {
         ];
 
         let sandbox = sandbox_tools(
-            Path::new("/tmp/pocket-test"),
+            &std::env::current_dir().unwrap(),
             Arc::new(PermissionState::new(ChatPermissionMode::Default)),
             None,
         );
@@ -1157,6 +1186,7 @@ mod tests {
             "relative/dir".to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             false,
         );
         assert!(err.is_err());
@@ -1216,8 +1246,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_without_pending_message_emits_exactly_one_terminal_callback() {
-        let workspace = std::env::temp_dir().join(format!("pocket-chat-{}", std::process::id()));
-        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = temp_dir("retry");
         let session = start_session(
             PocketProvider::Anthropic,
             "key".to_string(),
@@ -1225,6 +1254,7 @@ mod tests {
             None,
             workspace.display().to_string(),
             ChatPermissionMode::Default,
+            None,
             None,
             false,
         )
@@ -1246,6 +1276,90 @@ mod tests {
 
     // -- memory injection ---------------------------------------------------
 
+    fn test_familiar(role: Option<&str>) -> crate::remote::FamiliarIdentity {
+        crate::remote::FamiliarIdentity {
+            id: "familiar-1".to_string(),
+            display_name: "Morgana".to_string(),
+            emoji: Some("moon".to_string()),
+            role: role.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn familiar_preamble_uses_exact_role_and_no_role_forms() {
+        let workspace = std::env::current_dir().unwrap();
+        let with_role = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+            Some(test_familiar(Some("repository guide"))),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            with_role.append_system_prompt(),
+            "You are running inside Coven Pocket on iOS. Only repository file tools are \
+             available (no shell, no network tools); every path must stay inside the current \
+             workspace.\n\n[Identity: You are Morgana, a repository guide. Respond as Morgana, \
+             not as the underlying tool.]"
+        );
+
+        for role in [None, Some("   ")] {
+            let without_role = start_session(
+                PocketProvider::Anthropic,
+                "key".to_string(),
+                "model".to_string(),
+                None,
+                workspace.display().to_string(),
+                ChatPermissionMode::Default,
+                None,
+                Some(test_familiar(role)),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                without_role.append_system_prompt(),
+                "You are running inside Coven Pocket on iOS. Only repository file tools are \
+                 available (no shell, no network tools); every path must stay inside the current \
+                 workspace.\n\n[Identity: You are Morgana. Respond as Morgana, not as the \
+                 underlying tool.]"
+            );
+        }
+    }
+
+    #[test]
+    fn familiar_keeps_plan_mode_platform_note_and_memory_order() {
+        let guard = crate::memory::tests::setup("chat-familiar");
+        std::fs::write(guard.workspace.join("AGENTS.md"), "Pinned project memory.").unwrap();
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            guard.workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            None,
+            Some(test_familiar(Some("planner"))),
+            true,
+        )
+        .unwrap();
+
+        let prompt = session.append_system_prompt();
+        let platform = prompt
+            .find("You are running inside Coven Pocket on iOS.")
+            .unwrap();
+        let familiar = prompt
+            .find("[Identity: You are Morgana, a planner.")
+            .unwrap();
+        let memory = prompt.find("Pinned project memory.").unwrap();
+        assert!(platform < familiar && familiar < memory);
+        assert_eq!(session.permission_mode(), ChatPermissionMode::Plan);
+    }
+
     /// The workspace AGENTS.md must reach the model iff the toggle is on.
     #[test]
     fn inject_context_gates_agents_md_in_system_prompt() {
@@ -1265,6 +1379,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             true,
         )
         .unwrap();
@@ -1282,6 +1397,7 @@ mod tests {
             None,
             workspace.display().to_string(),
             ChatPermissionMode::Default,
+            None,
             None,
             false,
         )
@@ -1329,7 +1445,7 @@ mod tests {
         let perms = Arc::new(PermissionState::new(mode));
         let tool = SandboxedTool {
             inner: Box::new(StubWriteTool { ran: ran.clone() }),
-            root: std::env::temp_dir(),
+            root: std::env::current_dir().unwrap(),
             perms: perms.clone(),
             delegate,
         };
@@ -1337,7 +1453,7 @@ mod tests {
     }
 
     fn write_input() -> Value {
-        let path = std::env::temp_dir().join("gate-test.txt");
+        let path = std::env::current_dir().unwrap().join("gate-test.txt");
         serde_json::json!({ "file_path": path, "content": "hello" })
     }
 
@@ -1349,8 +1465,9 @@ mod tests {
             "key".to_string(),
             "model".to_string(),
             None,
-            std::env::temp_dir().display().to_string(),
+            std::env::current_dir().unwrap().display().to_string(),
             ChatPermissionMode::Default,
+            None,
             None,
             false,
         )
@@ -1448,7 +1565,7 @@ mod tests {
     async fn read_only_tools_bypass_the_gate() {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
         let perms = Arc::new(PermissionState::new(ChatPermissionMode::Default));
-        let workspace = std::env::temp_dir().canonicalize().unwrap();
+        let workspace = temp_dir("read-gate").canonicalize().unwrap();
         let tools = sandbox_tools(&workspace, perms, Some(delegate.clone()));
         let read = tools
             .iter()
@@ -1463,7 +1580,7 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(delegate.prompts.lock().is_empty());
-        let _ = std::fs::remove_file(&target);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
@@ -1494,7 +1611,11 @@ mod tests {
     // -- session persistence -------------------------------------------------
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pocket-{label}-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("chat-tests")
+            .join(format!("{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1510,6 +1631,7 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             Some(storage.display().to_string()),
+            None,
             false,
         )
         .unwrap();
@@ -1524,6 +1646,37 @@ mod tests {
             session.persist_new(&messages, &delegate).await;
         }
         session
+    }
+
+    #[test]
+    fn persisted_new_session_saves_familiar_before_returning() {
+        let storage = temp_dir("store-familiar");
+        let workspace = temp_dir("ws-familiar");
+        let identity = test_familiar(Some("repository guide"));
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            Some(storage.display().to_string()),
+            Some(identity.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::sessions::load_familiar_metadata(
+                &storage.display().to_string(),
+                &session.session_id()
+            )
+            .unwrap(),
+            Some(identity)
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]
@@ -1589,6 +1742,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_loads_the_stored_familiar_snapshot() {
+        let storage = temp_dir("store-resume-familiar");
+        let workspace = temp_dir("ws-resume-familiar");
+        let storage_str = storage.display().to_string();
+        let identity = test_familiar(Some("repository guide"));
+        let original = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            Some(storage_str.clone()),
+            Some(identity.clone()),
+            false,
+        )
+        .unwrap();
+        let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
+        {
+            let mut messages = original.messages.lock().await;
+            messages.push(Message::user("remember me"));
+            original.persist_new(&messages, &delegate).await;
+        }
+
+        let resumed = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            storage_str,
+            original.session_id(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resumed.config.familiar, Some(identity));
+        assert!(resumed
+            .append_system_prompt()
+            .contains("[Identity: You are Morgana, a repository guide."));
+        assert_eq!(resumed.permission_mode(), ChatPermissionMode::Plan);
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_fails_visibly_for_malformed_familiar_metadata() {
+        let storage = temp_dir("store-resume-malformed");
+        let workspace = temp_dir("ws-resume-malformed");
+        let storage_str = storage.display().to_string();
+        let original = persisted_session(&storage, &workspace).await;
+        let metadata = storage
+            .join("metadata")
+            .join(format!("{}.familiar.json", original.session_id()));
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        std::fs::write(metadata, b"not-json").unwrap();
+
+        let err = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            storage_str,
+            original.session_id(),
+            false,
+        )
+        .await
+        .err()
+        .expect("malformed familiar metadata must fail resume");
+        assert!(err.to_string().contains("cannot parse familiar metadata"));
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
     async fn resume_unknown_session_errors() {
         let storage = temp_dir("store");
         let err = resume_session(
@@ -1596,7 +1830,7 @@ mod tests {
             "key".to_string(),
             "claude-test".to_string(),
             None,
-            std::env::temp_dir().display().to_string(),
+            std::env::current_dir().unwrap().display().to_string(),
             ChatPermissionMode::Default,
             storage.display().to_string(),
             uuid::Uuid::new_v4().to_string(),
@@ -1693,6 +1927,7 @@ mod tests {
             None,
             workspace.display().to_string(),
             ChatPermissionMode::Default,
+            None,
             None,
             false,
         )
