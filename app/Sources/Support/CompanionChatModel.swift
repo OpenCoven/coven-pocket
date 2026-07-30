@@ -26,7 +26,18 @@ struct CompanionCleanupOwnership {
     var waiters: [CheckedContinuation<Bool, Never>] = []
 }
 
+enum CompanionTrafficAuthority {
+    case unavailable
+    case ready(DaemonPairing)
+}
+
+enum CompanionPairingVerificationMode {
+    case request
+    case trafficEpoch
+}
+
 @MainActor
+// swiftlint:disable:next type_body_length
 final class CompanionChatModel: ObservableObject {
     enum Availability: Equatable {
         case idle
@@ -72,6 +83,8 @@ final class CompanionChatModel: ObservableObject {
     var retriesPolling = false
     var operationGeneration: UInt64 = 0
     var availabilityGeneration: UInt64 = 0
+    var trafficEpoch: UInt64 = 0
+    var trafficAuthority: CompanionTrafficAuthority?
     private(set) var lastTerminalAvailability: Availability?
     var launchInFlight = false
     var pendingCleanup: RemoteSession?
@@ -162,10 +175,8 @@ final class CompanionChatModel: ObservableObject {
                   isOperationCurrent(),
                   !Task.isCancelled else { return nil }
             availability = Self.availability(from: gate)
-            publishedTerminal = true
             guard generation == availabilityGeneration,
-                  isOperationCurrent(),
-                  !Task.isCancelled else {
+                  isOperationCurrent() else {
                 if case .ready = gate { return nil }
                 restoreAvailability(
                     for: generation,
@@ -173,6 +184,19 @@ final class CompanionChatModel: ObservableObject {
                 )
                 return nil
             }
+            if Task.isCancelled {
+                if case .ready = gate, previousTerminal == nil {
+                    publishedTerminal = true
+                } else {
+                    restoreAvailability(
+                        for: generation,
+                        to: previousTerminal
+                    )
+                }
+                return nil
+            }
+            updateTrafficAuthority(for: availability)
+            publishedTerminal = true
             return (gate, generation)
         } onCancel: {
             Task { @MainActor [weak self] in
@@ -209,7 +233,9 @@ final class CompanionChatModel: ObservableObject {
         projectRoot: String,
         familiarID: String? = nil,
         familiar: FamiliarIdentity? = nil,
-        familiarProfile: FamiliarProfileKey? = nil
+        familiarProfile: FamiliarProfileKey? = nil,
+        verificationMode: CompanionPairingVerificationMode = .request,
+        expectedTrafficEpoch: UInt64? = nil
     ) async {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedRoot = projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -249,9 +275,14 @@ final class CompanionChatModel: ObservableObject {
             finishCancelledSend(generation: generation)
             return
         }
+        let verification = CompanionOperationVerification(
+            mode: verificationMode,
+            expectedTrafficEpoch: expectedTrafficEpoch
+        )
         guard let verified = await verifiedPairing(
             reportFailure: true,
-            generation: generation
+            generation: generation,
+            verificationMode: verificationMode
         ) else {
             await finishUnverifiedSend(
                 context: context,
@@ -259,10 +290,10 @@ final class CompanionChatModel: ObservableObject {
             )
             return
         }
-        guard canPerformSessionTraffic(
-            pairing: verified,
-            generation: generation
-        ) else {
+        let pairingIsCurrent = generation == operationGeneration
+            && !Task.isCancelled
+            && verification.isCurrent(verified, on: self)
+        guard pairingIsCurrent else {
             if generation == operationGeneration, !Task.isCancelled {
                 settleSupersededSend(
                     context: context,
@@ -283,6 +314,7 @@ final class CompanionChatModel: ObservableObject {
             try await performSend(
                 context: context,
                 pairing: verified,
+                verification: verification,
                 generation: generation
             )
         } catch {
@@ -290,6 +322,7 @@ final class CompanionChatModel: ObservableObject {
                 error,
                 context: context,
                 pairing: verified,
+                verification: verification,
                 generation: generation
             )
         }
@@ -400,6 +433,13 @@ extension CompanionChatModel {
            newestResult > lastCompletedResultSeq {
             lastCompletedResultSeq = newestResult
             isBusy = false
+            retryPrompt = nil
+            retryFamiliarID = nil
+            retryFamiliarPresentation = .empty
+            retriesPolling = false
+            if pendingCleanup == nil {
+                canRetry = false
+            }
         }
         if snapshot.sessionEnded {
             isBusy = false

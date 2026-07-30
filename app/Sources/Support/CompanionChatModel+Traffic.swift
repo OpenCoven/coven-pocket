@@ -1,8 +1,33 @@
+// swiftlint:disable file_length
+
 import Foundation
 
 struct VerifiedPairing: Equatable {
     let pairing: DaemonPairing
     let availabilityGeneration: UInt64
+    let trafficEpoch: UInt64
+}
+
+struct CompanionOperationVerification {
+    let mode: CompanionPairingVerificationMode
+    let expectedTrafficEpoch: UInt64?
+
+    @MainActor
+    func isCurrent(
+        _ verified: VerifiedPairing,
+        on model: CompanionChatModel
+    ) -> Bool {
+        switch mode {
+        case .request:
+            return model.isVerifiedPairingCurrent(verified)
+        case .trafficEpoch:
+            return model.isSessionTrafficCurrent(verified)
+                && (
+                    expectedTrafficEpoch == nil
+                        || expectedTrafficEpoch == verified.trafficEpoch
+                )
+        }
+    }
 }
 
 extension CompanionChatModel {
@@ -24,7 +49,8 @@ extension CompanionChatModel {
 
     func verifiedPairing(
         reportFailure: Bool,
-        generation: UInt64
+        generation: UInt64,
+        verificationMode: CompanionPairingVerificationMode = .request
     ) async -> VerifiedPairing? {
         guard generation == operationGeneration,
               !Task.isCancelled else { return nil }
@@ -37,9 +63,13 @@ extension CompanionChatModel {
         case let .ready(pairing):
             let verified = VerifiedPairing(
                 pairing: pairing,
-                availabilityGeneration: result.availabilityGeneration
+                availabilityGeneration: result.availabilityGeneration,
+                trafficEpoch: trafficEpoch
             )
-            guard isVerifiedPairingCurrent(verified) else { return nil }
+            let pairingIsCurrent = verificationMode == .request
+                ? isVerifiedPairingCurrent(verified)
+                : isSessionTrafficCurrent(verified)
+            guard pairingIsCurrent else { return nil }
             return verified
         case .notPaired:
             if reportFailure {
@@ -66,7 +96,7 @@ extension CompanionChatModel {
             return
         }
         if let sessionVerifiedPairing,
-           !isVerifiedPairingCurrent(sessionVerifiedPairing) {
+           !isSessionTrafficCurrent(sessionVerifiedPairing) {
             await discardSessionForSupersededPairingIfNeeded(
                 pairing: sessionVerifiedPairing,
                 generation: generation
@@ -76,13 +106,14 @@ extension CompanionChatModel {
         }
         isBusy = false
         setRetryContext(context)
+        resumeSessionPollingIfCurrent()
     }
 
     func finishUnverifiedPollingRetry(generation: UInt64) async {
         guard generation == operationGeneration,
               !Task.isCancelled else { return }
         if let sessionVerifiedPairing,
-           !isVerifiedPairingCurrent(sessionVerifiedPairing) {
+           !isSessionTrafficCurrent(sessionVerifiedPairing) {
             await discardSessionForSupersededPairingIfNeeded(
                 pairing: sessionVerifiedPairing,
                 generation: generation
@@ -160,7 +191,7 @@ extension CompanionChatModel {
             await finishUnverifiedPollingRetry(generation: generation)
             return
         }
-        guard canPerformSessionTraffic(
+        guard canPerformVerifiedOperation(
             pairing: verified,
             generation: generation
         ) else {
@@ -175,7 +206,7 @@ extension CompanionChatModel {
             generation: generation
         ) else { return }
         guard prepared else { return }
-        guard canPerformSessionTraffic(
+        guard canPerformVerifiedOperation(
             pairing: verified,
             generation: generation
         ) else {
@@ -355,9 +386,17 @@ extension CompanionChatModel {
         }
         isBusy = false
         setRetryContext(context)
+        resumeSessionPollingIfCurrent()
     }
 
-    func canPerformSessionTraffic(
+    func resumeSessionPollingIfCurrent() {
+        guard pollTask == nil,
+              let sessionVerifiedPairing,
+              isSessionTrafficCurrent(sessionVerifiedPairing) else { return }
+        startPolling(using: sessionVerifiedPairing)
+    }
+
+    func canPerformVerifiedOperation(
         pairing verified: VerifiedPairing,
         generation: UInt64
     ) -> Bool {
@@ -366,8 +405,18 @@ extension CompanionChatModel {
             && isVerifiedPairingCurrent(verified)
     }
 
+    func canPerformSessionTraffic(
+        pairing verified: VerifiedPairing,
+        generation: UInt64
+    ) -> Bool {
+        generation == operationGeneration
+            && !Task.isCancelled
+            && isSessionTrafficCurrent(verified)
+    }
+
     func isVerifiedPairingCurrent(_ verified: VerifiedPairing) -> Bool {
         guard verified.availabilityGeneration == availabilityGeneration,
+              verified.trafficEpoch == trafficEpoch,
               case let .ready(currentPairing) = availability else {
             return false
         }
@@ -375,5 +424,29 @@ extension CompanionChatModel {
             currentPairing,
             verified.pairing
         )
+    }
+
+    func isSessionTrafficCurrent(_ verified: VerifiedPairing) -> Bool {
+        guard verified.trafficEpoch == trafficEpoch,
+              let currentPairing = currentTrafficPairing else {
+            return false
+        }
+        return Self.isSameDaemonInstance(
+            currentPairing,
+            verified.pairing
+        )
+    }
+
+    var currentTrafficPairing: DaemonPairing? {
+        if case let .ready(pairing)? = trafficAuthority {
+            return pairing
+        }
+        if case let .ready(pairing) = availability {
+            return pairing
+        }
+        if case let .ready(pairing)? = lastTerminalAvailability {
+            return pairing
+        }
+        return nil
     }
 }

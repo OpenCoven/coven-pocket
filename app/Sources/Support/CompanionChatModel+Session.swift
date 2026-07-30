@@ -1,9 +1,13 @@
+// swiftlint:disable file_length
+
 import Foundation
 
 extension CompanionChatModel {
+    // swiftlint:disable:next function_body_length
     func performSend(
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) async throws {
         guard !(await finishInvalidatedSendIfNeeded(
@@ -11,7 +15,8 @@ extension CompanionChatModel {
             generation: generation,
             pairing: verified,
             launchedSession: nil,
-            activeSession: nil
+            activeSession: nil,
+            verification: verification
         )) else { return }
         guard await replaceSessionIfNeeded(
             context: context,
@@ -28,7 +33,8 @@ extension CompanionChatModel {
             generation: generation,
             pairing: verified,
             launchedSession: nil,
-            activeSession: session
+            activeSession: session,
+            verification: verification
         )) else { return }
 
         let reusedSession = try await sendInputIfSessionActive(
@@ -36,11 +42,15 @@ extension CompanionChatModel {
             pairing: verified,
             generation: generation
         )
+        if reusedSession, session == nil {
+            return
+        }
         var launchedSession: RemoteSession?
         if !reusedSession {
             guard let launched = try await prepareAndLaunch(
                 context: context,
                 pairing: verified,
+                verification: verification,
                 generation: generation
             ) else { return }
             launchedSession = launched
@@ -49,6 +59,7 @@ extension CompanionChatModel {
             context: context,
             pairing: verified,
             launchedSession: launchedSession,
+            verification: verification,
             generation: generation
         )
     }
@@ -57,14 +68,22 @@ extension CompanionChatModel {
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
         launchedSession: RemoteSession?,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) async {
+        let finalVerification = launchedSession == nil
+            ? CompanionOperationVerification(
+                mode: .trafficEpoch,
+                expectedTrafficEpoch: verified.trafficEpoch
+            )
+            : verification
         guard !(await finishInvalidatedSendIfNeeded(
             context: context,
             generation: generation,
             pairing: verified,
             launchedSession: launchedSession,
-            activeSession: nil
+            activeSession: nil,
+            verification: finalVerification
         )) else { return }
         if let launchedSession,
            session?.id != launchedSession.id
@@ -103,19 +122,39 @@ extension CompanionChatModel {
                 generation: generation,
                 pairing: verified,
                 launchedSession: nil,
-                activeSession: activeSession
+                activeSession: activeSession,
+                verification: CompanionOperationVerification(
+                    mode: .trafficEpoch,
+                    expectedTrafficEpoch: verified.trafficEpoch
+                )
             ) {
                 return true
             }
-            throw error
+            handleSessionTrafficFailure(
+                error,
+                context: context,
+                pairing: verified,
+                generation: generation
+            )
+            return true
         }
-        _ = await finishInvalidatedSendIfNeeded(
+        let invalidated = await finishInvalidatedSendIfNeeded(
             context: context,
             generation: generation,
             pairing: verified,
             launchedSession: nil,
-            activeSession: activeSession
+            activeSession: activeSession,
+            verification: CompanionOperationVerification(
+                mode: .trafficEpoch,
+                expectedTrafficEpoch: verified.trafficEpoch
+            )
         )
+        if !invalidated {
+            canRetry = false
+            retryPrompt = nil
+            retryFamiliarID = nil
+            retryFamiliarPresentation = .empty
+        }
         return true
     }
 
@@ -166,7 +205,7 @@ extension CompanionChatModel {
         verifiedPairing: VerifiedPairing,
         generation: UInt64
     ) async -> Bool {
-        guard canPerformSessionTraffic(
+        guard canPerformVerifiedOperation(
             pairing: verifiedPairing,
             generation: generation
         ) else { return false }
@@ -190,7 +229,7 @@ extension CompanionChatModel {
         verifiedPairing: VerifiedPairing,
         generation: UInt64
     ) async -> Bool {
-        guard canPerformSessionTraffic(
+        guard canPerformVerifiedOperation(
             pairing: verifiedPairing,
             generation: generation
         ) else { return false }
@@ -199,12 +238,11 @@ extension CompanionChatModel {
             of: activeSession,
             pairing: sessionPairing,
             completionText: nil,
-            verifiedPairing: verifiedPairing
+            verifiedPairing: verifiedPairing,
+            trafficEpoch: verifiedPairing.trafficEpoch
         )
-        guard canPerformSessionTraffic(
-            pairing: verifiedPairing,
-            generation: generation
-        ) else {
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
             if generation == operationGeneration, !Task.isCancelled {
                 setRetryContext(context)
                 isBusy = false
@@ -215,13 +253,27 @@ extension CompanionChatModel {
             setRetryContext(context)
             return false
         }
-        isBusy = true
-        return true
+        retryPrompt = nil
+        retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
+        isBusy = false
+        await send(
+            prompt: context.prompt,
+            projectRoot: context.projectRoot,
+            familiarID: context.familiarID,
+            familiar: context.familiarPresentation.familiar,
+            familiarProfile: context.familiarPresentation.profile,
+            verificationMode: .trafficEpoch,
+            expectedTrafficEpoch: verifiedPairing.trafficEpoch
+        )
+        return false
     }
 
+    // swiftlint:disable:next function_body_length
     func prepareAndLaunch(
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) async throws -> RemoteSession? {
         prepareForNewSession()
@@ -230,7 +282,8 @@ extension CompanionChatModel {
             generation: generation,
             pairing: verified,
             launchedSession: nil,
-            activeSession: nil
+            activeSession: nil,
+            verification: verification
         )) else { return nil }
         let launched: RemoteSession
         do {
@@ -242,6 +295,7 @@ extension CompanionChatModel {
             guard !handleSupersededLaunchFailure(
                 context: context,
                 pairing: verified,
+                verification: verification,
                 generation: generation
             ) else { return nil }
             throw error
@@ -250,6 +304,7 @@ extension CompanionChatModel {
             launched,
             pairing: verified,
             context: context,
+            verification: verification,
             generation: generation
         ) {
             return nil
@@ -258,6 +313,7 @@ extension CompanionChatModel {
             launched,
             context: context,
             pairing: verified,
+            verification: verification,
             generation: generation
         ) else { return nil }
         guard !(await finishInvalidatedSendIfNeeded(
@@ -265,7 +321,8 @@ extension CompanionChatModel {
             generation: generation,
             pairing: verified,
             launchedSession: launched,
-            activeSession: nil
+            activeSession: nil,
+            verification: verification
         )) else { return nil }
         adoptLaunchedSession(
             launched,
@@ -293,11 +350,12 @@ extension CompanionChatModel {
     func handleSupersededLaunchFailure(
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) -> Bool {
         guard generation == operationGeneration,
               !Task.isCancelled,
-              !isVerifiedPairingCurrent(verified) else { return false }
+              !verification.isCurrent(verified, on: self) else { return false }
         settleSupersededSend(
             context: context,
             generation: generation
@@ -310,6 +368,8 @@ extension CompanionChatModel {
         context: CompanionSendContext,
         pairing verified: VerifiedPairing
     ) {
+        trafficAuthority = .ready(verified.pairing)
+        trafficEpoch = verified.trafficEpoch
         session = launched
         pairing = verified.pairing
         sessionVerifiedPairing = verified
@@ -334,6 +394,7 @@ extension CompanionChatModel {
         _ launched: RemoteSession,
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) async throws -> Bool {
         guard launched.familiarId != context.familiarID else { return true }
@@ -347,7 +408,7 @@ extension CompanionChatModel {
             finishCancelledSend(generation: generation)
             return false
         }
-        guard isVerifiedPairingCurrent(verified) else {
+        guard verification.isCurrent(verified, on: self) else {
             settleSupersededSend(
                 context: context,
                 generation: generation
@@ -358,6 +419,38 @@ extension CompanionChatModel {
     }
 
     func handleSendFailure(
+        _ error: Error,
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
+        generation: UInt64
+    ) {
+        guard generation == operationGeneration else {
+            if pendingCleanup == nil {
+                isBusy = false
+            }
+            return
+        }
+        guard !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
+        guard verification.isCurrent(verified, on: self) else {
+            settleSupersededSend(
+                context: context,
+                generation: generation
+            )
+            return
+        }
+        isBusy = false
+        if Self.isSessionNotLive(error) {
+            abandonSession()
+        }
+        items.append(ChatItem(kind: .error, text: error.localizedDescription))
+        setRetryContext(context)
+    }
+
+    func handleSessionTrafficFailure(
         _ error: Error,
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
@@ -373,7 +466,7 @@ extension CompanionChatModel {
             finishCancelledSend(generation: generation)
             return
         }
-        guard isVerifiedPairingCurrent(verified) else {
+        guard isSessionTrafficCurrent(verified) else {
             settleSupersededSend(
                 context: context,
                 generation: generation
@@ -381,11 +474,23 @@ extension CompanionChatModel {
             return
         }
         isBusy = false
-        if Self.isSessionNotLive(error) {
+        let sessionEnded = Self.isSessionNotLive(error)
+        if sessionEnded {
+            pollTask?.cancel()
+            pollTask = nil
+            sessionVerifiedPairing = nil
             abandonSession()
+            pairing = nil
         }
         items.append(ChatItem(kind: .error, text: error.localizedDescription))
         setRetryContext(context)
+        if sessionEnded {
+            pollTask?.cancel()
+            pollTask = nil
+        } else {
+            pollTask = nil
+            startPolling(using: verified)
+        }
     }
 
 }

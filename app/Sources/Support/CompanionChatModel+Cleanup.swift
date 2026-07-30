@@ -12,6 +12,7 @@ private struct CompanionCleanupRequest {
 private struct CompanionCleanupAuthority {
     let verifiedPairing: VerifiedPairing
     let allowsSupersededPairing: Bool
+    let trafficEpoch: UInt64?
 }
 
 extension CompanionChatModel {
@@ -28,11 +29,12 @@ extension CompanionChatModel {
         _ launched: RemoteSession,
         pairing verified: VerifiedPairing,
         context: CompanionSendContext,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) async -> Bool {
         let operationInvalidated = generation != operationGeneration
         let cancelled = Task.isCancelled
-        let pairingInvalidated = !isVerifiedPairingCurrent(verified)
+        let pairingInvalidated = !verification.isCurrent(verified, on: self)
         guard operationInvalidated
                 || cancelled
                 || pairingInvalidated else { return false }
@@ -54,12 +56,14 @@ extension CompanionChatModel {
         return true
     }
 
+    // swiftlint:disable:next function_parameter_count
     func finishInvalidatedSendIfNeeded(
         context: CompanionSendContext,
         generation: UInt64,
         pairing verified: VerifiedPairing,
         launchedSession: RemoteSession?,
-        activeSession: RemoteSession?
+        activeSession: RemoteSession?,
+        verification: CompanionOperationVerification
     ) async -> Bool {
         let operationInvalidated = generation != operationGeneration
         let cancelled = Task.isCancelled
@@ -74,14 +78,16 @@ extension CompanionChatModel {
             finishCancelledSend(generation: generation)
             return true
         }
-        guard !isVerifiedPairingCurrent(verified) else { return false }
+        let pairingIsCurrent = verification.isCurrent(verified, on: self)
+        guard !pairingIsCurrent else { return false }
         if let launchedSession {
             await discardAdoptedLaunch(
                 launchedSession,
                 pairing: verified,
                 generation: generation
             )
-        } else if let activeSession {
+        } else if let activeSession,
+                  !isSessionTrafficCurrent(verified) {
             await discardSessionForSupersededPairingIfNeeded(
                 activeSession,
                 pairing: verified,
@@ -183,7 +189,7 @@ extension CompanionChatModel {
     ) async {
         guard generation == operationGeneration,
               !Task.isCancelled,
-              !isVerifiedPairingCurrent(verified),
+              !isSessionTrafficCurrent(verified),
               session?.id == activeSession.id else { return }
         abandonSession()
         pairing = nil
@@ -208,7 +214,8 @@ extension CompanionChatModel {
         pairing knownPairing: DaemonPairing?,
         completionText: String?,
         verifiedPairing: VerifiedPairing? = nil,
-        allowsSupersededPairing: Bool = false
+        allowsSupersededPairing: Bool = false,
+        trafficEpoch: UInt64? = nil
     ) async -> Bool {
         let generation = operationGeneration
         let retainedRetryContext = retryPrompt.map {
@@ -281,7 +288,8 @@ extension CompanionChatModel {
         let authority = verifiedPairing.map {
             CompanionCleanupAuthority(
                 verifiedPairing: $0,
-                allowsSupersededPairing: allowsSupersededPairing
+                allowsSupersededPairing: allowsSupersededPairing,
+                trafficEpoch: trafficEpoch
             )
         }
         result = await performOwnedCleanup(
@@ -348,8 +356,24 @@ extension CompanionChatModel {
             }
             return false
         }
-        guard authority.allowsSupersededPairing
-                || isVerifiedPairingCurrent(authority.verifiedPairing) else {
+        if authority.allowsSupersededPairing,
+           let currentPairing = currentTrafficPairing,
+           Self.isSameDaemonEndpoint(
+               currentPairing,
+               authority.verifiedPairing.pairing
+           ),
+           !Self.isSameDaemonInstance(
+               currentPairing,
+               authority.verifiedPairing.pairing
+           ) {
+            completeCleanup(
+                of: request.session,
+                message: request.completionText,
+                generation: request.generation
+            )
+            return false
+        }
+        guard cleanupAuthorityIsCurrent(authority) else {
             isBusy = false
             canRetry = true
             return false
@@ -377,8 +401,7 @@ extension CompanionChatModel {
         guard request.generation == operationGeneration else {
             return false
         }
-        guard authority.allowsSupersededPairing
-                || isVerifiedPairingCurrent(authority.verifiedPairing) else {
+        guard cleanupAuthorityIsCurrent(authority) else {
             isBusy = false
             canRetry = true
             return false
@@ -398,10 +421,7 @@ extension CompanionChatModel {
                 sessionID: request.session.id,
                 token: request.ownershipToken
             ), pendingCleanup?.id == request.session.id else { return nil }
-            guard suppliedAuthority.allowsSupersededPairing
-                    || isVerifiedPairingCurrent(
-                        suppliedAuthority.verifiedPairing
-                    ) else {
+            guard cleanupAuthorityIsCurrent(suppliedAuthority) else {
                 isBusy = false
                 canRetry = true
                 return nil
@@ -416,8 +436,20 @@ extension CompanionChatModel {
         ) else { return nil }
         return CompanionCleanupAuthority(
             verifiedPairing: verifiedPairing,
-            allowsSupersededPairing: false
+            allowsSupersededPairing: false,
+            trafficEpoch: nil
         )
+    }
+
+    private func cleanupAuthorityIsCurrent(
+        _ authority: CompanionCleanupAuthority
+    ) -> Bool {
+        if let expectedEpoch = authority.trafficEpoch {
+            return expectedEpoch == trafficEpoch
+                && isSessionTrafficCurrent(authority.verifiedPairing)
+        }
+        return authority.allowsSupersededPairing
+            || isVerifiedPairingCurrent(authority.verifiedPairing)
     }
 
     func cleanupPairing(
@@ -476,7 +508,8 @@ extension CompanionChatModel {
         case let .ready(pairing):
             return VerifiedPairing(
                 pairing: pairing,
-                availabilityGeneration: availabilityGeneration
+                availabilityGeneration: availabilityGeneration,
+                trafficEpoch: trafficEpoch
             )
         case .notPaired:
             isBusy = false

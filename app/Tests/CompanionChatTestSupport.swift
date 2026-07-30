@@ -152,9 +152,6 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         sessionID: String,
         data: String
     ) async throws {
-        if let sendInputError {
-            throw sendInputError
-        }
         sentInputs.append(data)
         sentInputPairings.append(pairing)
         if suspendsSendInput {
@@ -162,6 +159,9 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             await withCheckedContinuation { continuation in
                 sendInputContinuation = continuation
             }
+        }
+        if let sendInputError {
+            throw sendInputError
         }
     }
 
@@ -272,7 +272,8 @@ func verifiedPairingToken(
 ) -> VerifiedPairing {
     VerifiedPairing(
         pairing: pairing,
-        availabilityGeneration: model.availabilityGeneration
+        availabilityGeneration: model.availabilityGeneration,
+        trafficEpoch: model.trafficEpoch
     )
 }
 

@@ -61,8 +61,9 @@ final class CompanionChatPairingEpochTests: XCTestCase {
         await send.value
 
         XCTAssertEqual(model.availability, .ready(restarted))
-        XCTAssertEqual(client.killedSessionIDs, ["session-a"])
-        XCTAssertEqual(client.killPairings, [pairingA])
+        XCTAssertTrue(client.killedSessionIDs.isEmpty)
+        XCTAssertTrue(client.killPairings.isEmpty)
+        XCTAssertFalse(model.hasPendingCleanup)
         XCTAssertNil(model.session)
         XCTAssertFalse(model.hasActivePollTask)
         XCTAssertTrue(model.canRetry)
@@ -78,9 +79,13 @@ final class CompanionChatPairingEpochTests: XCTestCase {
             await model.send(prompt: "first", projectRoot: "/srv/repo")
         }
         await fulfillment(of: [client.launchRequested], timeout: 1)
+        let requestGeneration = model.availabilityGeneration
+        let trafficEpoch = model.trafficEpoch
 
         let refreshed = await model.refreshAvailability()
         XCTAssertTrue(refreshed)
+        XCTAssertEqual(model.availabilityGeneration, requestGeneration + 1)
+        XCTAssertEqual(model.trafficEpoch, trafficEpoch)
         client.resumeLaunch(id: "session-a")
         await send.value
 
@@ -165,11 +170,15 @@ final class CompanionChatPairingEpochTests: XCTestCase {
             await model.send(prompt: "first", projectRoot: "/srv/repo")
         }
         await fulfillment(of: [client.launchRequested], timeout: 1)
+        let requestGeneration = model.availabilityGeneration
+        let trafficEpoch = model.trafficEpoch
 
         client.suspendsGate = true
         let refresh = Task { await model.refreshAvailability() }
         await fulfillment(of: [client.gateRequested], timeout: 1)
         XCTAssertEqual(model.availability, .checking)
+        XCTAssertEqual(model.availabilityGeneration, requestGeneration + 1)
+        XCTAssertEqual(model.trafficEpoch, trafficEpoch)
 
         client.resumeLaunch(id: "session-a")
         await send.value
@@ -185,6 +194,7 @@ final class CompanionChatPairingEpochTests: XCTestCase {
         let refreshed = await refresh.value
         XCTAssertTrue(refreshed)
         XCTAssertEqual(model.availability, .ready(pairingB))
+        XCTAssertEqual(model.trafficEpoch, trafficEpoch + 1)
     }
 
     func testNewerCheckingBeforeGateResponsePreventsLaunchSideEffect() async {
@@ -276,7 +286,7 @@ final class CompanionChatPairingEpochTests: XCTestCase {
         await model.reset()
     }
 
-    func testNewerCheckingBeforeGateResponsePreventsInputAndCleansActiveSession() async {
+    func testNewerCheckingBeforeGateResponsePreventsInputAndKeepsActiveSession() async {
         let pairingA = pairedDaemon()
         let client = FakeCompanionSessionClient(gate: .ready(pairingA))
         let model = CompanionChatModel(client: client)
@@ -290,15 +300,16 @@ final class CompanionChatPairingEpochTests: XCTestCase {
 
         XCTAssertEqual(model.availability, .checking)
         XCTAssertTrue(client.sentInputs.isEmpty)
-        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
-        XCTAssertEqual(client.killPairings, [pairingA])
-        XCTAssertNil(model.session)
-        XCTAssertNil(model.pairing)
-        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertTrue(client.killedSessionIDs.isEmpty)
+        XCTAssertTrue(client.killPairings.isEmpty)
+        XCTAssertEqual(model.session?.id, "session-1")
+        XCTAssertEqual(model.pairing, pairingA)
+        XCTAssertTrue(model.hasActivePollTask)
         XCTAssertFalse(model.isBusy)
         XCTAssertTrue(model.canRetry)
         XCTAssertEqual(model.retryPrompt, "second")
         XCTAssertFalse(model.items.contains { $0.kind == .error })
+        await model.reset()
     }
 
     func testNewerReadySupersedesPollingRetryGateAndCleansPinnedSession() async {

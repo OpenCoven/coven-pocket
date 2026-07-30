@@ -61,8 +61,8 @@ final class CompanionChatLaunchRaceTests: XCTestCase {
         XCTAssertEqual(model.pairing, pairing)
         XCTAssertEqual(model.sessionVerifiedPairing?.pairing, pairing)
         XCTAssertEqual(
-            model.sessionVerifiedPairing?.availabilityGeneration,
-            model.availabilityGeneration
+            model.sessionVerifiedPairing?.trafficEpoch,
+            model.trafficEpoch
         )
         XCTAssertTrue(model.hasActivePollTask)
         XCTAssertTrue(model.isBusy)
