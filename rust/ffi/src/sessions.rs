@@ -6,6 +6,7 @@
 //! {storage_dir}/index.sqlite               — engine SqliteSessionStore (list/search index)
 //! {storage_dir}/transcripts/{uuid}.jsonl   — engine-format JSONL transcript (full fidelity)
 //! {storage_dir}/metadata/{uuid}.familiar.json — pinned familiar identity snapshot
+//! {storage_dir}/.session-lifecycle/session-models/{uuid}.json — durable model metadata
 //! {storage_dir}/.session-lifecycle/pending-forks/{uuid}.pending — incomplete fork quarantine
 //! {storage_dir}/.session-lifecycle/pending-deletions/{uuid}.pending — incomplete deletion
 //! {storage_dir}/.session-lifecycle/pending-index/{uuid}.json — one durable message-index intent
@@ -17,7 +18,8 @@
 //! forward-compatible parser. The SQLite index only serves the browser UI;
 //! the JSONL file is the source of truth for restores. Message appends publish
 //! a versioned pending-index record before touching JSONL, sync the append,
-//! replay `save_message` idempotently, and remove the record last. Routine
+//! publish the session row, replay `save_message` idempotently, and remove the
+//! record last. Routine
 //! recovery enumerates only those records; legacy transcripts reconcile once
 //! on explicit resume or fork and then receive an index-baseline marker, so
 //! stale legacy browser counts self-heal without making listing scan history.
@@ -48,6 +50,7 @@ use crate::PocketError;
 const INDEX_RECORD_VERSION: u32 = 1;
 const MAX_INDEX_RECORD_BYTES: u64 = MAX_TRANSCRIPT_BYTES;
 const MAX_BASELINE_RECORD_BYTES: u64 = 4 * 1024;
+const MAX_SESSION_MODEL_RECORD_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionKey {
@@ -79,6 +82,7 @@ static SESSION_LIFECYCLE_LOCK: LazyLock<tokio::sync::RwLock<SessionLifecycle>> =
 struct SessionTestFaults {
     fail_fork_publication_after_row_once: bool,
     fail_index_delete_remaining: usize,
+    fail_persist_before_first_intent_remaining: usize,
     fail_session_index_remaining: usize,
     fail_message_index_attempts: VecDeque<bool>,
     fail_transcript_append_remaining: usize,
@@ -483,6 +487,10 @@ impl CheckedStorage {
         self.child_path(&self.lifecycle_dir()?, "pending-index")
     }
 
+    fn session_models_dir(&self) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.lifecycle_dir()?, "session-models")
+    }
+
     fn index_baselines_dir(&self) -> Result<PathBuf, PocketError> {
         self.child_path(&self.lifecycle_dir()?, "index-baselines")
     }
@@ -535,6 +543,19 @@ impl CheckedStorage {
         )
     }
 
+    fn session_model_record(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(&self.session_models_dir()?, &format!("{session_id}.json"))
+    }
+
+    fn session_model_temporary(&self, session_id: &str) -> Result<PathBuf, PocketError> {
+        validate_session_id(session_id)?;
+        self.child_path(
+            &self.session_models_dir()?,
+            &format!(".{session_id}.json.tmp"),
+        )
+    }
+
     fn index_baseline_record(&self, session_id: &str) -> Result<PathBuf, PocketError> {
         validate_session_id(session_id)?;
         self.child_path(&self.index_baselines_dir()?, &format!("{session_id}.json"))
@@ -575,6 +596,7 @@ impl CheckedStorage {
                 self.pending_forks_dir()?,
                 self.pending_deletions_dir()?,
                 self.pending_index_dir()?,
+                self.session_models_dir()?,
                 self.index_baselines_dir()?,
             ] {
                 self.validate_directory(&pending, true)?;
@@ -621,6 +643,25 @@ fn save_index_session(
     store
         .save_session(session_id, title, model)
         .map_err(|err| engine_err(context, err))
+}
+
+#[cfg(test)]
+fn fail_persist_before_first_intent_if_requested(
+    storage: &CheckedStorage,
+) -> Result<(), PocketError> {
+    let mut faults = SESSION_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(faults) = faults.get_mut(storage.root()) {
+        if faults.fail_persist_before_first_intent_remaining > 0 {
+            faults.fail_persist_before_first_intent_remaining -= 1;
+            return Err(engine_err(
+                "cannot persist first message",
+                std::io::Error::other("injected abort before first pending index intent"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn save_index_message(
@@ -1004,23 +1045,6 @@ fn delete_index_session(
     })
 }
 
-fn rollback_unstarted_session_index(
-    storage: &CheckedStorage,
-    session_id: &str,
-    append_err: PocketError,
-) -> PocketError {
-    match delete_index_session(
-        storage,
-        session_id,
-        "cannot roll back session index after transcript append failure",
-    ) {
-        Ok(()) => append_err,
-        Err(rollback_err) => PocketError::Engine {
-            message: format!("{append_err}; index rollback also failed: {rollback_err}"),
-        },
-    }
-}
-
 #[cfg(test)]
 fn fail_fork_publication_after_row_if_requested(
     storage: &CheckedStorage,
@@ -1042,17 +1066,18 @@ fn fail_fork_publication_after_row_if_requested(
 
 fn indexed_session_model(
     storage: &CheckedStorage,
+    store: &SqliteSessionStore,
     session_id: &str,
-) -> Result<String, PocketError> {
-    let rows = checked_index_store(storage)?
+) -> Result<Option<String>, PocketError> {
+    storage.validate_sqlite_files()?;
+    let rows = store
         .list_sessions()
         .map_err(|err| engine_err("cannot list sessions", err))?;
     validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
     Ok(rows
         .into_iter()
         .find(|row| row.id == session_id)
-        .map(|row| row.model)
-        .unwrap_or_default())
+        .map(|row| row.model))
 }
 
 #[cfg(test)]
@@ -1462,6 +1487,14 @@ struct IndexBaselineRecord {
     session_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionModelRecord {
+    version: u32,
+    session_id: String,
+    model: String,
+}
+
 fn validate_pending_index_record(
     record: &PendingIndexRecord,
     path: &Path,
@@ -1524,6 +1557,35 @@ fn validate_index_baseline_record(
             path,
             format!(
                 "index baseline record session {} does not match file session \
+                 {expected_session_id}",
+                record.session_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_model_record(
+    record: &SessionModelRecord,
+    path: &Path,
+    expected_session_id: &str,
+) -> Result<(), PocketError> {
+    if record.version != INDEX_RECORD_VERSION {
+        return Err(persistence_err(
+            path,
+            format!(
+                "unsupported session model record version {}",
+                record.version
+            ),
+        ));
+    }
+    validate_session_id(&record.session_id)
+        .map_err(|err| persistence_err(path, format!("invalid model session UUID: {err}")))?;
+    if record.session_id != expected_session_id {
+        return Err(persistence_err(
+            path,
+            format!(
+                "session model record session {} does not match file session \
                  {expected_session_id}",
                 record.session_id
             ),
@@ -1800,12 +1862,98 @@ fn read_index_baseline(
     Ok(Some(record))
 }
 
+fn read_session_model_record(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<Option<SessionModelRecord>, PocketError> {
+    let path = storage.session_model_record(session_id)?;
+    if !storage.validate_regular_file(&path, true)? {
+        return Ok(None);
+    }
+    let record = read_json_record(
+        storage,
+        &path,
+        MAX_SESSION_MODEL_RECORD_BYTES,
+        "cannot parse session model record",
+    )?;
+    validate_session_model_record(&record, &path, session_id)?;
+    Ok(Some(record))
+}
+
+fn write_session_model_record(
+    storage: &CheckedStorage,
+    session_id: &str,
+    model: &str,
+) -> Result<(), PocketError> {
+    validate_session_id(session_id)?;
+    let directory = storage.session_models_dir()?;
+    ensure_lifecycle_record_directory(
+        storage,
+        &directory,
+        "cannot create session models directory",
+        "cannot sync session models directory creation",
+    )?;
+    let destination = storage.session_model_record(session_id)?;
+    let record = SessionModelRecord {
+        version: INDEX_RECORD_VERSION,
+        session_id: session_id.to_string(),
+        model: model.to_string(),
+    };
+    if let Some(existing) = read_session_model_record(storage, session_id)? {
+        if existing == record {
+            sync_record_file(
+                storage,
+                &destination,
+                "cannot sync existing session model record",
+            )?;
+            return sync_directory(
+                storage,
+                &directory,
+                "cannot sync existing session models directory",
+            );
+        }
+    }
+    validate_session_model_record(&record, &destination, session_id)?;
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|err| engine_err("cannot serialize session model record", err))?;
+    let temporary = storage.session_model_temporary(session_id)?;
+    write_json_record_atomically(
+        storage,
+        &directory,
+        &temporary,
+        &destination,
+        &bytes,
+        "session model record",
+        "cannot sync session model record installation",
+    )
+}
+
+fn remove_session_model_artifacts(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let directory = storage.session_models_dir()?;
+    let destination = storage.session_model_record(session_id)?;
+    remove_file_durably_if_present(
+        storage,
+        &destination,
+        &directory,
+        "cannot remove session model record",
+        "cannot sync session model record removal",
+    )?;
+    let temporary = storage.session_model_temporary(session_id)?;
+    remove_file_durably_if_present(
+        storage,
+        &temporary,
+        &directory,
+        "cannot remove temporary session model record",
+        "cannot sync temporary session model record removal",
+    )
+}
+
 fn write_index_baseline(storage: &CheckedStorage, session_id: &str) -> Result<(), PocketError> {
     validate_session_id(session_id)?;
-    let index = storage.index_file("")?;
-    if !storage.validate_regular_file(&index, true)? {
-        drop(checked_index_store(storage)?);
-    }
+    drop(checked_index_store(storage)?);
     let directory = storage.index_baselines_dir()?;
     ensure_lifecycle_record_directory(
         storage,
@@ -2456,10 +2604,28 @@ impl SessionPersistence {
             None => {}
         }
         save_familiar_metadata_at_storage(&storage, &session_id, familiar)?;
+        if let Err(model_err) = write_session_model_record(&storage, &session_id, &model) {
+            let mut errors = vec![model_err.to_string()];
+            if let Err(err) = remove_session_model_artifacts(&storage, &session_id) {
+                errors.push(format!("cannot clean session model metadata: {err}"));
+            }
+            if let Err(err) = save_familiar_metadata_at_storage(&storage, &session_id, None) {
+                errors.push(format!("cannot clean familiar metadata: {err}"));
+            }
+            return Err(PocketError::Engine {
+                message: format!(
+                    "cannot initialize session model metadata: {}",
+                    errors.join("; ")
+                ),
+            });
+        }
         if let Err(baseline_err) = write_index_baseline(&storage, &session_id) {
             let mut errors = vec![baseline_err.to_string()];
             if let Err(err) = remove_index_baseline_artifacts(&storage, &session_id) {
                 errors.push(format!("cannot clean index baseline: {err}"));
+            }
+            if let Err(err) = remove_session_model_artifacts(&storage, &session_id) {
+                errors.push(format!("cannot clean session model metadata: {err}"));
             }
             if let Err(err) = save_familiar_metadata_at_storage(&storage, &session_id, None) {
                 errors.push(format!("cannot clean familiar metadata: {err}"));
@@ -2515,8 +2681,9 @@ impl SessionPersistence {
             });
         }
         let loaded = load_session_transcript_at_storage(&storage, &session_id).await?;
-        let baseline = read_index_baseline(&storage, &session_id)?;
         let store = checked_index_store(&storage)?;
+        let baseline = read_index_baseline(&storage, &session_id)?;
+        write_session_model_record(&storage, &session_id, &model)?;
         save_index_session(
             &storage,
             &store,
@@ -2586,15 +2753,11 @@ impl SessionPersistence {
         }
 
         let title = derive_title(messages);
-        save_index_session(
-            &self.storage,
-            &store,
-            &self.key.session_id,
-            Some(&title),
-            &self.model,
-            "cannot index session",
-        )?;
-        let transcript_setup = (|| -> Result<PathBuf, PocketError> {
+        #[cfg(test)]
+        if state.persisted == 0 {
+            fail_persist_before_first_intent_if_requested(&self.storage)?;
+        }
+        let path = (|| -> Result<PathBuf, PocketError> {
             let transcript_directory = self.storage.transcripts_dir()?;
             ensure_durable_directory(
                 &self.storage,
@@ -2606,18 +2769,7 @@ impl SessionPersistence {
             let path = self.storage.transcript_file(&self.key.session_id)?;
             self.storage.validate_regular_file(&path, true)?;
             Ok(path)
-        })();
-        let path = match transcript_setup {
-            Ok(path) => path,
-            Err(err) if state.persisted == 0 => {
-                return Err(rollback_unstarted_session_index(
-                    &self.storage,
-                    &self.key.session_id,
-                    err,
-                ));
-            }
-            Err(err) => return Err(err),
-        };
+        })()?;
 
         while state.persisted < messages.len() {
             let message = &messages[state.persisted];
@@ -2645,17 +2797,7 @@ impl SessionPersistence {
                         return Err(write_err);
                     }
                     Ok(Some(_)) => return Err(write_err),
-                    Ok(None) => {
-                        return Err(if state.persisted == 0 {
-                            rollback_unstarted_session_index(
-                                &self.storage,
-                                &self.key.session_id,
-                                write_err,
-                            )
-                        } else {
-                            write_err
-                        });
-                    }
+                    Ok(None) => return Err(write_err),
                     Err(inspect_err) => {
                         return Err(PocketError::Engine {
                             message: format!(
@@ -2688,15 +2830,7 @@ impl SessionPersistence {
                     });
                 }
                 state.pending_index.pop_back();
-                return Err(if state.persisted == 0 {
-                    rollback_unstarted_session_index(
-                        &self.storage,
-                        &self.key.session_id,
-                        preflight_err,
-                    )
-                } else {
-                    preflight_err
-                });
+                return Err(preflight_err);
             }
             if let Err(err) = append_transcript_entry(&self.storage, &path, &entry) {
                 let append_err = err.error;
@@ -2721,15 +2855,7 @@ impl SessionPersistence {
                     });
                 }
                 state.pending_index.pop_back();
-                return Err(if state.persisted == 0 {
-                    rollback_unstarted_session_index(
-                        &self.storage,
-                        &self.key.session_id,
-                        append_err,
-                    )
-                } else {
-                    append_err
-                });
+                return Err(append_err);
             }
             let pending = state
                 .pending_index
@@ -2808,7 +2934,7 @@ async fn resolve_pending_index_transcript(
         }
         let record = work.record.clone();
         match find_pending_index_record_in_transcript(storage, &record).await? {
-            PendingTranscriptMatch::Absent => {
+            PendingTranscriptMatch::TranscriptAbsent | PendingTranscriptMatch::MessageAbsent => {
                 remove_pending_index_record(storage, &record, true)?;
                 state.pending_index.pop_front();
             }
@@ -2846,19 +2972,45 @@ fn drain_pending_index(
                 ),
             });
         }
-        save_index_message(
-            storage,
-            store,
-            session_id,
-            &record.message_uuid,
-            &record.role,
-            &record.text,
-            context,
-        )?;
+        if record.session_id != session_id {
+            return Err(PocketError::Engine {
+                message: format!(
+                    "pending index session {} does not match live session {session_id}",
+                    record.session_id
+                ),
+            });
+        }
+        publish_pending_index_record(storage, store, &record, "cannot index session", context)?;
         remove_pending_index_record(storage, &record, true)?;
         state.pending_index.pop_front();
     }
     Ok(())
+}
+
+fn publish_pending_index_record(
+    storage: &CheckedStorage,
+    store: &SqliteSessionStore,
+    record: &PendingIndexRecord,
+    session_context: &str,
+    message_context: &str,
+) -> Result<(), PocketError> {
+    save_index_session(
+        storage,
+        store,
+        &record.session_id,
+        Some(&record.title),
+        &record.model,
+        session_context,
+    )?;
+    save_index_message(
+        storage,
+        store,
+        &record.session_id,
+        &record.message_uuid,
+        &record.role,
+        &record.text,
+        message_context,
+    )
 }
 
 fn role_str(role: &Role) -> &'static str {
@@ -2925,7 +3077,8 @@ async fn load_session_transcript_at_storage(
 }
 
 enum PendingTranscriptMatch {
-    Absent,
+    TranscriptAbsent,
+    MessageAbsent,
     Present,
 }
 
@@ -2936,7 +3089,7 @@ async fn find_pending_index_record_in_transcript(
     let Some(loaded) =
         load_existing_session_transcript_at_storage(storage, &record.session_id).await?
     else {
-        return Ok(PendingTranscriptMatch::Absent);
+        return Ok(PendingTranscriptMatch::TranscriptAbsent);
     };
     let mut found = false;
     for entry in &loaded.entries {
@@ -2989,7 +3142,7 @@ async fn find_pending_index_record_in_transcript(
     Ok(if found {
         PendingTranscriptMatch::Present
     } else {
-        PendingTranscriptMatch::Absent
+        PendingTranscriptMatch::MessageAbsent
     })
 }
 
@@ -3027,8 +3180,6 @@ struct StorageRecoveryPlan {
 
 fn preflight_pending_index_recovery(
     storage: &CheckedStorage,
-    lifecycle: &SessionLifecycle,
-    lifecycle_plan: &PendingLifecycleRecoveryPlan,
 ) -> Result<PendingIndexRecoveryPlan, PocketError> {
     let directory = storage.pending_index_dir()?;
     if !storage.validate_directory(&directory, true)? {
@@ -3089,26 +3240,6 @@ fn preflight_pending_index_recovery(
 
     for record in &records {
         storage.validate_regular_file(&storage.transcript_file(&record.session_id)?, true)?;
-        let superseded = matches!(
-            lifecycle
-                .sessions
-                .get(&session_key(storage.root(), &record.session_id)),
-            Some(SessionLifecycleState::Tombstoned | SessionLifecycleState::PendingFork)
-        ) || lifecycle_plan
-            .pending_deletion_ids
-            .contains(&record.session_id)
-            || lifecycle_plan.pending_fork_ids.contains(&record.session_id);
-        if superseded {
-            continue;
-        }
-        if read_index_baseline(storage, &record.session_id)?.is_none() {
-            return Err(PocketError::Engine {
-                message: format!(
-                    "cannot recover pending message index for unknown session {}",
-                    record.session_id
-                ),
-            });
-        }
     }
     Ok(PendingIndexRecoveryPlan {
         records,
@@ -3121,7 +3252,7 @@ fn preflight_storage_recovery(
     lifecycle: &SessionLifecycle,
 ) -> Result<StorageRecoveryPlan, PocketError> {
     let lifecycle_plan = preflight_pending_lifecycle_recovery(storage, lifecycle)?;
-    let pending_index = preflight_pending_index_recovery(storage, lifecycle, &lifecycle_plan)?;
+    let pending_index = preflight_pending_index_recovery(storage)?;
     Ok(StorageRecoveryPlan {
         lifecycle: lifecycle_plan,
         pending_index,
@@ -3158,33 +3289,50 @@ async fn recover_pending_index_plan(
             continue;
         }
         match find_pending_index_record_in_transcript(storage, &record).await? {
-            PendingTranscriptMatch::Absent => {
+            PendingTranscriptMatch::TranscriptAbsent => {
+                remove_speculative_empty_index_session(storage, &record.session_id)?;
+                remove_pending_index_record(storage, &record, false)?;
+            }
+            PendingTranscriptMatch::MessageAbsent => {
                 remove_pending_index_record(storage, &record, false)?;
             }
             PendingTranscriptMatch::Present => {
                 {
                     let index_store = checked_index_store(storage)?;
-                    save_index_session(
+                    publish_pending_index_record(
                         storage,
                         &index_store,
-                        &record.session_id,
-                        Some(&record.title),
-                        &record.model,
+                        &record,
                         "cannot recover pending session index",
-                    )?;
-                    save_index_message(
-                        storage,
-                        &index_store,
-                        &record.session_id,
-                        &record.message_uuid,
-                        &record.role,
-                        &record.text,
                         "cannot recover pending message index",
                     )?;
                 }
                 remove_pending_index_record(storage, &record, false)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn remove_speculative_empty_index_session(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<(), PocketError> {
+    let store = checked_index_store(storage)?;
+    storage.validate_sqlite_files()?;
+    let rows = store
+        .list_sessions()
+        .map_err(|err| engine_err("cannot inspect speculative session index", err))?;
+    validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
+    if rows
+        .iter()
+        .any(|row| row.id == session_id && row.message_count == 0)
+    {
+        delete_index_session(
+            storage,
+            session_id,
+            "cannot remove speculative empty session index",
+        )?;
     }
     Ok(())
 }
@@ -3259,6 +3407,8 @@ struct SessionArtifactPreflight {
     pending_deletion_marker_exists: bool,
     pending_index_record_exists: bool,
     pending_index_temporary_exists: bool,
+    session_model_record_exists: bool,
+    session_model_temporary_exists: bool,
     index_baseline_record_exists: bool,
     index_baseline_temporary_exists: bool,
 }
@@ -3297,6 +3447,10 @@ fn preflight_session_artifacts(
         storage.validate_regular_file(&storage.pending_index_record(session_id)?, true)?;
     let pending_index_temporary_exists =
         storage.validate_regular_file(&storage.pending_index_temporary(session_id)?, true)?;
+    let session_model_record_exists =
+        storage.validate_regular_file(&storage.session_model_record(session_id)?, true)?;
+    let session_model_temporary_exists =
+        storage.validate_regular_file(&storage.session_model_temporary(session_id)?, true)?;
     let index_baseline_record_exists =
         storage.validate_regular_file(&storage.index_baseline_record(session_id)?, true)?;
     let index_baseline_temporary_exists =
@@ -3311,6 +3465,8 @@ fn preflight_session_artifacts(
         pending_deletion_marker_exists,
         pending_index_record_exists,
         pending_index_temporary_exists,
+        session_model_record_exists,
+        session_model_temporary_exists,
         index_baseline_record_exists,
         index_baseline_temporary_exists,
     })
@@ -3400,6 +3556,11 @@ fn verify_session_artifacts_absent(
             message: format!("pending message index recovery for session {session_id} remains"),
         });
     }
+    if preflight.session_model_record_exists || preflight.session_model_temporary_exists {
+        return Err(PocketError::Engine {
+            message: format!("session model metadata for session {session_id} remains"),
+        });
+    }
     if preflight.index_baseline_record_exists || preflight.index_baseline_temporary_exists {
         return Err(PocketError::Engine {
             message: format!("index baseline for session {session_id} remains"),
@@ -3441,6 +3602,9 @@ fn cleanup_session_artifacts(
         marker_errors.push(err.to_string());
     }
     if let Err(err) = remove_index_baseline_artifacts(storage, session_id) {
+        marker_errors.push(err.to_string());
+    }
+    if let Err(err) = remove_session_model_artifacts(storage, session_id) {
         marker_errors.push(err.to_string());
     }
     if !marker_errors.is_empty() {
@@ -3805,6 +3969,9 @@ impl ForkStage {
         if let Err(err) = remove_index_baseline_artifacts(&self.storage, &self.session_id) {
             errors.push(err.to_string());
         }
+        if let Err(err) = remove_session_model_artifacts(&self.storage, &self.session_id) {
+            errors.push(err.to_string());
+        }
         if self.index_may_exist {
             if self.pending_marker.is_some() {
                 if let Err(err) =
@@ -3967,11 +4134,21 @@ async fn fork_session_unlocked(
         });
     }
 
-    // Model comes from the source's index row; the transcript doesn't carry it.
+    let source_store = checked_index_store(storage)?;
     let source_needs_baseline = read_index_baseline(storage, session_id)?.is_none();
-    let model = indexed_session_model(storage, session_id)?;
+    let stored_model = read_session_model_record(storage, session_id)?;
+    let model = match stored_model {
+        Some(record) => record.model,
+        None => indexed_session_model(storage, &source_store, session_id)?.ok_or_else(|| {
+            PocketError::Engine {
+                message: format!(
+                    "cannot recover model for fork source {session_id}; resume it before forking"
+                ),
+            }
+        })?,
+    };
+    write_session_model_record(storage, session_id, &model)?;
     if source_needs_baseline {
-        let source_store = checked_index_store(storage)?;
         save_index_session(
             storage,
             &source_store,
@@ -4178,6 +4355,15 @@ async fn fork_session_unlocked(
             &key,
         ));
     }
+    if let Err(err) = write_session_model_record(storage, &new_id, &model) {
+        return Err(fork_publication_error(
+            "cannot publish fork model metadata",
+            err,
+            &mut stage,
+            lifecycle,
+            &key,
+        ));
+    }
     let store = match checked_index_store(storage) {
         Ok(store) => store,
         Err(err) => {
@@ -4315,6 +4501,15 @@ mod tests {
             .fail_session_index_remaining = count;
     }
 
+    fn fail_persist_before_first_intent(root: &Path, count: usize) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_persist_before_first_intent_remaining = count;
+    }
+
     fn fail_message_index_attempts(root: &Path, failures: impl IntoIterator<Item = bool>) {
         SESSION_TEST_FAULTS
             .lock()
@@ -4375,6 +4570,12 @@ mod tests {
 
     fn pending_index_marker(root: &Path, session_id: &str) -> PathBuf {
         pending_index_dir(root).join(format!("{session_id}.json"))
+    }
+
+    fn session_model_marker(root: &Path, session_id: &str) -> PathBuf {
+        root.join(".session-lifecycle")
+            .join("session-models")
+            .join(format!("{session_id}.json"))
     }
 
     fn index_baselines_dir(root: &Path) -> PathBuf {
@@ -4649,6 +4850,27 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn indexed_session_fields(root: &Path, session_id: &str) -> Option<(String, String, u32)> {
+        index_store(root)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == session_id)
+            .map(|row| (row.title.unwrap_or_default(), row.model, row.message_count))
+    }
+
+    fn remove_sqlite_cache(root: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = root.join(format!("index.sqlite{suffix}"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => panic!("cannot remove SQLite cache {}: {err}", path.display()),
+            }
+        }
+    }
+
     fn assert_deletion_fixture_present(storage: &Path, session_id: &str, staged_file: &Path) {
         assert!(index_contains(storage, session_id));
         assert!(transcript_file(storage, session_id).exists());
@@ -4851,8 +5073,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_index_failure_before_append_does_not_advance_state() {
-        let storage = test_storage("persist-session-index-failure");
+    async fn session_index_failure_after_append_recovers_without_reappend() {
+        let storage = test_storage("persist-session-index-recovery");
         let storage_str = storage.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
         let persistence =
@@ -4864,15 +5086,35 @@ mod tests {
 
         let err = persistence.persist_new(&messages).await.unwrap_err();
         assert!(err.to_string().contains("cannot index session"));
-        assert!(!transcript_file(&storage, &session_id).exists());
+        let entries = load_transcript(&transcript_file(&storage, &session_id))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let (durable_uuid, parent) = chain_uuid_and_parent(&entries[0]);
+        assert!(parent.is_none());
+        assert!(pending_index_marker(&storage, &session_id).is_file());
+        assert!(!index_contains(&storage, &session_id));
         {
             let state = persistence.state.lock().await;
-            assert_eq!(state.persisted, 0);
-            assert!(state.last_uuid.is_none());
-            assert!(state.pending_index.is_empty());
+            assert_eq!(state.persisted, 1);
+            assert_eq!(state.last_uuid.as_deref(), Some(durable_uuid.as_str()));
+            assert_eq!(state.pending_index.len(), 1);
         }
 
-        persistence.persist_new(&messages).await.unwrap();
+        drop(persistence);
+        clear_module_state_for_root(&storage).await;
+        remove_sqlite_cache(&storage);
+        clear_message_index_attempts(&storage);
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session_id);
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &session_id),
+            [durable_uuid]
+        );
+        assert!(!pending_index_marker(&storage, &session_id).exists());
         assert_eq!(
             load_transcript(&transcript_file(&storage, &session_id))
                 .await
@@ -4882,7 +5124,38 @@ mod tests {
         );
         assert_eq!(indexed_message_count(&storage, &session_id), 1);
 
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn crash_before_first_intent_never_publishes_session_row() {
+        let storage = test_storage("persist-crash-before-first-intent");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        fail_persist_before_first_intent(&storage, 1);
+
+        let err = persistence
+            .persist_new(&[Message::user("not durable")])
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected abort before first pending index intent"));
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!transcript_file(&storage, &session_id).exists());
+
         drop(persistence);
+        clear_module_state_for_root(&storage).await;
+
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(!index_contains(&storage, &session_id));
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!transcript_file(&storage, &session_id).exists());
+
         std::fs::remove_dir_all(storage).unwrap();
     }
 
@@ -4918,6 +5191,47 @@ mod tests {
             1
         );
         assert_eq!(indexed_message_count(&storage, &session_id), 1);
+
+        drop(persistence);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_append_failure_preserves_existing_session_row() {
+        let storage = test_storage("persist-later-append-failure");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        persistence
+            .persist_new(&[Message::user("durable first")])
+            .await
+            .unwrap();
+        fail_transcript_append(&storage, 1);
+
+        let err = persistence
+            .persist_new(&[
+                Message::user("durable first"),
+                Message::assistant("append later"),
+            ])
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cannot write transcript"));
+        assert_eq!(
+            indexed_session_fields(&storage, &session_id),
+            Some(("durable first".to_string(), "model".to_string(), 1))
+        );
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!pending_index_marker(&storage, &session_id).exists());
 
         drop(persistence);
         std::fs::remove_dir_all(storage).unwrap();
@@ -5403,10 +5717,10 @@ mod tests {
         clear_message_index_attempts(&storage);
 
         let listed = list_sessions(&storage_str).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].message_count, 0);
+        assert!(listed.is_empty());
         assert!(!pending_index_marker(&storage, &session_id).exists());
         assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
         assert_eq!(indexed_message_count(&storage, &session_id), 0);
         assert!(message_index_attempts_for(&storage).is_empty());
 
@@ -5942,7 +6256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recreated_index_invalidates_baselines_until_explicit_resume() {
+    async fn direct_resume_rebuilds_recreated_index_once_and_preserves_chain() {
         let storage = test_storage("persist-recreated-index-baseline");
         let storage_str = storage.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -5962,23 +6276,14 @@ mod tests {
             .map(chain_uuid_and_parent)
             .map(|(message_uuid, _)| message_uuid)
             .collect::<Vec<_>>();
+        let original_chain = entries
+            .iter()
+            .map(chain_uuid_and_parent)
+            .collect::<Vec<_>>();
         drop(persistence);
         clear_module_state_for_root(&storage).await;
-        for suffix in ["", "-wal", "-shm", "-journal"] {
-            let path = storage.join(format!("index.sqlite{suffix}"));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => panic!(
-                    "cannot remove recreated-index fixture {}: {err}",
-                    path.display()
-                ),
-            }
-        }
+        remove_sqlite_cache(&storage);
         clear_message_index_attempts(&storage);
-
-        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
-        assert!(message_index_attempts_for(&storage).is_empty());
 
         let (resumed, messages, _) =
             SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
@@ -5992,8 +6297,139 @@ mod tests {
         );
         assert_eq!(indexed_message_count(&storage, &session_id), 2);
         assert!(index_baseline_marker(&storage, &session_id).is_file());
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &session_id))
+                .await
+                .unwrap()
+                .iter()
+                .map(chain_uuid_and_parent)
+                .collect::<Vec<_>>(),
+            original_chain
+        );
 
         drop(resumed);
+        clear_message_index_attempts(&storage);
+        let (resumed_again, messages, _) =
+            SessionPersistence::resume(&storage_str, session_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(message_index_attempts_for(&storage).is_empty());
+        assert_eq!(indexed_message_count(&storage, &session_id), 2);
+
+        drop(resumed_again);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_fork_rebuilds_source_after_index_recreation() {
+        let storage = test_storage("fork-recreated-source-index");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let source = SessionPersistence::create(
+            &storage_str,
+            source_id.clone(),
+            "source-model".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        source
+            .persist_new(&[
+                Message::user("fork source title"),
+                Message::assistant("source response"),
+            ])
+            .await
+            .unwrap();
+        let source_entries = load_transcript(&transcript_file(&storage, &source_id))
+            .await
+            .unwrap();
+        let source_uuids = source_entries
+            .iter()
+            .map(chain_uuid_and_parent)
+            .map(|(uuid, _)| uuid)
+            .collect::<Vec<_>>();
+        let source_chain = source_entries
+            .iter()
+            .map(chain_uuid_and_parent)
+            .collect::<Vec<_>>();
+        drop(source);
+        clear_module_state_for_root(&storage).await;
+        remove_sqlite_cache(&storage);
+        clear_message_index_attempts(&storage);
+
+        let fork_id = fork_session(&storage_str, &source_id).await.unwrap();
+
+        assert_eq!(
+            message_index_attempt_uuids(&storage, &source_id),
+            source_uuids
+        );
+        assert_eq!(
+            indexed_session_fields(&storage, &source_id),
+            Some((
+                "fork source title".to_string(),
+                "source-model".to_string(),
+                2
+            ))
+        );
+        assert_eq!(
+            indexed_session_fields(&storage, &fork_id),
+            Some((
+                "fork source title".to_string(),
+                "source-model".to_string(),
+                2
+            ))
+        );
+        let fork_messages = load_session_messages_at_root(&storage, &fork_id)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(fork_messages.len(), 2);
+        assert_eq!(fork_messages[0].get_all_text(), "fork source title");
+        assert_eq!(fork_messages[1].get_all_text(), "source response");
+        assert_eq!(
+            load_transcript(&transcript_file(&storage, &source_id))
+                .await
+                .unwrap()
+                .iter()
+                .map(chain_uuid_and_parent)
+                .collect::<Vec<_>>(),
+            source_chain
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recreated_index_fork_fails_closed_when_legacy_model_is_unrecoverable() {
+        let storage = test_storage("fork-recreated-legacy-model");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        seed_legacy_session(&storage, &source_id, &[Message::user("legacy source")]).await;
+        seed_index_baseline_record(&storage, &source_id);
+        clear_module_state_for_root(&storage).await;
+        remove_sqlite_cache(&storage);
+
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cannot recover model for fork source"));
+        assert!(!session_model_marker(&storage, &source_id).exists());
+        assert!(index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .is_empty());
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_dir(storage.join("transcripts"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from(format!("{source_id}.jsonl"))]
+        );
+
         std::fs::remove_dir_all(storage).unwrap();
     }
 
@@ -6028,7 +6464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_record_for_unknown_session_fails_closed() {
+    async fn absent_pending_record_for_unknown_session_is_removed_without_publication() {
         let storage = test_storage("persist-pending-index-unknown");
         let storage_str = storage.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -6040,13 +6476,10 @@ mod tests {
             "unknown",
         );
 
-        let err = match list_sessions(&storage_str).await {
-            Ok(_) => panic!("unknown pending index session must fail recovery"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("unknown session"));
-        assert!(pending_index_marker(&storage, &session_id).is_file());
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!index_contains(&storage, &session_id));
+        assert!(message_index_attempts_for(&storage).is_empty());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
@@ -6713,7 +7146,12 @@ mod tests {
 
         assert_eq!(
             directory_syncs_for(&storage),
-            [storage.clone(), storage.join("metadata"), storage.clone()]
+            [
+                storage.clone(),
+                storage.join("metadata"),
+                storage.clone(),
+                storage.clone()
+            ]
         );
 
         save_familiar_metadata_at_root(&storage, &session_id, Some(&familiar())).unwrap();
@@ -6722,6 +7160,7 @@ mod tests {
             [
                 storage.clone(),
                 storage.join("metadata"),
+                storage.clone(),
                 storage.clone(),
                 storage.clone(),
                 storage.join("metadata")
@@ -6734,6 +7173,7 @@ mod tests {
             [
                 storage.clone(),
                 storage.join("metadata"),
+                storage.clone(),
                 storage.clone(),
                 storage.clone(),
                 storage.join("metadata"),
