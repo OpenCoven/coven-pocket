@@ -2,6 +2,7 @@ import XCTest
 @testable import CovenPocket
 
 @MainActor
+// swiftlint:disable:next type_body_length
 final class CompanionChatPollingTests: XCTestCase {
     func testPollingFailureCanRetryFromTheSameCursor() async {
         let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
@@ -243,5 +244,56 @@ final class CompanionChatPollingTests: XCTestCase {
         await Task.yield()
 
         XCTAssertTrue(model.isBusy)
+    }
+
+    func testPollingRetryResponseFromSupersededPairingCleansWithoutStalePoll() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        model.pollTask?.cancel()
+        model.pollTask = nil
+        client.eventError = .polling
+        await model.refreshOnce()
+        let errorCount = model.items.count { $0.kind == .error }
+        client.eventError = nil
+        client.suspendsEvents = true
+
+        let retry = Task { await model.retry() }
+        await fulfillment(of: [client.eventsRequested], timeout: 1)
+
+        client.gate = .ready(pairingB)
+        let refreshed = await model.refreshAvailability()
+        XCTAssertTrue(refreshed)
+        client.resumeEvents(
+            with: RemoteEventBatch(
+                events: [
+                    RemoteEvent(
+                        seq: 2,
+                        kind: "assistant",
+                        payloadJson: #"{"type":"assistant","message":{"content":"#
+                            + #"[{"type":"text","text":"Stale"}]}}"#,
+                        createdAt: "t"
+                    )
+                ],
+                nextAfterSeq: 2,
+                hasMore: false
+            )
+        )
+        await retry.value
+
+        XCTAssertEqual(model.availability, .ready(pairingB))
+        XCTAssertEqual(client.eventPairings.last, pairingA)
+        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertEqual(client.killPairings, [pairingA])
+        XCTAssertNil(model.session)
+        XCTAssertNil(model.pairing)
+        XCTAssertFalse(model.hasActivePollTask)
+        XCTAssertFalse(model.items.contains { $0.text == "Stale" })
+        XCTAssertEqual(model.items.count { $0.kind == .error }, errorCount)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.retriesPolling)
+        XCTAssertFalse(model.canRetry)
     }
 }

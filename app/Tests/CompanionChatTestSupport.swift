@@ -23,8 +23,12 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     var gate: CompanionModel.SessionGate
     var launchedPrompts: [String] = []
     var launchedFamiliarIDs: [String?] = []
+    var launchedPairings: [DaemonPairing] = []
     var sentInputs: [String] = []
+    var sentInputPairings: [DaemonPairing] = []
     var killedSessionIDs: [String] = []
+    var killPairings: [DaemonPairing] = []
+    var eventPairings: [DaemonPairing] = []
     var operationLog: [String] = []
     var gateCallCount = 0
     var eventBatches: [RemoteEventBatch] = []
@@ -41,6 +45,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     var suspendsLaunch = false
     var suspendsSendInput = false
     var suspendsKill = false
+    var beforeGateResponse: (() -> Void)?
     let eventsRequested = XCTestExpectation(description: "events requested")
     let gateRequested = XCTestExpectation(description: "session gate requested")
     let secondGateRequested = XCTestExpectation(description: "second session gate requested")
@@ -62,17 +67,23 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
 
     func sessionGate() async -> CompanionModel.SessionGate {
         gateCallCount += 1
+        let result: CompanionModel.SessionGate
         if suspendsGate {
             if gateContinuations.isEmpty {
                 gateRequested.fulfill()
             } else {
                 secondGateRequested.fulfill()
             }
-            return await withCheckedContinuation { continuation in
+            result = await withCheckedContinuation { continuation in
                 gateContinuations.append(continuation)
             }
+        } else {
+            result = gate
         }
-        return gate
+        let responseHook = beforeGateResponse
+        beforeGateResponse = nil
+        responseHook?()
+        return result
     }
 
     func launch(
@@ -84,6 +95,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
     ) async throws -> RemoteSession {
         launchedPrompts.append(prompt)
         launchedFamiliarIDs.append(familiarID)
+        launchedPairings.append(pairing)
         operationLog.append("launch:\(familiarID ?? "nil")")
         if suspendsLaunch {
             suspendedLaunchFamiliarID = familiarID
@@ -107,6 +119,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         sessionID: String,
         afterSeq: Int64
     ) async throws -> RemoteEventBatch {
+        eventPairings.append(pairing)
         if suspendsEvents {
             eventsRequested.fulfill()
             return await withCheckedContinuation { continuation in
@@ -135,6 +148,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
             throw sendInputError
         }
         sentInputs.append(data)
+        sentInputPairings.append(pairing)
         if suspendsSendInput {
             sendInputRequested.fulfill()
             await withCheckedContinuation { continuation in
@@ -145,6 +159,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
 
     func kill(pairing: DaemonPairing, sessionID: String) async throws {
         operationLog.append("kill:\(sessionID)")
+        killPairings.append(pairing)
         if suspendsKill {
             killRequested.fulfill()
             await withCheckedContinuation { continuation in
@@ -184,7 +199,10 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         continuation.resume(returning: result)
     }
 
-    func resumeLaunch(projectRoot: String = "/srv/repo") {
+    func resumeLaunch(
+        id: String = "session-1",
+        projectRoot: String = "/srv/repo"
+    ) {
         suspendsLaunch = false
         let continuation = launchContinuation
         launchContinuation = nil
@@ -195,6 +213,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         } else {
             continuation?.resume(
                 returning: remoteSession(
+                    id: id,
                     title: "title",
                     projectRoot: projectRoot,
                     familiarID: responseFamiliarID(for: familiarID)
@@ -235,6 +254,17 @@ func pairedDaemon(
         pid: pid,
         startedAt: startedAt,
         pairedAt: Date()
+    )
+}
+
+@MainActor
+func verifiedPairingToken(
+    _ pairing: DaemonPairing,
+    on model: CompanionChatModel
+) -> VerifiedPairing {
+    VerifiedPairing(
+        pairing: pairing,
+        availabilityGeneration: model.availabilityGeneration
     )
 }
 

@@ -16,7 +16,7 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
                 of: session,
                 pairing: pairing,
                 completionText: nil,
-                verifiedPairing: pairing
+                verifiedPairing: verifiedPairingToken(pairing, on: model)
             )
         }
         await fulfillment(of: [client.killRequested], timeout: 1)
@@ -60,7 +60,7 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
                 of: session,
                 pairing: pairing,
                 completionText: nil,
-                verifiedPairing: pairing
+                verifiedPairing: verifiedPairingToken(pairing, on: model)
             )
         }
         await fulfillment(of: [client.killRequested], timeout: 1)
@@ -97,6 +97,7 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
         let client = FakeCompanionSessionClient(gate: .ready(pairing))
         client.suspendsKill = true
         let model = CompanionChatModel(client: client)
+        model.availability = .ready(pairing)
         let session = remoteSession()
 
         let cleanup = Task {
@@ -104,7 +105,7 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
                 of: session,
                 pairing: pairing,
                 completionText: nil,
-                verifiedPairing: pairing
+                verifiedPairing: verifiedPairingToken(pairing, on: model)
             )
         }
         await fulfillment(of: [client.killRequested], timeout: 1)
@@ -142,5 +143,77 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
         XCTAssertFalse(model.isBusy)
         XCTAssertFalse(model.canRetry)
         XCTAssertTrue(model.items.isEmpty)
+    }
+
+    func testNewerCheckingBeforeGateResponsePreventsCleanupKillSideEffect() async {
+        let pairing = pairedDaemon()
+        let client = FakeCompanionSessionClient(gate: .ready(pairing))
+        let model = CompanionChatModel(client: client)
+        client.beforeGateResponse = {
+            _ = model.beginAvailabilityCheck()
+        }
+
+        let cleaned = await model.beginCleanup(
+            of: remoteSession(),
+            pairing: pairing,
+            completionText: nil
+        )
+
+        XCTAssertFalse(cleaned)
+        XCTAssertEqual(model.availability, .checking)
+        XCTAssertTrue(client.killPairings.isEmpty)
+        XCTAssertTrue(model.hasPendingCleanup)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.canRetry)
+    }
+
+    func testStaleCleanupCompletionCannotClearNewerBLaunchState() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        client.suspendsKill = true
+        let model = CompanionChatModel(client: client)
+        model.availability = .ready(pairingA)
+
+        let cleanup = Task {
+            await model.beginCleanup(
+                of: remoteSession(id: "session-a"),
+                pairing: pairingA,
+                completionText: nil,
+                verifiedPairing: verifiedPairingToken(pairingA, on: model)
+            )
+        }
+        await fulfillment(of: [client.killRequested], timeout: 1)
+
+        model.operationGeneration &+= 1
+        model.availability = .ready(pairingB)
+        model.adoptLaunchedSession(
+            remoteSession(id: "session-b"),
+            context: CompanionSendContext(
+                prompt: "newer",
+                projectRoot: "/srv/repo",
+                familiarID: nil,
+                familiarPresentation: .empty
+            ),
+            pairing: verifiedPairingToken(pairingB, on: model)
+        )
+        model.pairing = pairingB
+        model.isBusy = true
+        model.startPolling()
+
+        client.resumeKill()
+        let cleaned = await cleanup.value
+
+        XCTAssertTrue(cleaned)
+        XCTAssertEqual(model.availability, .ready(pairingB))
+        XCTAssertEqual(model.session?.id, "session-b")
+        XCTAssertEqual(model.pairing, pairingB)
+        XCTAssertTrue(model.hasActivePollTask)
+        XCTAssertTrue(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+        XCTAssertFalse(model.hasPendingCleanup)
+
+        client.gate = .ready(pairingB)
+        await model.reset()
     }
 }

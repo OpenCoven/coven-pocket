@@ -56,6 +56,7 @@ final class CompanionChatModel: ObservableObject {
     let companion: CompanionModel
     let client: any CompanionSessionClient
     var pairing: DaemonPairing?
+    var sessionVerifiedPairing: VerifiedPairing?
     var session: RemoteSession?
     var sessionProjectRoot: String?
     var sessionFamiliarID: String?
@@ -141,7 +142,10 @@ final class CompanionChatModel: ObservableObject {
 
     func availabilityGate(
         while isOperationCurrent: () -> Bool
-    ) async -> CompanionModel.SessionGate? {
+    ) async -> (
+        gate: CompanionModel.SessionGate,
+        availabilityGeneration: UInt64
+    )? {
         let previousTerminal = lastTerminalAvailability
         let generation = beginAvailabilityCheck()
         var publishedTerminal = false
@@ -159,7 +163,9 @@ final class CompanionChatModel: ObservableObject {
                   !Task.isCancelled else { return nil }
             availability = Self.availability(from: gate)
             publishedTerminal = true
-            guard isOperationCurrent(), !Task.isCancelled else {
+            guard generation == availabilityGeneration,
+                  isOperationCurrent(),
+                  !Task.isCancelled else {
                 if case .ready = gate { return nil }
                 restoreAvailability(
                     for: generation,
@@ -167,7 +173,7 @@ final class CompanionChatModel: ObservableObject {
                 )
                 return nil
             }
-            return gate
+            return (gate, generation)
         } onCancel: {
             Task { @MainActor [weak self] in
                 self?.restoreAvailability(for: generation)
@@ -247,18 +253,24 @@ final class CompanionChatModel: ObservableObject {
             reportFailure: true,
             generation: generation
         ) else {
-            guard generation == operationGeneration else { return }
-            guard !Task.isCancelled else {
-                finishCancelledSend(generation: generation)
-                return
-            }
-            isBusy = false
-            retryPrompt = trimmedPrompt
-            canRetry = true
+            await finishUnverifiedSend(
+                context: context,
+                generation: generation
+            )
             return
         }
-        guard generation == operationGeneration, !Task.isCancelled else {
-            finishCancelledSend(generation: generation)
+        guard canPerformSessionTraffic(
+            pairing: verified,
+            generation: generation
+        ) else {
+            if generation == operationGeneration, !Task.isCancelled {
+                settleSupersededSend(
+                    context: context,
+                    generation: generation
+                )
+            } else {
+                finishCancelledSend(generation: generation)
+            }
             return
         }
 
@@ -277,6 +289,7 @@ final class CompanionChatModel: ObservableObject {
             handleSendFailure(
                 error,
                 context: context,
+                pairing: verified,
                 generation: generation
             )
         }
@@ -362,48 +375,6 @@ extension CompanionChatModel {
         retriesPolling = true
         canRetry = true
         return true
-    }
-
-    func refreshOnce() async {
-        let generation = operationGeneration
-        guard let pairing, let session else { return }
-        do {
-            var hasMore = true
-            while hasMore && !Task.isCancelled {
-                let page = try await client.events(
-                    pairing: pairing,
-                    sessionID: session.id,
-                    afterSeq: cursor
-                )
-                guard generation == operationGeneration,
-                      !Task.isCancelled else { return }
-                let knownSequences = Set(accumulatedEvents.map(\.seq))
-                accumulatedEvents.append(
-                    contentsOf: page.events.filter { !knownSequences.contains($0.seq) }
-                )
-                cursor = max(cursor, page.nextAfterSeq)
-                hasMore = page.hasMore
-            }
-            guard generation == operationGeneration,
-                  !Task.isCancelled else { return }
-            apply(events: accumulatedEvents)
-        } catch {
-            guard generation == operationGeneration,
-                  !Task.isCancelled else { return }
-            let wasAwaitingResult = isBusy
-            items.append(ChatItem(kind: .error, text: error.localizedDescription))
-            pollTask?.cancel()
-            pollTask = nil
-            isBusy = false
-            if Self.isSessionNotLive(error) {
-                abandonSession()
-                retriesPolling = false
-                canRetry = false
-            } else {
-                retriesPolling = wasAwaitingResult
-                canRetry = wasAwaitingResult
-            }
-        }
     }
 
     func apply(events: [RemoteEvent]) {
@@ -515,6 +486,7 @@ extension CompanionChatModel {
 
     func clearSessionBinding() {
         session = nil
+        sessionVerifiedPairing = nil
         sessionProjectRoot = nil
         sessionFamiliarID = nil
         pinnedSessionFamiliar = nil
