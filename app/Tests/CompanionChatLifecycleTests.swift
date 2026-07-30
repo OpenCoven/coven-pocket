@@ -206,7 +206,11 @@ final class CompanionChatLifecycleTests: XCTestCase {
         await fulfillment(of: [client.killRequested], timeout: 1)
 
         client.suspendsKill = false
-        await model.reset()
+        let generation = model.operationGeneration
+        let reset = Task { await model.reset() }
+        while model.operationGeneration == generation {
+            await Task.yield()
+        }
 
         XCTAssertEqual(
             client.operationLog.filter { $0 == "kill:session-1" }.count,
@@ -215,6 +219,7 @@ final class CompanionChatLifecycleTests: XCTestCase {
 
         client.resumeKill()
         await send.value
+        await reset.value
 
         XCTAssertEqual(client.killedSessionIDs, ["session-1"])
         XCTAssertFalse(model.hasPendingCleanup)

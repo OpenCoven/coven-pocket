@@ -500,13 +500,20 @@ final class CompanionChatFamiliarAuthorityTests: XCTestCase {
 
         let retry = Task { await model.retry() }
         await fulfillment(of: [client.gateRequested], timeout: 1)
+        let gateCallsDuringRetry = client.gateCallCount
+        let generation = model.operationGeneration
         let stop = Task { await model.stop() }
-        await fulfillment(of: [client.secondGateRequested], timeout: 1)
+        while model.operationGeneration == generation {
+            await Task.yield()
+        }
+        XCTAssertEqual(client.gateCallCount, gateCallsDuringRetry)
 
-        client.resumeLastGate(with: .ready(pairedDaemon()))
-        await stop.value
-        client.suspendsGate = false
         client.resumeNextGate(with: .ready(pairedDaemon()))
+        while client.gateCallCount == gateCallsDuringRetry {
+            await Task.yield()
+        }
+        client.resumeNextGate(with: .ready(pairedDaemon()))
+        await stop.value
         await retry.value
 
         XCTAssertEqual(client.launchedFamiliarIDs, ["sage"])

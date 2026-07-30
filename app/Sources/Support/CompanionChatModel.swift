@@ -19,6 +19,13 @@ struct CompanionSendContext: Equatable {
     let familiarPresentation: CompanionFamiliarPresentationContext
 }
 
+struct CompanionCleanupOwnership {
+    let sessionID: String
+    let generation: UInt64
+    let token: UInt64
+    var waiters: [CheckedContinuation<Bool, Never>] = []
+}
+
 @MainActor
 final class CompanionChatModel: ObservableObject {
     enum Availability: Equatable {
@@ -69,7 +76,8 @@ final class CompanionChatModel: ObservableObject {
     var pendingCleanup: RemoteSession?
     var pendingCleanupPairing: DaemonPairing?
     var pendingCleanupCompletionText: String?
-    var cleanupKillInFlightSessionID: String?
+    var cleanupOwnership: CompanionCleanupOwnership?
+    var nextCleanupOwnershipToken: UInt64 = 0
 
     convenience init() {
         self.init(companion: CompanionModel())

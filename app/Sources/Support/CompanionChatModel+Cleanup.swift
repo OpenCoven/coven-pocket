@@ -1,5 +1,7 @@
 import Foundation
 
+// swiftlint:disable file_length
+
 extension CompanionChatModel {
     func retryPendingCleanup() async {
         guard let pendingCleanup else { return }
@@ -113,6 +115,7 @@ extension CompanionChatModel {
     }
 
     @discardableResult
+    // swiftlint:disable:next function_body_length
     func beginCleanup(
         of sessionToClean: RemoteSession,
         pairing knownPairing: DaemonPairing?,
@@ -136,6 +139,26 @@ extension CompanionChatModel {
                 retryFamiliarPresentation = retainedRetryContext.familiarPresentation
             }
         }
+
+        while let ownership = cleanupOwnership {
+            let ownerResult = await joinCleanupOwnership(ownership)
+            let ownerClearedPending = pendingCleanup?.id != ownership.sessionID
+            if ownership.sessionID == sessionToClean.id {
+                if ownerResult || ownerClearedPending {
+                    return true
+                }
+                guard ownership.generation != generation,
+                      generation == operationGeneration,
+                      !Task.isCancelled else { return false }
+                continue
+            }
+            guard ownerClearedPending,
+                  generation == operationGeneration,
+                  !Task.isCancelled else { return false }
+        }
+
+        guard pendingCleanup == nil
+                || pendingCleanup?.id == sessionToClean.id else { return false }
         pendingCleanup = sessionToClean
         if let knownPairing {
             pendingCleanupPairing = knownPairing
@@ -145,20 +168,58 @@ extension CompanionChatModel {
         canRetry = false
         retriesPolling = false
 
+        let ownershipToken = claimCleanupOwnership(
+            sessionID: sessionToClean.id,
+            generation: generation
+        )
+        var result = false
+        defer {
+            finishCleanupOwnership(
+                token: ownershipToken,
+                result: result
+            )
+        }
+
+        result = await performOwnedCleanup(
+            of: sessionToClean,
+            verifiedPairing: verifiedPairing,
+            generation: generation,
+            completionText: completionText,
+            ownershipToken: ownershipToken
+        )
+        return result
+    }
+
+    func performOwnedCleanup(
+        of sessionToClean: RemoteSession,
+        verifiedPairing: DaemonPairing?,
+        generation: UInt64,
+        completionText: String?,
+        ownershipToken: UInt64
+    ) async -> Bool {
         guard let verified = await resolveCleanupPairing(
             verifiedPairing,
             generation: generation,
             session: sessionToClean,
-            completionText: completionText
+            completionText: completionText,
+            ownershipToken: ownershipToken
         ) else { return false }
 
-        guard canStartCleanupKill(generation: generation) else { return false }
-        guard cleanupKillInFlightSessionID == nil else { return false }
-        cleanupKillInFlightSessionID = sessionToClean.id
-        defer { cleanupKillInFlightSessionID = nil }
+        guard isCurrentCleanupOwnership(
+            sessionID: sessionToClean.id,
+            token: ownershipToken
+        ), pendingCleanup?.id == sessionToClean.id else { return false }
+        guard canStartCleanupKill(
+            generation: generation,
+            sessionID: sessionToClean.id,
+            ownershipToken: ownershipToken
+        ) else { return false }
         do {
             try await client.kill(pairing: verified, sessionID: sessionToClean.id)
-            guard pendingCleanup?.id == sessionToClean.id else { return false }
+            guard isCurrentCleanupOwnership(
+                sessionID: sessionToClean.id,
+                token: ownershipToken
+            ), pendingCleanup?.id == sessionToClean.id else { return false }
             completeCleanup(of: sessionToClean, message: completionText)
             return true
         } catch {
@@ -166,12 +227,21 @@ extension CompanionChatModel {
                 error,
                 session: sessionToClean,
                 completionText: completionText,
-                generation: generation
+                generation: generation,
+                ownershipToken: ownershipToken
             )
         }
     }
 
-    func canStartCleanupKill(generation: UInt64) -> Bool {
+    func canStartCleanupKill(
+        generation: UInt64,
+        sessionID: String,
+        ownershipToken: UInt64
+    ) -> Bool {
+        guard isCurrentCleanupOwnership(
+            sessionID: sessionID,
+            token: ownershipToken
+        ), pendingCleanup?.id == sessionID else { return false }
         guard generation == operationGeneration,
               !Task.isCancelled else {
             if generation == operationGeneration {
@@ -187,9 +257,13 @@ extension CompanionChatModel {
         _ error: Error,
         session: RemoteSession,
         completionText: String?,
-        generation: UInt64
+        generation: UInt64,
+        ownershipToken: UInt64
     ) -> Bool {
-        guard pendingCleanup?.id == session.id else { return false }
+        guard isCurrentCleanupOwnership(
+            sessionID: session.id,
+            token: ownershipToken
+        ), pendingCleanup?.id == session.id else { return false }
         if Self.isSessionNotLive(error) {
             completeCleanup(
                 of: session,
@@ -212,33 +286,79 @@ extension CompanionChatModel {
         _ verifiedPairing: DaemonPairing?,
         generation: UInt64,
         session: RemoteSession,
-        completionText: String?
+        completionText: String?,
+        ownershipToken: UInt64
     ) async -> DaemonPairing? {
         if let verifiedPairing {
+            guard isCurrentCleanupOwnership(
+                sessionID: session.id,
+                token: ownershipToken
+            ), pendingCleanup?.id == session.id else { return nil }
             return verifiedPairing
         }
         return await cleanupPairing(
             generation: generation,
             session: session,
-            completionText: completionText
+            completionText: completionText,
+            ownershipToken: ownershipToken
         )
     }
 
+    // swiftlint:disable:next function_body_length
     func cleanupPairing(
         generation: UInt64,
         session: RemoteSession,
-        completionText: String?
+        completionText: String?,
+        ownershipToken: UInt64? = nil
     ) async -> DaemonPairing? {
-        guard let verified = await verifiedPairing(
-            reportFailure: true,
-            generation: generation
+        guard generation == operationGeneration,
+              cleanupContextIsCurrent(
+                  sessionID: session.id,
+                  ownershipToken: ownershipToken
+              ),
+              !Task.isCancelled else { return nil }
+        guard let gate = await availabilityGate(
+            while: {
+                generation == operationGeneration
+                    && cleanupContextIsCurrent(
+                        sessionID: session.id,
+                        ownershipToken: ownershipToken
+                    )
+            }
         ) else {
-            guard generation == operationGeneration else { return nil }
+            guard generation == operationGeneration,
+                  cleanupContextIsCurrent(
+                      sessionID: session.id,
+                      ownershipToken: ownershipToken
+                  ) else { return nil }
             isBusy = false
             canRetry = true
             return nil
         }
-        guard generation == operationGeneration else { return nil }
+        guard generation == operationGeneration,
+              cleanupContextIsCurrent(
+                  sessionID: session.id,
+                  ownershipToken: ownershipToken
+              ),
+              !Task.isCancelled else { return nil }
+        let verified: DaemonPairing
+        switch gate {
+        case let .ready(pairing):
+            verified = pairing
+        case .notPaired:
+            isBusy = false
+            fail(
+                "Not paired. Pair with a daemon in the Companion tab first.",
+                retryPrompt: nil
+            )
+            canRetry = true
+            return nil
+        case let .blocked(reason, hint):
+            isBusy = false
+            fail("\(reason). \(hint)", retryPrompt: nil)
+            canRetry = true
+            return nil
+        }
         guard let expected = pendingCleanupPairing else { return verified }
         guard Self.isSameDaemonEndpoint(expected, verified) else {
             isBusy = false
@@ -255,6 +375,63 @@ extension CompanionChatModel {
             return nil
         }
         return verified
+    }
+
+    func claimCleanupOwnership(
+        sessionID: String,
+        generation: UInt64
+    ) -> UInt64 {
+        nextCleanupOwnershipToken &+= 1
+        let token = nextCleanupOwnershipToken
+        cleanupOwnership = CompanionCleanupOwnership(
+            sessionID: sessionID,
+            generation: generation,
+            token: token
+        )
+        return token
+    }
+
+    func joinCleanupOwnership(
+        _ ownership: CompanionCleanupOwnership
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            guard var current = cleanupOwnership,
+                  current.sessionID == ownership.sessionID,
+                  current.token == ownership.token else {
+                continuation.resume(
+                    returning: pendingCleanup?.id != ownership.sessionID
+                )
+                return
+            }
+            current.waiters.append(continuation)
+            cleanupOwnership = current
+        }
+    }
+
+    func finishCleanupOwnership(token: UInt64, result: Bool) {
+        guard let ownership = cleanupOwnership,
+              ownership.token == token else { return }
+        cleanupOwnership = nil
+        ownership.waiters.forEach { $0.resume(returning: result) }
+    }
+
+    func isCurrentCleanupOwnership(
+        sessionID: String,
+        token: UInt64
+    ) -> Bool {
+        cleanupOwnership?.sessionID == sessionID
+            && cleanupOwnership?.token == token
+    }
+
+    func cleanupContextIsCurrent(
+        sessionID: String,
+        ownershipToken: UInt64?
+    ) -> Bool {
+        guard let ownershipToken else { return true }
+        return isCurrentCleanupOwnership(
+            sessionID: sessionID,
+            token: ownershipToken
+        ) && pendingCleanup?.id == sessionID
     }
 
     func completeCleanup(of cleanedSession: RemoteSession, message: String?) {
