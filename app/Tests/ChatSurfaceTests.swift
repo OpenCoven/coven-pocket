@@ -177,6 +177,67 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionStoreURLCanonicalizesSyntheticVarMobilePathWithoutCreatingIt() {
+        let applicationSupportPath = """
+        /var/mobile/Containers/Data/Application/ABC/Library/Application Support
+        """
+        let applicationSupport = URL(
+            fileURLWithPath: applicationSupportPath,
+            isDirectory: true
+        )
+
+        let store = ChatModel.sessionStoreURL(applicationSupportBase: applicationSupport)
+
+        XCTAssertEqual(
+            store.path,
+            """
+            /private/var/mobile/Containers/Data/Application/ABC/Library/Application Support/\
+            chat-sessions
+            """
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: applicationSupport.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.path))
+    }
+
+    @MainActor
+    func testSessionStoreURLCanonicalizesExactVarRoot() {
+        let store = ChatModel.sessionStoreURL(
+            applicationSupportBase: URL(fileURLWithPath: "/var", isDirectory: true)
+        )
+
+        XCTAssertEqual(store.path, "/private/var/chat-sessions")
+    }
+
+    @MainActor
+    func testSessionStoreURLLeavesOrdinaryUsersPathUnchanged() {
+        let applicationSupportPath = "/Users/example/Library/Application Support"
+        let store = ChatModel.sessionStoreURL(
+            applicationSupportBase: URL(
+                fileURLWithPath: applicationSupportPath,
+                isDirectory: true
+            )
+        )
+
+        XCTAssertEqual(store.path, "\(applicationSupportPath)/chat-sessions")
+    }
+
+    @MainActor
+    func testSessionStoreURLCanonicalizesAppleSystemAliasesAtComponentBoundary() {
+        let mappings = [
+            ("/tmp/example", "/private/tmp/example/chat-sessions"),
+            ("/etc/example", "/private/etc/example/chat-sessions"),
+            ("/variable/example", "/variable/example/chat-sessions")
+        ]
+
+        for (input, expected) in mappings {
+            let store = ChatModel.sessionStoreURL(
+                applicationSupportBase: URL(fileURLWithPath: input, isDirectory: true)
+            )
+            XCTAssertEqual(store.path, expected)
+        }
+    }
+
+    @MainActor
     func testSessionStoreURLResolvesApplicationSupportAliasBeforeAppendingLeaf() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("session-store-url-\(UUID().uuidString)", isDirectory: true)

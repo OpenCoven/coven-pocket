@@ -146,11 +146,35 @@ final class ChatModel: ObservableObject {
     }
 
     static func sessionStoreURL(applicationSupportBase: URL) -> URL {
-        applicationSupportBase
+        let resolvedBase = applicationSupportBase
             .standardizedFileURL
             .resolvingSymlinksInPath()
             .standardizedFileURL
+
+        return canonicalAppleSystemRootAlias(resolvedBase)
             .appendingPathComponent("chat-sessions", isDirectory: true)
+    }
+
+    private static func canonicalAppleSystemRootAlias(_ url: URL) -> URL {
+        #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+        let path = url.path
+        let aliases = [
+            (alias: "/var", canonical: "/private/var"),
+            (alias: "/tmp", canonical: "/private/tmp"),
+            (alias: "/etc", canonical: "/private/etc")
+        ]
+
+        for mapping in aliases
+        where path == mapping.alias || path.hasPrefix("\(mapping.alias)/") {
+            let suffix = path.dropFirst(mapping.alias.count)
+            return URL(
+                fileURLWithPath: mapping.canonical + suffix,
+                isDirectory: url.hasDirectoryPath
+            )
+        }
+        #endif
+
+        return url
     }
 
     /// The directory the next session binds to: the active git workspace
