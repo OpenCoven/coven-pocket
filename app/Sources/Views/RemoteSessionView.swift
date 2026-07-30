@@ -100,7 +100,7 @@ struct RemoteSessionView: View {
             TextField("Send to session…", text: $model.draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
-                .disabled(model.finished)
+                .disabled(!model.acceptsInput)
             Button {
                 Task { await model.send() }
             } label: {
@@ -108,7 +108,7 @@ struct RemoteSessionView: View {
                     .font(.title2)
             }
             .disabled(
-                model.finished
+                !model.acceptsInput
                     || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             )
         }

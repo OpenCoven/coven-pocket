@@ -32,6 +32,7 @@ struct ChatView: View {
 
     private var canSend: Bool {
         guard !activeIsBusy,
+              !(settings.backend == .companionClaude && companionModel.hasPendingCleanup),
               !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return false }
         switch settings.backend {

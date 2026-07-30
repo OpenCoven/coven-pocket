@@ -278,13 +278,17 @@ fn split_response(raw: &str) -> (u16, String) {
 /// envelope's message when present.
 fn daemon_error(status: u16, body: &str) -> PocketError {
     let envelope: Option<serde_json::Value> = serde_json::from_str(body).ok();
-    let message = envelope
-        .as_ref()
-        .and_then(|v| v.get("error"))
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
+    let error = envelope.as_ref().and_then(|value| value.get("error"));
+    let detail = error
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| format!("the daemon rejected the request (HTTP {status})"));
+    let message = error
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_str())
+        .map(|code| format!("{code}: {detail}"))
+        .unwrap_or(detail);
     PocketError::Engine { message }
 }
 
@@ -467,6 +471,7 @@ mod tests {
             err.to_string().contains("Session is not live."),
             "got: {err}"
         );
+        assert!(err.to_string().contains("session_not_live"), "got: {err}");
     }
 
     #[tokio::test]
