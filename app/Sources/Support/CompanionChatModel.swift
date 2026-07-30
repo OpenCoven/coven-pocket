@@ -142,6 +142,7 @@ final class CompanionChatModel: ObservableObject {
     func availabilityGate(
         while isOperationCurrent: () -> Bool
     ) async -> CompanionModel.SessionGate? {
+        let previousTerminal = lastTerminalAvailability
         let generation = beginAvailabilityCheck()
         var publishedTerminal = false
         defer {
@@ -158,6 +159,14 @@ final class CompanionChatModel: ObservableObject {
                   !Task.isCancelled else { return nil }
             availability = Self.availability(from: gate)
             publishedTerminal = true
+            guard isOperationCurrent(), !Task.isCancelled else {
+                if case .ready = gate { return nil }
+                restoreAvailability(
+                    for: generation,
+                    to: previousTerminal
+                )
+                return nil
+            }
             return gate
         } onCancel: {
             Task { @MainActor [weak self] in
@@ -177,6 +186,15 @@ final class CompanionChatModel: ObservableObject {
     private func restoreAvailability(for generation: UInt64) {
         guard generation == availabilityGeneration else { return }
         availability = lastTerminalAvailability ?? .idle
+    }
+
+    private func restoreAvailability(
+        for generation: UInt64,
+        to terminal: Availability?
+    ) {
+        guard generation == availabilityGeneration else { return }
+        lastTerminalAvailability = terminal
+        availability = terminal ?? .idle
     }
 
     // swiftlint:disable:next function_body_length
@@ -324,6 +342,26 @@ extension CompanionChatModel {
             familiar: familiarPresentation.familiar,
             familiarProfile: familiarPresentation.profile
         )
+    }
+
+    func finishInvalidatedPollingRetryIfNeeded(
+        generation: UInt64
+    ) -> Bool {
+        guard generation != operationGeneration
+                || Task.isCancelled else { return false }
+        guard generation == operationGeneration else { return true }
+        let shouldRetryPolling = isBusy || retriesPolling
+        pollTask?.cancel()
+        pollTask = nil
+        isBusy = false
+        guard shouldRetryPolling, session != nil, pairing != nil else {
+            retriesPolling = false
+            canRetry = pendingCleanup != nil
+            return true
+        }
+        retriesPolling = true
+        canRetry = true
+        return true
     }
 
     func refreshOnce() async {

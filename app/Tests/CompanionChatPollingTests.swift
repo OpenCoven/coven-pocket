@@ -42,6 +42,7 @@ final class CompanionChatPollingTests: XCTestCase {
 
         XCTAssertEqual(model.cursor, 4)
         XCTAssertEqual(model.items.map(\.text), ["first", "Recovered", "Turn complete"])
+        XCTAssertFalse(model.hasActivePollTask)
         XCTAssertFalse(model.canRetry)
     }
 
@@ -64,6 +65,7 @@ final class CompanionChatPollingTests: XCTestCase {
         await secondRetry.value
 
         XCTAssertEqual(client.gateCallCount - callsBeforeRetry, 1)
+        XCTAssertTrue(model.hasActivePollTask)
     }
 
     func testPollingRetryAfterDaemonRestartDoesNotRebindStaleSession() async {

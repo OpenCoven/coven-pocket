@@ -142,24 +142,32 @@ extension CompanionChatModel {
         pollTask = nil
         let generation = operationGeneration
         isBusy = true
-        guard let verified = await verifiedPairing(
+        defer { _ = finishInvalidatedPollingRetryIfNeeded(generation: generation) }
+        let verified = await verifiedPairing(
             reportFailure: true,
             generation: generation
-        ) else {
-            guard generation == operationGeneration else { return }
+        )
+        guard !finishInvalidatedPollingRetryIfNeeded(
+            generation: generation
+        ) else { return }
+        guard let verified else {
             isBusy = false
             canRetry = true
             return
         }
-        guard generation == operationGeneration,
-              await prepareSessionForPollingRetry(pairing: verified),
-              generation == operationGeneration else { return }
+        let prepared = await prepareSessionForPollingRetry(pairing: verified)
+        guard !finishInvalidatedPollingRetryIfNeeded(
+            generation: generation
+        ) else { return }
+        guard prepared else { return }
         pairing = verified
         retriesPolling = false
         canRetry = false
         await refreshOnce()
-        guard generation == operationGeneration else { return }
-        if session != nil, !retriesPolling {
+        guard !finishInvalidatedPollingRetryIfNeeded(
+            generation: generation
+        ) else { return }
+        if session != nil, isBusy, !retriesPolling {
             startPolling()
         }
     }
