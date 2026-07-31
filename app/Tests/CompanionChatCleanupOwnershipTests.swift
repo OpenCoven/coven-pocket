@@ -12,12 +12,12 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
         let coordinator = ChatRouteGenerationCoordinator()
         var resetCount = 0
 
-        coordinator.launchRoutedReset {
+        coordinator.launchRoutedReset(for: .companionClaude) {
             resetCount += 1
             await model.reset()
         }
         await fulfillment(of: [client.killRequested], timeout: 1)
-        coordinator.launchRoutedReset {
+        coordinator.launchRoutedReset(for: .companionClaude) {
             resetCount += 1
             await model.reset()
         }

@@ -150,10 +150,11 @@ final class ChatRouteGenerationCoordinator: ObservableObject {
     }
 
     func launchRoutedReset(
+        for backend: ChatBackend,
         _ reset: @escaping @MainActor () async -> Void
     ) {
         invalidate()
-        routedResetRunner.launch(reset)
+        routedResetRunner.launch(for: backend, reset)
     }
 
     func waitForRoutedReset() async {

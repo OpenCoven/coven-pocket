@@ -313,7 +313,7 @@ private extension ChatView {
     private func consumeRouterReset() {
         guard router.consumeReset() else { return }
         let backend = settings.backend
-        routeCoordinator.launchRoutedReset {
+        routeCoordinator.launchRoutedReset(for: backend) {
             await resetActiveConversation(backend: backend)
         }
     }

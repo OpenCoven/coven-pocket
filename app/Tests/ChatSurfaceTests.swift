@@ -2004,36 +2004,290 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
-    func testRoutedResetRunnerOutlivesCancelledLaunchingTaskAndCompletesOnce() async {
+    func testRoutedResetRunnerQueuesDifferentBackendAfterActiveReset() async {
         let runner = RoutedResetRunner()
-        let resetStarted = expectation(description: "routed reset started")
-        var resetContinuation: CheckedContinuation<Void, Never>?
+        let companionStarted = expectation(description: "companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        var companionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
+        var resets: [ChatBackend] = []
+
+        runner.launch(for: .companionClaude) {
+            resets.append(.companionClaude)
+            companionStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                companionContinuation = continuation
+            }
+        }
+        await fulfillment(of: [companionStarted], timeout: 1)
+
+        runner.launch(for: .codex) {
+            resets.append(.codex)
+            codexStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                codexContinuation = continuation
+            }
+        }
+        companionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        codexContinuation?.resume()
+        await runner.waitForCompletion()
+
+        XCTAssertEqual(resets, [.companionClaude, .codex])
+    }
+
+    @MainActor
+    func testRoutedResetRunnerCoalescesEquivalentActiveAndPendingResets() async {
+        let runner = RoutedResetRunner()
+        let companionStarted = expectation(description: "companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        var companionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
+        var companionCount = 0
+        var codexCount = 0
+
+        runner.launch(for: .companionClaude) {
+            companionCount += 1
+            companionStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                companionContinuation = continuation
+            }
+        }
+        await fulfillment(of: [companionStarted], timeout: 1)
+
+        runner.launch(for: .companionClaude) {
+            XCTFail("an equivalent active reset must coalesce")
+        }
+        runner.launch(for: .codex) {
+            codexCount += 1
+            codexStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                codexContinuation = continuation
+            }
+        }
+        runner.launch(for: .codex) {
+            XCTFail("an equivalent pending reset must coalesce")
+        }
+
+        companionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        codexContinuation?.resume()
+        await runner.waitForCompletion()
+
+        XCTAssertEqual(companionCount, 1)
+        XCTAssertEqual(codexCount, 1)
+    }
+
+    @MainActor
+    func testRoutedResetWaitsThroughQueuedReset() async {
+        let runner = RoutedResetRunner()
+        let companionStarted = expectation(description: "companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        let waitCompleted = expectation(description: "reset wait completed")
+        var companionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
+        var didCompleteWait = false
+
+        runner.launch(for: .companionClaude) {
+            companionStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                companionContinuation = continuation
+            }
+        }
+        await fulfillment(of: [companionStarted], timeout: 1)
+        runner.launch(for: .codex) {
+            codexStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                codexContinuation = continuation
+            }
+        }
+
+        let waiter = Task { @MainActor in
+            await runner.waitForCompletion()
+            didCompleteWait = true
+            waitCompleted.fulfill()
+        }
+        companionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        await Task.yield()
+        XCTAssertFalse(didCompleteWait)
+
+        codexContinuation?.resume()
+        await fulfillment(of: [waitCompleted], timeout: 1)
+        await waiter.value
+        XCTAssertTrue(didCompleteWait)
+    }
+
+    @MainActor
+    func testRoutesWaitThroughQueuedRoutedReset() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let companionStarted = expectation(description: "companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        var companionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
+        var events: [String] = []
+
+        coordinator.launchRoutedReset(for: .companionClaude) {
+            events.append("companion-started")
+            companionStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                companionContinuation = continuation
+            }
+            events.append("companion-finished")
+        }
+        await fulfillment(of: [companionStarted], timeout: 1)
+        coordinator.launchRoutedReset(for: .codex) {
+            events.append("codex-started")
+            codexStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                codexContinuation = continuation
+            }
+            events.append("codex-finished")
+        }
+
+        let sessionToken = coordinator.begin()
+        let sessionRoute = Task { @MainActor in
+            await coordinator.runAfterRoutedReset(token: sessionToken) {
+                events.append("session")
+            }
+        }
+        companionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        await Task.yield()
+        XCTAssertEqual(
+            events,
+            ["companion-started", "companion-finished", "codex-started"]
+        )
+
+        codexContinuation?.resume()
+        await sessionRoute.value
+        XCTAssertEqual(
+            events,
+            [
+                "companion-started",
+                "companion-finished",
+                "codex-started",
+                "codex-finished",
+                "session"
+            ]
+        )
+    }
+
+    @MainActor
+    func testRoutedResetRunnerPreservesActivePendingActiveOrdering() async {
+        let runner = RoutedResetRunner()
+        let firstCompanionStarted = expectation(description: "first companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        var firstCompanionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
+        var resets: [String] = []
+
+        runner.launch(for: .companionClaude) {
+            resets.append("companion-1")
+            firstCompanionStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                firstCompanionContinuation = continuation
+            }
+        }
+        await fulfillment(of: [firstCompanionStarted], timeout: 1)
+        runner.launch(for: .codex) {
+            resets.append("codex")
+            codexStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                codexContinuation = continuation
+            }
+        }
+        runner.launch(for: .companionClaude) {
+            XCTFail("the active companion reset already satisfies this request")
+        }
+
+        firstCompanionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        runner.launch(for: .companionClaude) {
+            resets.append("companion-2")
+        }
+        codexContinuation?.resume()
+        await runner.waitForCompletion()
+
+        XCTAssertEqual(resets, ["companion-1", "codex", "companion-2"])
+    }
+
+    @MainActor
+    func testRoutedResetRunnerOutlivesCancelledLaunchingTaskWithPendingReset() async {
+        let runner = RoutedResetRunner()
+        let companionStarted = expectation(description: "companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        var companionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
         var completionCount = 0
 
         let outerRouteTask = Task { @MainActor in
             withUnsafeCurrentTask { $0?.cancel() }
             XCTAssertTrue(Task.isCancelled)
-            runner.launch {
+            runner.launch(for: .companionClaude) {
                 XCTAssertFalse(Task.isCancelled)
-                resetStarted.fulfill()
+                companionStarted.fulfill()
                 await withCheckedContinuation { continuation in
-                    resetContinuation = continuation
+                    companionContinuation = continuation
+                }
+                XCTAssertFalse(Task.isCancelled)
+                completionCount += 1
+            }
+            runner.launch(for: .codex) {
+                XCTAssertFalse(Task.isCancelled)
+                codexStarted.fulfill()
+                await withCheckedContinuation { continuation in
+                    codexContinuation = continuation
                 }
                 XCTAssertFalse(Task.isCancelled)
                 completionCount += 1
             }
         }
-        await fulfillment(of: [resetStarted], timeout: 1)
+        await fulfillment(of: [companionStarted], timeout: 1)
 
         outerRouteTask.cancel()
-        runner.launch {
-            XCTFail("an active routed reset must coalesce later requests")
-        }
-        resetContinuation?.resume()
+        companionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        codexContinuation?.resume()
         await runner.waitForCompletion()
         await outerRouteTask.value
 
-        XCTAssertEqual(completionCount, 1)
+        XCTAssertEqual(completionCount, 2)
+    }
+
+    @MainActor
+    func testRoutedResetQueueOutlivesOwnerDisappearance() async {
+        var runner: RoutedResetRunner? = RoutedResetRunner()
+        weak var retainedRunner = runner
+        let companionStarted = expectation(description: "companion reset started")
+        let codexStarted = expectation(description: "Codex reset started")
+        var companionContinuation: CheckedContinuation<Void, Never>?
+        var codexContinuation: CheckedContinuation<Void, Never>?
+
+        runner?.launch(for: .companionClaude) {
+            companionStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                companionContinuation = continuation
+            }
+        }
+        await fulfillment(of: [companionStarted], timeout: 1)
+        runner?.launch(for: .codex) {
+            codexStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                codexContinuation = continuation
+            }
+        }
+
+        runner = nil
+        XCTAssertNotNil(retainedRunner)
+        companionContinuation?.resume()
+        await fulfillment(of: [codexStarted], timeout: 1)
+        codexContinuation?.resume()
+        for _ in 0..<100 where retainedRunner != nil {
+            await Task.yield()
+        }
+
+        XCTAssertNil(retainedRunner)
     }
 
     @MainActor
@@ -2042,7 +2296,7 @@ final class ChatSurfaceTests: XCTestCase {
         let resetStarted = expectation(description: "routed reset started")
         var resetContinuation: CheckedContinuation<Void, Never>?
         var events: [String] = []
-        coordinator.launchRoutedReset {
+        coordinator.launchRoutedReset(for: .companionClaude) {
             events.append("reset-started")
             resetStarted.fulfill()
             await withCheckedContinuation { continuation in
@@ -2117,11 +2371,11 @@ final class ChatSurfaceTests: XCTestCase {
 
         let coordinator = ChatRouteGenerationCoordinator()
         var resetCount = 0
-        coordinator.launchRoutedReset {
+        coordinator.launchRoutedReset(for: .codex) {
             resetCount += 1
             model.reset()
         }
-        coordinator.launchRoutedReset {
+        coordinator.launchRoutedReset(for: .codex) {
             resetCount += 1
             model.reset()
         }
