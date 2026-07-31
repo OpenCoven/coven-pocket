@@ -8,7 +8,8 @@ extension CompanionChatModel {
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
         verification: CompanionOperationVerification,
-        generation: UInt64
+        generation: UInt64,
+        promptRetryFence: CompanionPromptRetryLaunchFence?
     ) async throws {
         guard !(await finishInvalidatedSendIfNeeded(
             context: context,
@@ -45,18 +46,21 @@ extension CompanionChatModel {
         if reusedSession, session == nil {
             return
         }
+        var finalizedContext = context
         var launchedSession: RemoteSession?
         if !reusedSession {
-            guard let launched = try await prepareAndLaunch(
+            guard let preparedLaunch = try await prepareAndLaunch(
                 context: context,
                 pairing: verified,
                 verification: verification,
-                generation: generation
+                generation: generation,
+                promptRetryFence: promptRetryFence
             ) else { return }
-            launchedSession = launched
+            launchedSession = preparedLaunch.session
+            finalizedContext = preparedLaunch.context
         }
         await finalizeSendIfCurrent(
-            context: context,
+            context: finalizedContext,
             pairing: verified,
             launchedSession: launchedSession,
             verification: verification,
@@ -274,9 +278,9 @@ extension CompanionChatModel {
         context: CompanionSendContext,
         pairing verified: VerifiedPairing,
         verification: CompanionOperationVerification,
-        generation: UInt64
-    ) async throws -> RemoteSession? {
-        prepareForNewSession()
+        generation: UInt64,
+        promptRetryFence: CompanionPromptRetryLaunchFence?
+    ) async throws -> CompanionPreparedLaunch? {
         guard !(await finishInvalidatedSendIfNeeded(
             context: context,
             generation: generation,
@@ -285,15 +289,32 @@ extension CompanionChatModel {
             activeSession: nil,
             verification: verification
         )) else { return nil }
+        let launchContext: CompanionSendContext
+        if let promptRetryFence {
+            guard let refreshedContext = promptRetryLaunchContext(
+                promptRetryFence,
+                pairing: verified.pairing
+            ) else {
+                rejectPromptRetry(
+                    context: promptRetryFence.originalContext,
+                    generation: generation
+                )
+                return nil
+            }
+            launchContext = refreshedContext
+        } else {
+            launchContext = context
+        }
+        prepareForNewSession()
         let launched: RemoteSession
         do {
             launched = try await requestLaunch(
-                context: context,
+                context: launchContext,
                 pairing: verified
             )
         } catch {
             guard !handleSupersededLaunchFailure(
-                context: context,
+                context: launchContext,
                 pairing: verified,
                 verification: verification,
                 generation: generation
@@ -303,7 +324,7 @@ extension CompanionChatModel {
         if await discardReturnedLaunchIfNeeded(
             launched,
             pairing: verified,
-            context: context,
+            context: launchContext,
             verification: verification,
             generation: generation
         ) {
@@ -311,13 +332,13 @@ extension CompanionChatModel {
         }
         guard try await confirmLaunchedFamiliar(
             launched,
-            context: context,
+            context: launchContext,
             pairing: verified,
             verification: verification,
             generation: generation
         ) else { return nil }
         guard !(await finishInvalidatedSendIfNeeded(
-            context: context,
+            context: launchContext,
             generation: generation,
             pairing: verified,
             launchedSession: launched,
@@ -326,10 +347,13 @@ extension CompanionChatModel {
         )) else { return nil }
         adoptLaunchedSession(
             launched,
-            context: context,
+            context: launchContext,
             pairing: verified
         )
-        return launched
+        return CompanionPreparedLaunch(
+            session: launched,
+            context: launchContext
+        )
     }
 
     func requestLaunch(

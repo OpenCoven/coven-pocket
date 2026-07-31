@@ -407,7 +407,13 @@ private extension ChatView {
     private func retryActiveConversation() async {
         switch settings.backend {
         case .companionClaude:
-            await companionModel.retry()
+            await companionModel.retry {
+                CompanionPromptRetrySelection(
+                    familiarID: settings.familiarID,
+                    familiar: familiarModel.selectedFamiliar,
+                    profile: familiarModel.activeProfile
+                )
+            }
         case .codex:
             await model.retry()
         }

@@ -987,6 +987,28 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertTrue(settings.contains("synchronizeFamiliarProfile()"))
     }
 
+    func testChatRetrySuppliesLiveCompanionFamiliarSelection() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let chat = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/Views/ChatView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(chat.contains("await companionModel.retry {"))
+        XCTAssertTrue(chat.contains("CompanionPromptRetrySelection("))
+        XCTAssertTrue(chat.contains("familiarID: settings.familiarID"))
+        XCTAssertTrue(
+            chat.contains("familiar: familiarModel.selectedFamiliar")
+        )
+        XCTAssertTrue(
+            chat.contains("profile: familiarModel.activeProfile")
+        )
+    }
+
     func testStartChatCreatesIdleSession() async throws {
         let engine = PocketEngine()
         let workspace = try makeWorkspace()

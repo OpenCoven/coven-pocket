@@ -12,11 +12,59 @@ struct CompanionFamiliarPresentationContext: Equatable {
     )
 }
 
+struct CompanionPromptRetrySelection: Equatable {
+    let familiarID: String?
+    let familiar: FamiliarIdentity?
+    let profile: FamiliarProfileKey?
+
+    static let empty = CompanionPromptRetrySelection(
+        familiarID: nil,
+        familiar: nil,
+        profile: nil
+    )
+}
+
+struct CompanionPromptRetryResolution {
+    let context: CompanionSendContext
+    let requiresSelectionFence: Bool
+}
+
+struct CompanionPromptRetryLaunchFence {
+    let originalContext: CompanionSendContext
+    let currentSelection: @MainActor () -> CompanionPromptRetrySelection
+}
+
+struct CompanionPreparedPromptRetry {
+    let context: CompanionSendContext
+    let launchFence: CompanionPromptRetryLaunchFence?
+}
+
+struct CompanionPreparedLaunch {
+    let session: RemoteSession
+    let context: CompanionSendContext
+}
+
 struct CompanionSendContext: Equatable {
     let prompt: String
     let projectRoot: String
     let familiarID: String?
     let familiarPresentation: CompanionFamiliarPresentationContext
+
+    func bindingMissingFamiliarProfile(
+        to pairing: DaemonPairing
+    ) -> CompanionSendContext {
+        guard familiarID != nil,
+              familiarPresentation.profile == nil else { return self }
+        return CompanionSendContext(
+            prompt: prompt,
+            projectRoot: projectRoot,
+            familiarID: familiarID,
+            familiarPresentation: CompanionFamiliarPresentationContext(
+                familiar: familiarPresentation.familiar,
+                profile: .companion(pairing: pairing)
+            )
+        )
+    }
 }
 
 struct CompanionCleanupOwnership {
@@ -243,14 +291,17 @@ final class CompanionChatModel: ObservableObject {
         familiar: FamiliarIdentity? = nil,
         familiarProfile: FamiliarProfileKey? = nil,
         verificationMode: CompanionPairingVerificationMode = .request,
-        expectedTrafficEpoch: UInt64? = nil
+        expectedTrafficEpoch: UInt64? = nil,
+        promptRetrySelection: (
+            @MainActor () -> CompanionPromptRetrySelection
+        )? = nil
     ) async {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedRoot = projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedFamiliarID = Self.normalizedFamiliarID(familiarID)
         let presentation = CompanionFamiliarPresentationContext(
             familiar: familiar,
-            profile: familiarProfile
+            profile: familiarProfile?.normalized
         )
         let context = CompanionSendContext(
             prompt: trimmedPrompt,
@@ -298,13 +349,16 @@ final class CompanionChatModel: ObservableObject {
             )
             return
         }
+        var verifiedContext = context.bindingMissingFamiliarProfile(
+            to: verified.pairing
+        )
         let pairingIsCurrent = generation == operationGeneration
             && !Task.isCancelled
             && verification.isCurrent(verified, on: self)
         guard pairingIsCurrent else {
             if generation == operationGeneration, !Task.isCancelled {
                 settleSupersededSend(
-                    context: context,
+                    context: verifiedContext,
                     generation: generation
                 )
             } else {
@@ -312,6 +366,18 @@ final class CompanionChatModel: ObservableObject {
             }
             return
         }
+        guard let preparedRetry = preparePromptRetry(
+            original: verifiedContext,
+            currentSelection: promptRetrySelection,
+            pairing: verified.pairing
+        ) else {
+            rejectPromptRetry(
+                context: verifiedContext,
+                generation: generation
+            )
+            return
+        }
+        verifiedContext = preparedRetry.context
 
         canRetry = false
         retryPrompt = nil
@@ -320,15 +386,16 @@ final class CompanionChatModel: ObservableObject {
         retriesPolling = false
         do {
             try await performSend(
-                context: context,
+                context: verifiedContext,
                 pairing: verified,
                 verification: verification,
-                generation: generation
+                generation: generation,
+                promptRetryFence: preparedRetry.launchFence
             )
         } catch {
             handleSendFailure(
                 error,
-                context: context,
+                context: verifiedContext,
                 pairing: verified,
                 verification: verification,
                 generation: generation
@@ -352,7 +419,10 @@ private extension CompanionChatModel.Availability {
 }
 
 extension CompanionChatModel {
-    func retry() async {
+    func retry(
+        currentFamiliarSelection: @escaping @MainActor () ->
+            CompanionPromptRetrySelection = { .empty }
+    ) async {
         guard !isBusy else { return }
         if pendingCleanup != nil {
             let prompt = retryPrompt
@@ -375,7 +445,8 @@ extension CompanionChatModel {
                 projectRoot: projectRoot,
                 familiarID: familiarID,
                 familiar: familiarPresentation.familiar,
-                familiarProfile: familiarPresentation.profile
+                familiarProfile: familiarPresentation.profile,
+                promptRetrySelection: currentFamiliarSelection
             )
             return
         }
@@ -394,7 +465,112 @@ extension CompanionChatModel {
             projectRoot: retryProjectRoot,
             familiarID: familiarID,
             familiar: familiarPresentation.familiar,
-            familiarProfile: familiarPresentation.profile
+            familiarProfile: familiarPresentation.profile,
+            promptRetrySelection: currentFamiliarSelection
+        )
+    }
+
+    func promptRetryResolution(
+        original: CompanionSendContext,
+        currentSelection: CompanionPromptRetrySelection,
+        pairing: DaemonPairing
+    ) -> CompanionPromptRetryResolution? {
+        guard original.familiarID != nil else {
+            return CompanionPromptRetryResolution(
+                context: original,
+                requiresSelectionFence: false
+            )
+        }
+        let endpointProfile = FamiliarProfileKey.companion(pairing: pairing)
+        if original.familiarPresentation.profile?.normalized == endpointProfile {
+            return CompanionPromptRetryResolution(
+                context: original,
+                requiresSelectionFence: false
+            )
+        }
+        guard currentSelection.profile?.normalized == endpointProfile,
+              let familiar = currentSelection.familiar,
+              let selectedID = Self.normalizedFamiliarID(familiar.id),
+              let settingsID = Self.normalizedFamiliarID(
+                  currentSelection.familiarID
+              ),
+              selectedID.caseInsensitiveCompare(settingsID) == .orderedSame
+        else {
+            return nil
+        }
+        return CompanionPromptRetryResolution(
+            context: CompanionSendContext(
+                prompt: original.prompt,
+                projectRoot: original.projectRoot,
+                familiarID: selectedID,
+                familiarPresentation: CompanionFamiliarPresentationContext(
+                    familiar: familiar,
+                    profile: endpointProfile
+                )
+            ),
+            requiresSelectionFence: true
+        )
+    }
+
+    func preparePromptRetry(
+        original: CompanionSendContext,
+        currentSelection: (
+            @MainActor () -> CompanionPromptRetrySelection
+        )?,
+        pairing: DaemonPairing
+    ) -> CompanionPreparedPromptRetry? {
+        guard let currentSelection else {
+            return CompanionPreparedPromptRetry(
+                context: original,
+                launchFence: nil
+            )
+        }
+        guard let resolution = promptRetryResolution(
+            original: original,
+            currentSelection: currentSelection(),
+            pairing: pairing
+        ) else {
+            return nil
+        }
+        let launchFence = resolution.requiresSelectionFence
+            ? CompanionPromptRetryLaunchFence(
+                originalContext: original,
+                currentSelection: currentSelection
+            )
+            : nil
+        return CompanionPreparedPromptRetry(
+            context: resolution.context,
+            launchFence: launchFence
+        )
+    }
+
+    func promptRetryLaunchContext(
+        _ fence: CompanionPromptRetryLaunchFence,
+        pairing: DaemonPairing
+    ) -> CompanionSendContext? {
+        promptRetryResolution(
+            original: fence.originalContext,
+            currentSelection: fence.currentSelection(),
+            pairing: pairing
+        )?.context
+    }
+
+    func rejectPromptRetry(
+        context: CompanionSendContext,
+        generation: UInt64
+    ) {
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
+        isBusy = false
+        setRetryContext(context)
+        items.append(
+            ChatItem(
+                kind: .error,
+                text: "Choose a familiar for this daemon before retrying."
+            )
         )
     }
 
