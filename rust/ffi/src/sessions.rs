@@ -89,9 +89,6 @@ struct SessionLifecycle {
 static SESSION_LIFECYCLE_LOCK: LazyLock<tokio::sync::RwLock<SessionLifecycle>> =
     LazyLock::new(|| tokio::sync::RwLock::new(SessionLifecycle::default()));
 
-static ROOT_COMPONENTS_REQUIRING_PARENT_SYNC: LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
-
 #[cfg(test)]
 #[derive(Default)]
 struct SessionTestFaults {
@@ -125,8 +122,25 @@ static DIRECTORY_SYNC_EVENTS: LazyLock<std::sync::Mutex<Vec<PathBuf>>> =
     LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
-static DIRECTORY_SYNC_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+#[derive(Clone, Copy)]
+struct DirectorySyncFailure {
+    skip: usize,
+    remaining: usize,
+    kind: std::io::ErrorKind,
+}
+
+#[cfg(test)]
+static DIRECTORY_SYNC_FAILURES: LazyLock<std::sync::Mutex<HashMap<PathBuf, DirectorySyncFailure>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static ROOT_PARENT_ACCESS_FAILURES: LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, DirectorySyncFailure>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static ROOT_PARENT_ACCESS_EVENTS: LazyLock<std::sync::Mutex<Vec<PathBuf>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,7 +218,7 @@ fn persistence_err(path: &Path, reason: impl std::fmt::Display) -> PocketError {
 }
 
 #[cfg(test)]
-fn record_directory_sync_attempt(path: &Path, context: &str) -> Result<(), PocketError> {
+fn record_directory_sync_attempt(path: &Path) -> std::io::Result<()> {
     DIRECTORY_SYNC_EVENTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -212,13 +226,17 @@ fn record_directory_sync_attempt(path: &Path, context: &str) -> Result<(), Pocke
     let mut failures = DIRECTORY_SYNC_FAILURES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(remaining) = failures.get_mut(path) {
-        if *remaining > 0 {
-            *remaining -= 1;
-            return Err(engine_err(
-                context,
-                std::io::Error::other("injected directory sync failure"),
-            ));
+    if let Some(failure) = failures.get_mut(path) {
+        if failure.skip > 0 {
+            failure.skip -= 1;
+        } else if failure.remaining > 0 {
+            failure.remaining -= 1;
+            let message = if failure.kind == std::io::ErrorKind::PermissionDenied {
+                "injected permission denied"
+            } else {
+                "injected directory sync failure"
+            };
+            return Err(std::io::Error::new(failure.kind, message));
         }
     }
     Ok(())
@@ -258,27 +276,6 @@ fn remove_root_component_directory(path: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(path)
 }
 
-fn root_component_requires_parent_sync(path: &Path) -> bool {
-    ROOT_COMPONENTS_REQUIRING_PARENT_SYNC
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(path)
-}
-
-fn mark_root_component_for_parent_sync(path: &Path) {
-    ROOT_COMPONENTS_REQUIRING_PARENT_SYNC
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(path.to_path_buf());
-}
-
-fn clear_root_component_parent_sync(path: &Path) {
-    ROOT_COMPONENTS_REQUIRING_PARENT_SYNC
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(path);
-}
-
 fn normalize_storage_root(root: &Path) -> Result<PathBuf, PocketError> {
     let mut normalized = PathBuf::new();
     for component in root.components() {
@@ -304,9 +301,17 @@ enum RootComponentExpectation {
     Missing,
 }
 
-#[derive(Default)]
-struct RootWalkOutcome {
-    configured_root_parent_synced: bool,
+fn is_root_parent_access_boundary(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
+struct RootParentSyncStart {
+    component: PathBuf,
+    parent: PathBuf,
+    expectation: RootComponentExpectation,
 }
 
 /// Reject anything that is not a bare UUID before it touches a path.
@@ -401,10 +406,11 @@ impl CheckedStorage {
         })?;
 
         #[cfg(test)]
-        record_directory_sync_attempt(parent, &context)?;
+        record_directory_sync_attempt(parent).map_err(|err| engine_err(&context, err))?;
 
-        let directory = std::fs::File::open(parent)
-            .map_err(|err| engine_err(&format!("{context}: cannot open parent directory"), err))?;
+        let open_context = format!("{context}: cannot open parent directory");
+        let directory =
+            std::fs::File::open(parent).map_err(|err| engine_err(&open_context, err))?;
         directory
             .sync_all()
             .map_err(|err| engine_err(&context, err))?;
@@ -469,13 +475,169 @@ impl CheckedStorage {
         )
     }
 
-    fn walk_root_components(
-        root: &Path,
-        create_missing: bool,
-    ) -> Result<RootWalkOutcome, PocketError> {
+    fn root_parent_sync_start(root: &Path) -> Result<Option<RootParentSyncStart>, PocketError> {
+        let mut candidate = root.to_path_buf();
+        let mut first_missing = None;
+
+        loop {
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    Self::validate_existing_root_component(&candidate)?;
+                    Self::walk_root_components(&candidate, false)?;
+                    return if let Some(component) = first_missing {
+                        Ok(Some(RootParentSyncStart {
+                            component,
+                            parent: candidate,
+                            expectation: RootComponentExpectation::Missing,
+                        }))
+                    } else {
+                        Ok(candidate.parent().map(|parent| RootParentSyncStart {
+                            component: candidate.clone(),
+                            parent: parent.to_path_buf(),
+                            expectation: RootComponentExpectation::Directory,
+                        }))
+                    };
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    first_missing = Some(candidate.clone());
+                    candidate = candidate
+                        .parent()
+                        .ok_or_else(|| {
+                            persistence_err(
+                                root,
+                                "configured storage root has no existing absolute ancestor",
+                            )
+                        })?
+                        .to_path_buf();
+                }
+                Err(err) => {
+                    return Err(persistence_err(
+                        &candidate,
+                        format!("cannot inspect configured storage root component: {err}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn root_parent_can_contain_app_created_component(parent: &Path) -> Result<bool, PocketError> {
+        #[cfg(test)]
+        {
+            ROOT_PARENT_ACCESS_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(parent.to_path_buf());
+            let mut failures = ROOT_PARENT_ACCESS_FAILURES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(failure) = failures.get_mut(parent) {
+                if failure.remaining > 0 {
+                    failure.remaining -= 1;
+                    if is_root_parent_access_boundary(failure.kind) {
+                        return Ok(false);
+                    }
+                    return Err(engine_err(
+                        &format!(
+                            "cannot check configured storage root ancestor access {}",
+                            parent.display()
+                        ),
+                        std::io::Error::new(failure.kind, "injected root parent access failure"),
+                    ));
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let path = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+                persistence_err(
+                    parent,
+                    "configured storage root ancestor contains a NUL byte",
+                )
+            })?;
+            const X_OK: std::ffi::c_int = 1;
+            const W_OK: std::ffi::c_int = 2;
+            extern "C" {
+                fn access(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> std::ffi::c_int;
+            }
+
+            // SAFETY: `path` is a live NUL-terminated C string and `access` only reads it.
+            if unsafe { access(path.as_ptr(), W_OK | X_OK) } == 0 {
+                return Ok(true);
+            }
+            let err = std::io::Error::last_os_error();
+            if is_root_parent_access_boundary(err.kind()) {
+                return Ok(false);
+            }
+            Err(engine_err(
+                &format!(
+                    "cannot check configured storage root ancestor access {}",
+                    parent.display()
+                ),
+                err,
+            ))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(parent).map_err(|err| {
+                engine_err(
+                    &format!(
+                        "cannot check configured storage root ancestor access {}",
+                        parent.display()
+                    ),
+                    err,
+                )
+            })?;
+            Ok(!metadata.permissions().readonly())
+        }
+    }
+
+    fn resync_root_parent_chain(root: &Path) -> Result<(), PocketError> {
+        let Some(mut next) = Self::root_parent_sync_start(root)? else {
+            return Ok(());
+        };
+        let mut immediate = true;
+
+        loop {
+            // Bottom-up syncs make every lower entry durable first. Beyond the
+            // immediate root parent, a non-writable parent cannot contain a
+            // directory the app created, so it is a safe system boundary.
+            if !immediate
+                && (next.parent.parent().is_none()
+                    || !Self::root_parent_can_contain_app_created_component(&next.parent)?)
+            {
+                return Ok(());
+            }
+
+            match Self::sync_root_component_parent(
+                &next.component,
+                &next.parent,
+                next.expectation,
+                "cannot resync configured storage root component parent",
+            ) {
+                Ok(()) => {}
+                Err(err) => return Err(err),
+            }
+
+            let component = next.parent;
+            let Some(parent) = component.parent().map(Path::to_path_buf) else {
+                return Ok(());
+            };
+            next = RootParentSyncStart {
+                component,
+                parent,
+                expectation: RootComponentExpectation::Directory,
+            };
+            immediate = false;
+        }
+    }
+
+    fn walk_root_components(root: &Path, create_missing: bool) -> Result<(), PocketError> {
         let mut current = PathBuf::new();
         let mut has_validated_parent = false;
-        let mut outcome = RootWalkOutcome::default();
 
         for component in root.components() {
             match component {
@@ -502,24 +664,6 @@ impl CheckedStorage {
                     match std::fs::symlink_metadata(&current) {
                         Ok(_) => {
                             Self::validate_existing_root_component(&current)?;
-                            if create_missing && root_component_requires_parent_sync(&current) {
-                                let parent = current.parent().ok_or_else(|| {
-                                    persistence_err(
-                                        &current,
-                                        "configured storage root component has no parent",
-                                    )
-                                })?;
-                                Self::sync_root_component_parent(
-                                    &current,
-                                    parent,
-                                    RootComponentExpectation::Directory,
-                                    "cannot re-sync uncertain configured storage root component parent",
-                                )?;
-                                clear_root_component_parent_sync(&current);
-                                if current == root {
-                                    outcome.configured_root_parent_synced = true;
-                                }
-                            }
                         }
                         Err(err)
                             if create_missing && err.kind() == std::io::ErrorKind::NotFound =>
@@ -562,26 +706,18 @@ impl CheckedStorage {
                                 "cannot sync configured storage root component parent",
                             );
                             if let Err(sync_err) = sync_result {
-                                mark_root_component_for_parent_sync(&current);
                                 if !created {
                                     return Err(sync_err);
                                 }
                                 return match Self::rollback_created_root_component(&current, parent)
                                 {
-                                    Ok(()) => {
-                                        clear_root_component_parent_sync(&current);
-                                        Err(sync_err)
-                                    }
+                                    Ok(()) => Err(sync_err),
                                     Err(rollback_err) => Err(PocketError::Engine {
                                         message: format!(
                                             "{sync_err}; rollback also failed: {rollback_err}"
                                         ),
                                     }),
                                 };
-                            }
-                            clear_root_component_parent_sync(&current);
-                            if current == root {
-                                outcome.configured_root_parent_synced = true;
                             }
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -606,7 +742,7 @@ impl CheckedStorage {
                 }
             }
         }
-        Ok(outcome)
+        Ok(())
     }
 
     fn open_path(root: PathBuf, display_path: &str) -> Result<Self, PocketError> {
@@ -616,22 +752,9 @@ impl CheckedStorage {
             });
         }
         let root = normalize_storage_root(&root)?;
-        let walk = Self::walk_root_components(&root, true)?;
+        Self::resync_root_parent_chain(&root)?;
+        Self::walk_root_components(&root, true)?;
         Self::walk_root_components(&root, false)?;
-        if !walk.configured_root_parent_synced {
-            if let Some(parent) = root.parent() {
-                if let Err(sync_err) = Self::sync_root_component_parent(
-                    &root,
-                    parent,
-                    RootComponentExpectation::Directory,
-                    "cannot sync configured storage root component parent",
-                ) {
-                    mark_root_component_for_parent_sync(&root);
-                    return Err(sync_err);
-                }
-                clear_root_component_parent_sync(&root);
-            }
-        }
         let canonical_root = std::fs::canonicalize(&root)
             .map_err(|err| engine_err("cannot canonicalize storage dir", err))?;
         let storage = Self {
@@ -1543,7 +1666,7 @@ fn sync_directory(storage: &CheckedStorage, path: &Path, context: &str) -> Resul
         storage.validate_directory(path, false)?;
     }
     #[cfg(test)]
-    record_directory_sync_attempt(path, context)?;
+    record_directory_sync_attempt(path).map_err(|err| engine_err(context, err))?;
 
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -5846,14 +5969,54 @@ mod tests {
     }
 
     fn fail_directory_sync(path: &Path, count: usize) {
+        fail_directory_sync_after(path, 0, count, std::io::ErrorKind::Other);
+    }
+
+    fn fail_directory_sync_with_kind(path: &Path, count: usize, kind: std::io::ErrorKind) {
+        fail_directory_sync_after(path, 0, count, kind);
+    }
+
+    fn fail_directory_sync_after(path: &Path, skip: usize, count: usize, kind: std::io::ErrorKind) {
         DIRECTORY_SYNC_FAILURES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.to_path_buf(), count);
+            .insert(
+                path.to_path_buf(),
+                DirectorySyncFailure {
+                    skip,
+                    remaining: count,
+                    kind,
+                },
+            );
     }
 
     fn clear_directory_sync_failure(path: &Path) {
         DIRECTORY_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(path);
+    }
+
+    fn deny_root_parent_access(path: &Path, count: usize) {
+        fail_root_parent_access(path, count, std::io::ErrorKind::PermissionDenied);
+    }
+
+    fn fail_root_parent_access(path: &Path, count: usize, kind: std::io::ErrorKind) {
+        ROOT_PARENT_ACCESS_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                path.to_path_buf(),
+                DirectorySyncFailure {
+                    skip: 0,
+                    remaining: count,
+                    kind,
+                },
+            );
+    }
+
+    fn clear_root_parent_access_failure(path: &Path) {
+        ROOT_PARENT_ACCESS_FAILURES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(path);
@@ -5921,6 +6084,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|attempt| attempt.root != root);
+    }
+
+    async fn simulate_process_restart_for_root(root: &Path) {
+        clear_module_state_for_root(root).await;
     }
 
     fn indexed_fork_id(root: &Path, source_id: &str) -> String {
@@ -9094,6 +9261,7 @@ mod tests {
         let configured = two.join("store");
         let storage_str = configured.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
+        let parent_parent = parent.parent().unwrap().to_path_buf();
 
         let persistence =
             SessionPersistence::create(&storage_str, session_id.clone(), "model".to_string(), None)
@@ -9107,6 +9275,10 @@ mod tests {
         assert_eq!(
             root_walk_events_under(&parent),
             [
+                RootWalkEvent::ParentSynced {
+                    component: parent.clone(),
+                    parent: parent_parent,
+                },
                 RootWalkEvent::Created {
                     component: one.clone(),
                     parent: parent.clone(),
@@ -9155,7 +9327,7 @@ mod tests {
         let parent = test_storage("storage-root-list-parent-sync-failure");
         let configured = parent.join("store");
         let storage_str = configured.display().to_string();
-        fail_directory_sync(&parent, 1);
+        fail_directory_sync_after(&parent, 1, 1, std::io::ErrorKind::Other);
 
         let err = match list_sessions(&storage_str).await {
             Ok(_) => panic!("root parent sync failure must fail list"),
@@ -9175,8 +9347,8 @@ mod tests {
                 .iter()
                 .filter(|path| path.as_path() == parent)
                 .count(),
-            2,
-            "the failed publication and durable rollback must both sync the parent"
+            3,
+            "preflight, failed publication, and durable rollback must sync the parent"
         );
 
         clear_directory_sync_failure(&parent);
@@ -9189,8 +9361,8 @@ mod tests {
                 .iter()
                 .filter(|path| path.as_path() == parent)
                 .count(),
-            3,
-            "retry must publish the recreated root by syncing its immediate parent"
+            5,
+            "retry must preflight and publish the recreated root through its immediate parent"
         );
 
         std::fs::remove_dir_all(parent).unwrap();
@@ -9202,7 +9374,7 @@ mod tests {
         let configured = parent.join("store");
         let storage_str = configured.display().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
-        fail_directory_sync(&parent, 1);
+        fail_directory_sync_after(&parent, 1, 1, std::io::ErrorKind::Other);
 
         let err = match SessionPersistence::create(
             &storage_str,
@@ -9237,7 +9409,7 @@ mod tests {
         let parent = test_storage("storage-root-rollback-remove-failure");
         let configured = parent.join("store");
         let storage_str = configured.display().to_string();
-        fail_directory_sync(&parent, 1);
+        fail_directory_sync_after(&parent, 1, 1, std::io::ErrorKind::Other);
         fail_directory_remove(&configured, 1);
 
         let err = match list_sessions(&storage_str).await {
@@ -9261,7 +9433,7 @@ mod tests {
                 .iter()
                 .filter(|path| path.as_path() == parent)
                 .count(),
-            1
+            2
         );
 
         clear_directory_sync_failure(&parent);
@@ -9275,7 +9447,7 @@ mod tests {
                 .iter()
                 .filter(|path| path.as_path() == parent)
                 .count(),
-            2,
+            3,
             "retry must re-sync the existing root's immediate parent"
         );
 
@@ -9283,14 +9455,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_root_intermediate_rollback_failure_retry_resyncs_that_parent() {
-        let parent = test_storage("storage-root-intermediate-rollback-failure");
+    async fn storage_root_parent_resync_after_restart_precedes_success() {
+        let parent = test_storage("storage-root-parent-resync-after-restart");
         let one = parent.join("one");
         let two = one.join("two");
         let configured = two.join("store");
         let storage_str = configured.display().to_string();
         std::fs::create_dir(&one).unwrap();
-        fail_directory_sync(&one, 1);
+        fail_directory_sync_after(&one, 1, 1, std::io::ErrorKind::Other);
         fail_directory_remove(&two, 1);
 
         let err = match list_sessions(&storage_str).await {
@@ -9303,29 +9475,45 @@ mod tests {
         assert!(two.is_dir());
         assert!(!configured.exists());
 
+        simulate_process_restart_for_root(&configured).await;
         clear_directory_sync_failure(&one);
         clear_directory_remove_failure(&two);
+        let retry_event_offset = root_walk_events_under(&parent).len();
+        let attempts_before_retry = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.as_path() == one)
+            .count();
         assert!(list_sessions(&storage_str).await.unwrap().is_empty());
-        assert_eq!(
-            root_walk_events_under(&two),
-            [
-                RootWalkEvent::Created {
-                    component: two.clone(),
-                    parent: one.clone(),
-                },
-                RootWalkEvent::ParentSynced {
-                    component: two.clone(),
-                    parent: one.clone(),
-                },
-                RootWalkEvent::Created {
-                    component: configured.clone(),
-                    parent: two.clone(),
-                },
-                RootWalkEvent::ParentSynced {
-                    component: configured,
-                    parent: two,
-                },
-            ]
+        let retry_events = root_walk_events_under(&parent)
+            .into_iter()
+            .skip(retry_event_offset)
+            .collect::<Vec<_>>();
+        let survivor_sync = retry_events
+            .iter()
+            .position(|event| {
+                event
+                    == &RootWalkEvent::ParentSynced {
+                        component: two.clone(),
+                        parent: one.clone(),
+                    }
+            })
+            .expect("restart must resync the surviving intermediate's parent");
+        let configured_create = retry_events
+            .iter()
+            .position(|event| {
+                event
+                    == &RootWalkEvent::Created {
+                        component: configured.clone(),
+                        parent: two.clone(),
+                    }
+            })
+            .expect("retry must create the configured root");
+        assert!(
+            survivor_sync < configured_create,
+            "surviving intermediate must be durable before creating storage artifacts: \
+             {retry_events:?}"
         );
         assert_eq!(
             DIRECTORY_SYNC_EVENTS
@@ -9334,11 +9522,248 @@ mod tests {
                 .iter()
                 .filter(|path| path.as_path() == one)
                 .count(),
-            2,
+            attempts_before_retry + 1,
             "retry must re-sync the immediate parent of the uncertain component"
         );
 
         std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_root_parent_resync_failure_after_restart_blocks_artifacts_until_sync() {
+        let parent = test_storage("storage-root-parent-resync-retry-failure");
+        let one = parent.join("one");
+        let two = one.join("two");
+        let configured = two.join("store");
+        let storage_str = configured.display().to_string();
+        std::fs::create_dir(&one).unwrap();
+        fail_directory_sync_after(&one, 1, 1, std::io::ErrorKind::Other);
+        fail_directory_remove(&two, 1);
+
+        let first_err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("intermediate root sync and rollback failure must fail list"),
+            Err(err) => err,
+        };
+        assert!(first_err
+            .to_string()
+            .contains("injected directory removal failure"));
+        assert!(two.is_dir());
+        assert!(!configured.exists());
+
+        simulate_process_restart_for_root(&configured).await;
+        clear_directory_sync_failure(&one);
+        clear_directory_remove_failure(&two);
+        fail_directory_sync(&one, 1);
+        let attempts_before_restart = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.as_path() == one)
+            .count();
+
+        let restart_err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("restart resync failure must keep storage closed"),
+            Err(err) => err,
+        };
+        assert!(restart_err
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert!(
+            !configured.exists(),
+            "restart recovery must fail before recreating the configured root"
+        );
+        assert!(!configured.join("index.sqlite").exists());
+
+        let attempts_after_failure = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.as_path() == one)
+            .count();
+        assert_eq!(
+            attempts_after_failure,
+            attempts_before_restart + 1,
+            "restart must actually attempt the forgotten parent fsync"
+        );
+
+        clear_directory_sync_failure(&one);
+        assert!(list_sessions(&storage_str).await.unwrap().is_empty());
+        assert!(configured.join("index.sqlite").is_file());
+        assert_eq!(
+            DIRECTORY_SYNC_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|path| path.as_path() == one)
+                .count(),
+            attempts_after_failure + 1,
+            "later success must clear uncertainty with another actual parent fsync"
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn storage_root_parent_resync_stops_at_higher_inaccessible_ancestor() {
+        let outer = test_storage("storage-root-parent-resync-inaccessible");
+        let system = outer.join("system");
+        let container = system.join("container");
+        let library = container.join("Library");
+        let app_support = library.join("Application Support");
+        let configured = app_support.join("chat-sessions");
+        std::fs::create_dir_all(&configured).unwrap();
+        deny_root_parent_access(&system, 1);
+
+        let sync_offset = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let access_offset = ROOT_PARENT_ACCESS_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let result = CheckedStorage::open(&configured.display().to_string());
+        let syncs = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .skip(sync_offset)
+            .filter(|path| path.starts_with(&outer))
+            .cloned()
+            .collect::<Vec<_>>();
+        let accesses = ROOT_PARENT_ACCESS_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .skip(access_offset)
+            .filter(|path| path.starts_with(&outer))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        clear_root_parent_access_failure(&system);
+        std::fs::remove_dir_all(&outer).unwrap();
+
+        result.unwrap();
+        assert!(
+            syncs.len() >= 3,
+            "accessible descendants were not resynced bottom-up: {syncs:?}"
+        );
+        assert_eq!(
+            &syncs[..3],
+            &[app_support.clone(), library.clone(), container.clone()]
+        );
+        assert!(
+            !syncs.contains(&system),
+            "inaccessible system ancestor must not be fsynced: {syncs:?}"
+        );
+        assert_eq!(accesses.last(), Some(&system));
+        assert!(
+            !accesses.contains(&outer),
+            "walk must stop at the first inaccessible ancestor: {accesses:?}"
+        );
+    }
+
+    #[test]
+    fn storage_root_parent_resync_stops_at_higher_read_only_ancestor() {
+        let outer = test_storage("storage-root-parent-resync-read-only");
+        let system = outer.join("system");
+        let container = system.join("container");
+        let app_support = container.join("Library").join("Application Support");
+        let configured = app_support.join("chat-sessions");
+        std::fs::create_dir_all(&configured).unwrap();
+        fail_root_parent_access(&system, 1, std::io::ErrorKind::ReadOnlyFilesystem);
+
+        let result = CheckedStorage::open(&configured.display().to_string());
+
+        clear_root_parent_access_failure(&system);
+        std::fs::remove_dir_all(&outer).unwrap();
+
+        result.expect("read-only system ancestor must be a safe stop boundary");
+    }
+
+    #[test]
+    fn storage_root_parent_resync_propagates_sync_denial_for_creatable_ancestor() {
+        let outer = test_storage("storage-root-parent-resync-creatable-denial");
+        let ancestor = outer.join("ancestor");
+        let parent = ancestor.join("parent");
+        let configured = parent.join("chat-sessions");
+        std::fs::create_dir_all(&configured).unwrap();
+        fail_directory_sync_with_kind(&ancestor, 1, std::io::ErrorKind::PermissionDenied);
+
+        let result = CheckedStorage::open(&configured.display().to_string());
+
+        clear_directory_sync_failure(&ancestor);
+        std::fs::remove_dir_all(&outer).unwrap();
+
+        let err = result.expect_err("a creatable ancestor's fsync denial must remain fatal");
+        assert!(err.to_string().contains("injected permission denied"));
+    }
+
+    #[tokio::test]
+    async fn storage_root_parent_resync_immediate_parent_denial_is_fatal() {
+        let parent = test_storage("storage-root-parent-resync-immediate-denial");
+        let configured = parent.join("chat-sessions");
+        std::fs::create_dir(&configured).unwrap();
+        fail_directory_sync_with_kind(&parent, 1, std::io::ErrorKind::PermissionDenied);
+
+        let result = list_sessions(&configured.display().to_string()).await;
+        let index_exists = configured.join("index.sqlite").exists();
+
+        clear_directory_sync_failure(&parent);
+        std::fs::remove_dir_all(&parent).unwrap();
+
+        let err = match result {
+            Ok(_) => panic!("immediate root parent denial must fail open"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("permission denied"));
+        assert!(!index_exists);
+    }
+
+    #[test]
+    fn storage_root_parent_resync_existing_app_support_avoids_system_ancestors() {
+        let outer = test_storage("storage-root-parent-resync-app-support");
+        let application = outer
+            .join("private")
+            .join("var")
+            .join("mobile")
+            .join("Containers/Data/Application/00000000-0000-0000-0000-000000000000");
+        let library = application.join("Library");
+        let app_support = library.join("Application Support");
+        let configured = app_support.join("chat-sessions");
+        let system_ancestor = application.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&configured).unwrap();
+        deny_root_parent_access(&system_ancestor, 1);
+
+        let sync_offset = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let result = CheckedStorage::open(&configured.display().to_string());
+        let syncs = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .skip(sync_offset)
+            .filter(|path| path.starts_with(&outer))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        clear_root_parent_access_failure(&system_ancestor);
+        std::fs::remove_dir_all(&outer).unwrap();
+
+        result.unwrap();
+        assert!(syncs.contains(&app_support));
+        assert!(syncs.contains(&library));
+        assert!(syncs.contains(&application));
+        assert!(
+            !syncs.contains(&system_ancestor),
+            "normal app-support open must not fsync inaccessible system ancestors: {syncs:?}"
+        );
+        assert!(
+            !syncs.contains(&outer),
+            "normal app-support open must not continue above the access boundary: {syncs:?}"
+        );
     }
 
     #[cfg(unix)]
