@@ -255,6 +255,26 @@ final class ChatSurfaceTests: XCTestCase {
         )
     }
 
+    func testAppBodyUsesStableRootWindowState() throws {
+        let appRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: appRoot.appendingPathComponent(
+                "Sources/CovenPocketApp.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(
+            source.contains("@StateObject private var rootWindowState")
+        )
+        XCTAssertTrue(
+            source.contains("RootView(windowState: rootWindowState)")
+        )
+        XCTAssertFalse(source.contains("rootWindowFactory.makeRoot()"))
+    }
+
     @MainActor
     func testStandaloneRootInitializerIsExplicit() {
         let client = EngineClient(engine: SuspendedAuthEngine())

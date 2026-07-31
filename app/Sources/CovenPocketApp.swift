@@ -13,7 +13,7 @@ struct CovenPocketAppDependencies {
 @main
 struct CovenPocketApp: App {
     @StateObject private var router = AppRouter.shared
-    @StateObject private var engineClient: EngineClient
+    @StateObject private var rootWindowState: RootWindowState
     let rootWindowFactory: RootWindowFactory
 
     init() {
@@ -21,17 +21,18 @@ struct CovenPocketApp: App {
     }
 
     init(dependencies: CovenPocketAppDependencies) {
-        _engineClient = StateObject(
-            wrappedValue: dependencies.engineClient
-        )
-        rootWindowFactory = RootWindowFactory(
+        let factory = RootWindowFactory(
             client: dependencies.engineClient
+        )
+        rootWindowFactory = factory
+        _rootWindowState = StateObject(
+            wrappedValue: factory.makeWindowState()
         )
     }
 
     var body: some Scene {
         WindowGroup {
-            rootWindowFactory.makeRoot()
+            RootView(windowState: rootWindowState)
                 // Spotlight result taps arrive as index continuations.
                 .onContinueUserActivity(CSSearchableItemActionType) { activity in
                     guard
