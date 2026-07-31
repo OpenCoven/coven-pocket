@@ -67,6 +67,15 @@ struct CompanionSendContext: Equatable {
     }
 }
 
+struct CompanionContextualSendError: LocalizedError {
+    let underlying: Error
+    let context: CompanionSendContext
+
+    var errorDescription: String? {
+        underlying.localizedDescription
+    }
+}
+
 struct CompanionCleanupOwnership {
     let sessionID: String
     let generation: UInt64
@@ -393,9 +402,10 @@ final class CompanionChatModel: ObservableObject {
                 promptRetryFence: preparedRetry.launchFence
             )
         } catch {
+            let contextualError = error as? CompanionContextualSendError
             handleSendFailure(
-                error,
-                context: verifiedContext,
+                contextualError?.underlying ?? error,
+                context: contextualError?.context ?? verifiedContext,
                 pairing: verified,
                 verification: verification,
                 generation: generation

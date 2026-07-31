@@ -305,55 +305,62 @@ extension CompanionChatModel {
         } else {
             launchContext = context
         }
-        prepareForNewSession()
-        let launched: RemoteSession
         do {
-            launched = try await requestLaunch(
+            prepareForNewSession()
+            let launched: RemoteSession
+            do {
+                launched = try await requestLaunch(
+                    context: launchContext,
+                    pairing: verified
+                )
+            } catch {
+                guard !handleSupersededLaunchFailure(
+                    context: launchContext,
+                    pairing: verified,
+                    verification: verification,
+                    generation: generation
+                ) else { return nil }
+                throw error
+            }
+            if await discardReturnedLaunchIfNeeded(
+                launched,
+                pairing: verified,
                 context: launchContext,
-                pairing: verified
-            )
-        } catch {
-            guard !handleSupersededLaunchFailure(
+                verification: verification,
+                generation: generation
+            ) {
+                return nil
+            }
+            guard try await confirmLaunchedFamiliar(
+                launched,
                 context: launchContext,
                 pairing: verified,
                 verification: verification,
                 generation: generation
             ) else { return nil }
-            throw error
+            guard !(await finishInvalidatedSendIfNeeded(
+                context: launchContext,
+                generation: generation,
+                pairing: verified,
+                launchedSession: launched,
+                activeSession: nil,
+                verification: verification
+            )) else { return nil }
+            adoptLaunchedSession(
+                launched,
+                context: launchContext,
+                pairing: verified
+            )
+            return CompanionPreparedLaunch(
+                session: launched,
+                context: launchContext
+            )
+        } catch {
+            throw CompanionContextualSendError(
+                underlying: error,
+                context: launchContext
+            )
         }
-        if await discardReturnedLaunchIfNeeded(
-            launched,
-            pairing: verified,
-            context: launchContext,
-            verification: verification,
-            generation: generation
-        ) {
-            return nil
-        }
-        guard try await confirmLaunchedFamiliar(
-            launched,
-            context: launchContext,
-            pairing: verified,
-            verification: verification,
-            generation: generation
-        ) else { return nil }
-        guard !(await finishInvalidatedSendIfNeeded(
-            context: launchContext,
-            generation: generation,
-            pairing: verified,
-            launchedSession: launched,
-            activeSession: nil,
-            verification: verification
-        )) else { return nil }
-        adoptLaunchedSession(
-            launched,
-            context: launchContext,
-            pairing: verified
-        )
-        return CompanionPreparedLaunch(
-            session: launched,
-            context: launchContext
-        )
     }
 
     func requestLaunch(

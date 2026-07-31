@@ -181,6 +181,10 @@ final class CompanionChatFamiliarTests: XCTestCase {
 
         XCTAssertEqual(model.retryFamiliarID, "sage")
         XCTAssertEqual(
+            model.retryFamiliarPresentation.familiar,
+            presentation
+        )
+        XCTAssertEqual(
             model.retryFamiliarPresentation.profile,
             .companion(pairing: pairing)
         )
@@ -412,6 +416,265 @@ final class CompanionChatFamiliarTests: XCTestCase {
                 )
             }
         )
+    }
+
+    func testLaunchFailureAfterRetryFenceRetainsAttemptedFamiliarContext() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        client.launchError = .polling
+        let model = CompanionChatModel(client: client)
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "muse",
+            familiar: companionFamiliar(id: "muse", name: "Muse on A"),
+            familiarProfile: .companion(pairing: pairingA)
+        )
+        let forgeB = CompanionPromptRetrySelection(
+            familiarID: "forge",
+            familiar: companionFamiliar(id: "forge", name: "Forge on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        let sageB = CompanionPromptRetrySelection(
+            familiarID: "sage",
+            familiar: companionFamiliar(
+                id: "sage",
+                name: "Sage on B",
+                role: "B role"
+            ),
+            profile: .companion(pairing: pairingB)
+        )
+        var selectionReadCount = 0
+
+        client.gate = .ready(pairingB)
+        await model.retry {
+            selectionReadCount += 1
+            return selectionReadCount == 1 ? forgeB : sageB
+        }
+
+        XCTAssertGreaterThanOrEqual(selectionReadCount, 2)
+        XCTAssertEqual(client.launchedFamiliarIDs, ["muse", "sage"])
+        XCTAssertEqual(model.retryFamiliarID, "sage")
+        XCTAssertEqual(model.retryFamiliarPresentation.familiar, sageB.familiar)
+        XCTAssertEqual(
+            model.retryFamiliarPresentation.profile,
+            .companion(pairing: pairingB)
+        )
+
+        client.launchError = nil
+        var nextSelectionReadCount = 0
+        await model.retry {
+            nextSelectionReadCount += 1
+            return forgeB
+        }
+
+        XCTAssertEqual(nextSelectionReadCount, 1)
+        XCTAssertEqual(client.launchedFamiliarIDs, ["muse", "sage", "sage"])
+        XCTAssertEqual(model.sessionFamiliar, sageB.familiar)
+    }
+
+    func testLaunchFailureAfterRetryFenceRetainsAttemptedSameIDMetadata() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        client.launchError = .polling
+        let model = CompanionChatModel(client: client)
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "sage",
+            familiar: companionFamiliar(id: "sage", name: "Sage on A"),
+            familiarProfile: .companion(pairing: pairingA)
+        )
+        let staleSageB = CompanionPromptRetrySelection(
+            familiarID: "sage",
+            familiar: companionFamiliar(id: "sage", name: "Old Sage on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        let attemptedSageB = CompanionPromptRetrySelection(
+            familiarID: "sage",
+            familiar: companionFamiliar(
+                id: "sage",
+                name: "Current Sage on B",
+                role: "Updated B role"
+            ),
+            profile: .companion(pairing: pairingB)
+        )
+        var selectionReadCount = 0
+
+        client.gate = .ready(pairingB)
+        await model.retry {
+            selectionReadCount += 1
+            return selectionReadCount == 1 ? staleSageB : attemptedSageB
+        }
+
+        XCTAssertGreaterThanOrEqual(selectionReadCount, 2)
+        XCTAssertEqual(client.launchedFamiliarIDs, ["sage", "sage"])
+        XCTAssertEqual(model.retryFamiliarID, "sage")
+        XCTAssertEqual(
+            model.retryFamiliarPresentation.familiar,
+            attemptedSageB.familiar
+        )
+        XCTAssertEqual(
+            model.retryFamiliarPresentation.profile,
+            .companion(pairing: pairingB)
+        )
+    }
+
+    func testConfirmationCleanupFailureRetainsAttemptedRetryContext() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        client.launchError = .polling
+        let model = CompanionChatModel(client: client)
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "muse",
+            familiar: companionFamiliar(id: "muse", name: "Muse on A"),
+            familiarProfile: .companion(pairing: pairingA)
+        )
+        let forgeB = CompanionPromptRetrySelection(
+            familiarID: "forge",
+            familiar: companionFamiliar(id: "forge", name: "Forge on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        let sageB = CompanionPromptRetrySelection(
+            familiarID: "sage",
+            familiar: companionFamiliar(id: "sage", name: "Sage on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        var selectionReadCount = 0
+
+        client.launchError = nil
+        client.echoesRequestedFamiliarID = false
+        client.launchResponseFamiliarID = "forge"
+        client.killError = .polling
+        client.gate = .ready(pairingB)
+        await model.retry {
+            selectionReadCount += 1
+            return selectionReadCount == 1 ? forgeB : sageB
+        }
+
+        XCTAssertGreaterThanOrEqual(selectionReadCount, 2)
+        XCTAssertEqual(client.launchedFamiliarIDs, ["muse", "sage"])
+        XCTAssertTrue(model.hasPendingCleanup)
+        XCTAssertEqual(model.retryFamiliarID, "sage")
+        XCTAssertEqual(model.retryFamiliarPresentation.familiar, sageB.familiar)
+        XCTAssertEqual(
+            model.retryFamiliarPresentation.profile,
+            .companion(pairing: pairingB)
+        )
+        XCTAssertTrue(
+            model.items.contains {
+                $0.kind == .error
+                    && $0.text.contains(
+                        "did not confirm the selected familiar"
+                    )
+            }
+        )
+    }
+
+    func testSupersededRetryLaunchFailureKeepsAttemptedContextWithoutError() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let pairingC = pairedDaemon(host: "c.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        client.launchError = .polling
+        let model = CompanionChatModel(client: client)
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "muse",
+            familiar: companionFamiliar(id: "muse", name: "Muse on A"),
+            familiarProfile: .companion(pairing: pairingA)
+        )
+        let forgeB = CompanionPromptRetrySelection(
+            familiarID: "forge",
+            familiar: companionFamiliar(id: "forge", name: "Forge on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        let sageB = CompanionPromptRetrySelection(
+            familiarID: "sage",
+            familiar: companionFamiliar(id: "sage", name: "Sage on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        var selectionReadCount = 0
+        client.gate = .ready(pairingB)
+        client.suspendsLaunch = true
+
+        let retry = Task {
+            await model.retry {
+                selectionReadCount += 1
+                return selectionReadCount == 1 ? forgeB : sageB
+            }
+        }
+        await fulfillment(of: [client.launchRequested], timeout: 1)
+        client.gate = .ready(pairingC)
+        let refreshed = await model.refreshAvailability()
+        XCTAssertTrue(refreshed)
+        client.resumeLaunch()
+        await retry.value
+
+        XCTAssertEqual(model.availability, .ready(pairingC))
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+        XCTAssertTrue(model.canRetry)
+        XCTAssertEqual(model.retryFamiliarID, "sage")
+        XCTAssertEqual(
+            model.retryFamiliarPresentation.familiar,
+            sageB.familiar
+        )
+        XCTAssertEqual(
+            model.retryFamiliarPresentation.profile,
+            .companion(pairing: pairingB)
+        )
+    }
+
+    func testCancelledRetryLaunchFailureClearsContextWithoutError() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        client.launchError = .polling
+        let model = CompanionChatModel(client: client)
+        await model.send(
+            prompt: "first",
+            projectRoot: "/srv/repo",
+            familiarID: "muse",
+            familiar: companionFamiliar(id: "muse", name: "Muse on A"),
+            familiarProfile: .companion(pairing: pairingA)
+        )
+        let forgeB = CompanionPromptRetrySelection(
+            familiarID: "forge",
+            familiar: companionFamiliar(id: "forge", name: "Forge on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        let sageB = CompanionPromptRetrySelection(
+            familiarID: "sage",
+            familiar: companionFamiliar(id: "sage", name: "Sage on B"),
+            profile: .companion(pairing: pairingB)
+        )
+        var selectionReadCount = 0
+        client.gate = .ready(pairingB)
+        client.suspendsLaunch = true
+
+        let retry = Task {
+            await model.retry {
+                selectionReadCount += 1
+                return selectionReadCount == 1 ? forgeB : sageB
+            }
+        }
+        await fulfillment(of: [client.launchRequested], timeout: 1)
+        retry.cancel()
+        client.resumeLaunch()
+        await retry.value
+
+        XCTAssertFalse(model.items.contains { $0.kind == .error })
+        XCTAssertNil(model.retryPrompt)
+        XCTAssertNil(model.retryFamiliarID)
+        XCTAssertEqual(model.retryFamiliarPresentation, .empty)
+        XCTAssertFalse(model.canRetry)
+        XCTAssertFalse(model.isBusy)
     }
 
     func testEndpointChangeDuringRetryGateRetainsBoundPrompt() async {
