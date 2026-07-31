@@ -184,6 +184,15 @@ must return explicit errors to Pocket.
 The upstream change must therefore make status transitions verify that they
 actually affected the intended goal.
 
+### Durable query-message events
+
+The query loop will emit a typed event whenever a finalized assistant or
+tool-result message becomes durable, after placeholder/snapshot finalization
+but before automatic compaction can rewrite its working context. Engine-only
+recovery and continuation nudges do not emit durable events. This additive
+event lets non-CLI consumers persist a full transcript without deriving output
+from mutable message-vector positions.
+
 ### Pin discipline
 
 The upstream PR will be tested and merged first. Pocket will then update the
@@ -232,7 +241,8 @@ generic command string.
 - optional token budget;
 - cumulative tokens used;
 - cumulative elapsed seconds;
-- turns used; and
+- turns used;
+- the engine's maximum turns; and
 - updated timestamp.
 
 `GoalRunStopReason` distinguishes completion, user/background pause,
@@ -291,6 +301,11 @@ messages. They remain available to the current model turn but are not rendered
 as ordinary composer submissions. Assistant and tool results continue to be
 persisted through the existing transcript publication path.
 
+Pocket keeps the full durable/UI transcript separate from the query loop's
+working history. The working history may be compacted by coven-code; durable
+message events append exact output to the full transcript. Continuations and
+other engine-internal control prompts stay only in working history.
+
 Resume reloads the transcript and durable goal, seeds cumulative accounting
 from `Goal.tokens_used`, then begins with the engine-provided continuation
 message. It does not create a second initiating user bubble.
@@ -301,11 +316,13 @@ recorded by the run's shared `CostTracker`. Per-turn trackers are not used.
 
 ### Errors
 
-Objective validation, malformed budgets, invalid transitions, storage errors,
-query failures, and progress-write failures are typed FFI errors and become
-visible in the in-app goal card. If an error occurs after a goal becomes
-active, the runner best-effort transitions it to paused; failure of that
-transition is included in the surfaced error rather than swallowed.
+Objective validation, malformed budgets, invalid transitions, and initial
+storage failures are typed FFI errors. After a run becomes active, its typed
+terminal result distinguishes runtime and storage errors and carries the real
+message plus the last readable snapshot. These failures become visible in the
+in-app goal card. The runner best-effort transitions an active goal to paused
+and publishes that snapshot before returning; failure of that transition is
+included in the surfaced message rather than swallowed.
 
 Ordinary chat remains usable when the goal store is unavailable, but goal
 commands report the storage failure and do not create success-shaped UI state.
@@ -318,14 +335,15 @@ message submission.
 - Leading and trailing whitespace is ignored.
 - Command words are ASCII case-sensitive and must match exactly.
 - `/goal <objective>` uses no token budget.
-- `/goal --tokens <budget> <objective>` requires a positive base-10 `UInt64`
-  and a non-empty objective.
+- `/goal --tokens <budget> <objective>` requires a positive base-10 integer no
+  greater than `Int64.max` (the SQLite integer limit) and a non-empty
+  objective.
 - `status`, `pause`, `resume`, and `clear` take no additional arguments.
 - Only the exact one-word forms `status`, `pause`, `resume`, and `clear` are
   actions. The same words followed by more objective text are ordinary
   objectives.
-- Unknown flags, overflow, missing arguments, and extra action arguments produce
-  concise local usage errors and are not sent to the model.
+- Unknown flags, overflow, and missing arguments produce concise local usage
+  errors and are not sent to the model.
 
 The composer is disabled while a goal is actively running. The existing Stop
 control becomes a Pause action for that state. A paused goal does not prevent
@@ -450,6 +468,9 @@ activity's content state as evidence that execution is alive.
   snapshot uses the same canonical session ID.
 - UI state is mutated only on `@MainActor`; UniFFI callbacks hop from Rust
   threads before touching it.
+- Goal callbacks and ActivityKit operations are generation- and
+  sequence-fenced so stale active progress cannot overwrite a later terminal
+  state.
 - A session cannot be deleted while installed or running.
 - Deletion removes the matching goal; fork never copies it.
 - A Familiar snapshot is pinned exactly as it is for ordinary chat and cannot
