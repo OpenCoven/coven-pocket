@@ -134,6 +134,17 @@ static DIRECTORY_SYNC_EVENTS: LazyLock<std::sync::Mutex<Vec<PathBuf>>> =
     LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TranscriptSyncEvent {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+static TRANSCRIPT_SYNC_EVENTS: LazyLock<std::sync::Mutex<Vec<TranscriptSyncEvent>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct DirectorySyncFailure {
     skip: usize,
@@ -1267,10 +1278,35 @@ fn prepare_transcript_append(
     })
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TranscriptDurability {
+    Immediate,
+    Deferred,
+}
+
+fn sync_transcript_file(
+    storage: &CheckedStorage,
+    path: &Path,
+    file: &std::fs::File,
+) -> std::io::Result<()> {
+    #[cfg(not(test))]
+    let _ = (storage, path);
+    #[cfg(test)]
+    TRANSCRIPT_SYNC_EVENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(TranscriptSyncEvent {
+            root: storage.root().to_path_buf(),
+            path: path.to_path_buf(),
+        });
+    file.sync_all()
+}
+
 fn append_transcript_entry(
     storage: &CheckedStorage,
     path: &Path,
     prepared: &PreparedTranscriptAppend,
+    durability: TranscriptDurability,
 ) -> Result<(), TranscriptAppendError> {
     #[cfg(test)]
     {
@@ -1328,8 +1364,8 @@ fn append_transcript_entry(
     if write_result.is_ok() {
         write_result = file.flush();
     }
-    if write_result.is_ok() {
-        write_result = file.sync_all();
+    if write_result.is_ok() && durability == TranscriptDurability::Immediate {
+        write_result = sync_transcript_file(storage, path, &file);
     }
     if let Err(write_err) = write_result {
         drop(file);
@@ -3323,7 +3359,12 @@ impl SessionPersistence {
                 state.pending_index.pop_back();
                 return Err(preflight_err);
             }
-            if let Err(err) = append_transcript_entry(&self.storage, &path, &prepared_append) {
+            if let Err(err) = append_transcript_entry(
+                &self.storage,
+                &path,
+                &prepared_append,
+                TranscriptDurability::Immediate,
+            ) {
                 let append_err = err.error;
                 if err.uncertain {
                     state.uncertain_append = Some(append_err.to_string());
@@ -5372,7 +5413,8 @@ async fn fork_session_unlocked(
         reconcile_loaded_transcript(storage, &source_store, session_id, &loaded)?;
         write_index_baseline(storage, session_id)?;
     }
-    let messages = loaded.messages;
+    let LoadedSessionTranscript { entries, messages } = loaded;
+    drop(entries);
     let fork_title = derive_title(&messages);
 
     let new_id = uuid::Uuid::new_v4().to_string();
@@ -5416,15 +5458,18 @@ async fn fork_session_unlocked(
     }
 
     let mut parent: Option<String> = None;
-    let mut indexed_messages = Vec::with_capacity(messages.len());
+    let mut message_uuids = Vec::with_capacity(messages.len());
     for message in &messages {
         let uuid = uuid::Uuid::new_v4().to_string();
         let entry = build_entry(message.clone(), &uuid, parent.as_deref(), &new_id);
         let prepared_append = prepare_transcript_append(&stage.storage, &stage.transcript, &entry)
             .map_err(|err| fork_stage_error("cannot stage fork transcript", err, &mut stage))?;
-        if let Err(err) =
-            append_transcript_entry(&stage.storage, &stage.transcript, &prepared_append)
-        {
+        if let Err(err) = append_transcript_entry(
+            &stage.storage,
+            &stage.transcript,
+            &prepared_append,
+            TranscriptDurability::Deferred,
+        ) {
             return Err(fork_stage_error(
                 "cannot stage fork transcript",
                 err.error,
@@ -5437,13 +5482,7 @@ async fn fork_session_unlocked(
             .map_err(|err| {
                 fork_stage_error("cannot validate staged fork transcript", err, &mut stage)
             })?;
-        indexed_messages.push(PendingIndexRecord::from_message(
-            &new_id,
-            &uuid,
-            message,
-            &model,
-            &fork_title,
-        ));
+        message_uuids.push(uuid.clone());
         parent = Some(uuid);
 
         #[cfg(test)]
@@ -5466,7 +5505,7 @@ async fn fork_session_unlocked(
     if let Err(err) = std::fs::OpenOptions::new()
         .read(true)
         .open(&stage.transcript)
-        .and_then(|file| file.sync_all())
+        .and_then(|file| sync_transcript_file(&stage.storage, &stage.transcript, &file))
     {
         return Err(fork_stage_error(
             "cannot sync staged fork transcript",
@@ -5614,14 +5653,15 @@ async fn fork_session_unlocked(
             &key,
         ));
     }
-    for message in indexed_messages {
+    for (message_uuid, message) in message_uuids.iter().zip(&messages) {
+        let text = message.get_all_text();
         if let Err(err) = save_index_message(
             storage,
             &store,
             &new_id,
-            &message.message_uuid,
-            &message.role,
-            &message.text,
+            message_uuid,
+            role_str(&message.role),
+            &text,
             "cannot publish fork message index",
         ) {
             return Err(fork_publication_error(
@@ -5822,6 +5862,27 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|attempt| attempt.root != root);
+    }
+
+    fn clear_transcript_sync_events(root: &Path) {
+        TRANSCRIPT_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|event| event.root != root);
+    }
+
+    fn transcript_sync_count_for(root: &Path, session_id: &str) -> usize {
+        let file_name = format!("{session_id}.jsonl");
+        TRANSCRIPT_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| {
+                event.root == root
+                    && event.path.file_name().and_then(|name| name.to_str())
+                        == Some(file_name.as_str())
+            })
+            .count()
     }
 
     fn pending_index_dir(root: &Path) -> PathBuf {
@@ -11817,6 +11878,26 @@ mod tests {
             assert_repeated_text(message, *fill, seed.text_lengths[index]);
         }
         drop(resumed);
+    }
+
+    #[tokio::test]
+    async fn fork_syncs_staged_transcript_once_before_publication() {
+        let storage = test_storage("fork-single-transcript-sync");
+        let _cleanup = RemoveTestStorage(storage.clone());
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        seed_compact_fork_source(
+            &storage,
+            &source_id,
+            &[("user", b'a'), ("assistant", b'b'), ("user", b'c')],
+            16 * 1024,
+            None,
+        );
+        clear_transcript_sync_events(&storage);
+
+        let fork_id = fork_session(&storage_str, &source_id).await.unwrap();
+
+        assert_eq!(transcript_sync_count_for(&storage, &fork_id), 1);
     }
 
     #[tokio::test]
