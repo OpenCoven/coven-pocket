@@ -175,6 +175,18 @@ struct ChatView: View {
 }
 
 extension ChatView {
+    static func spotlightSession(
+        sessionID: String,
+        loader: SessionListModel.Loader
+    ) async -> ChatSessionSummary? {
+        do {
+            let sessions = try await loader()
+            return sessions.first { $0.sessionId == sessionID }
+        } catch {
+            return nil
+        }
+    }
+
     static func consumeQueuedPrompt(
         _ queued: String?,
         coordinator: ChatRouteGenerationCoordinator,
@@ -264,8 +276,10 @@ private extension ChatView {
                 token: token,
                 coordinator: routeCoordinator,
                 lookup: {
-                    await model.storedSessions()
-                        .first(where: { $0.sessionId == sessionID })
+                    await ChatView.spotlightSession(
+                        sessionID: sessionID,
+                        loader: { try await model.storedSessions() }
+                    )
                 },
                 cancelResume: {
                     model.stop()

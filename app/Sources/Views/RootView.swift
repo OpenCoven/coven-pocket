@@ -63,7 +63,7 @@ struct RootView: View {
 private struct SidebarView: View {
     @ObservedObject var router: AppRouter
     @StateObject private var sessions = SidebarSessionsModel()
-    @State private var pendingDelete: IndexSet?
+    @State private var pendingDelete: [ChatSessionSummary]?
 
     var body: some View {
         List(selection: sectionSelection) {
@@ -75,9 +75,28 @@ private struct SidebarView: View {
             }
             Section("Sessions") {
                 if sessions.summaries.isEmpty {
-                    Text("No stored sessions.")
-                        .foregroundStyle(.secondary)
-                        .font(.footnote)
+                    switch sessions.loadState {
+                    case .idle, .loading:
+                        ProgressView("Loading sessions")
+                            .font(.footnote)
+                    case .failed:
+                        SessionListErrorRow(error: .load) {
+                            Task { await sessions.refresh() }
+                        }
+                    case .loaded:
+                        Text("No stored sessions.")
+                            .foregroundStyle(.secondary)
+                            .font(.footnote)
+                    }
+                } else if sessions.loadError != nil {
+                    SessionListErrorRow(error: .load) {
+                        Task { await sessions.refresh() }
+                    }
+                }
+                if let error = sessions.operationError {
+                    SessionListErrorRow(error: error) {
+                        Task { await sessions.refresh() }
+                    }
                 }
                 ForEach(sessions.summaries, id: \.sessionId) { summary in
                     Button {
@@ -93,9 +112,15 @@ private struct SidebarView: View {
                     }
                     .buttonStyle(.plain)
                     .hoverEffect(.highlight)
+                    .deleteDisabled(sessions.isMutating)
                 }
                 .onDelete { offsets in
-                    pendingDelete = offsets
+                    let selected = offsets.compactMap { index in
+                        sessions.summaries.indices.contains(index)
+                            ? sessions.summaries[index]
+                            : nil
+                    }
+                    pendingDelete = selected.isEmpty ? nil : selected
                 }
             }
         }
@@ -121,10 +146,11 @@ private struct SidebarView: View {
             ),
             titleVisibility: .visible,
             presenting: pendingDelete
-        ) { offsets in
+        ) { summaries in
             Button("Delete", role: .destructive) {
-                Task { await sessions.delete(at: offsets) }
+                Task { await sessions.delete(summaries) }
             }
+            .disabled(sessions.isMutating)
         } message: { _ in
             Text("The transcript is removed from this device.")
         }
@@ -144,32 +170,5 @@ extension ChatSessionSummary {
     var sidebarSubtitle: String {
         let messages = "\(messageCount) messages"
         return model.isEmpty ? messages : "\(model) · \(messages)"
-    }
-}
-
-/// Stored-session list state for the sidebar; resume itself routes through
-/// `AppRouter` so the chat pane owns the actual engine session.
-@MainActor
-final class SidebarSessionsModel: ObservableObject {
-    @Published var summaries: [ChatSessionSummary] = []
-
-    private let engine = PocketEngine()
-
-    func refresh() async {
-        summaries = (try? await engine.listChatSessions(
-            storageDir: ChatModel.sessionStoreURL.path
-        )) ?? []
-        SessionSpotlight.reindex(summaries)
-    }
-
-    func delete(at offsets: IndexSet) async {
-        for index in offsets {
-            guard summaries.indices.contains(index) else { continue }
-            try? await engine.deleteChatSession(
-                storageDir: ChatModel.sessionStoreURL.path,
-                sessionId: summaries[index].sessionId
-            )
-        }
-        await refresh()
     }
 }

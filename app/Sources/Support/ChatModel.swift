@@ -79,7 +79,7 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    let engine = PocketEngine()
+    let engine: PocketEngine
 
     private var session: ChatSession?
     private var sessionSettings: ChatSettings?
@@ -92,6 +92,7 @@ final class ChatModel: ObservableObject {
     private var approvalQueue: [PendingApproval] = []
     private let defaults: UserDefaults
     private let performSessionOperation: SessionOperation
+    private let storedSessionsLoader: SessionListModel.Loader
 
     static let permissionModeKey = "chat-permission-mode"
     /// Absolute path of the git workspace chat should operate in, written by
@@ -118,10 +119,18 @@ final class ChatModel: ObservableObject {
         defaults: UserDefaults = .standard,
         performSessionOperation: @escaping SessionOperation = { _, operation in
             try await operation()
-        }
+        },
+        storedSessionsLoader: SessionListModel.Loader? = nil
     ) {
+        let engine = PocketEngine()
+        self.engine = engine
         self.defaults = defaults
         self.performSessionOperation = performSessionOperation
+        self.storedSessionsLoader = storedSessionsLoader ?? {
+            try await engine.listChatSessions(
+                storageDir: Self.sessionStoreURL.path
+            )
+        }
         permissionMode = ChatPermissionMode(
             storageValue: defaults.string(forKey: Self.permissionModeKey)
         )
@@ -355,8 +364,8 @@ final class ChatModel: ObservableObject {
 
     /// Stored sessions, newest first. The engine call is async, keeping the
     /// SQLite read off the main thread.
-    func storedSessions() async -> [ChatSessionSummary] {
-        (try? await engine.listChatSessions(storageDir: Self.sessionStoreURL.path)) ?? []
+    func storedSessions() async throws -> [ChatSessionSummary] {
+        try await storedSessionsLoader()
     }
 
     /// Swap the live conversation for a stored one, restoring its transcript.
@@ -486,24 +495,19 @@ final class ChatModel: ObservableObject {
         return runningSession
     }
 
-    func deleteSession(_ summary: ChatSessionSummary) async {
-        try? await engine.deleteChatSession(
+    func deleteSession(_ summary: ChatSessionSummary) async throws {
+        try await engine.deleteChatSession(
             storageDir: Self.sessionStoreURL.path,
             sessionId: summary.sessionId
         )
     }
 
-    /// Copy a stored session at its head; returns whether the fork was made.
-    func forkSession(_ summary: ChatSessionSummary) async -> Bool {
-        do {
-            _ = try await engine.forkChatSession(
-                storageDir: Self.sessionStoreURL.path,
-                sessionId: summary.sessionId
-            )
-            return true
-        } catch {
-            return false
-        }
+    /// Copy a stored session at its head.
+    func forkSession(_ summary: ChatSessionSummary) async throws {
+        _ = try await engine.forkChatSession(
+            storageDir: Self.sessionStoreURL.path,
+            sessionId: summary.sessionId
+        )
     }
 
     /// Rendered rows for a restored transcript.
