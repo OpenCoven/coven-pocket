@@ -4,13 +4,42 @@ import SwiftUI
 /// a three-pane split — sections + sessions | selected section | context.
 struct RootView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @StateObject private var client: EngineClient
+    @StateObject private var chatState: ChatSurfaceState
     @ObservedObject private var router = AppRouter.shared
 
+    init() {
+        _client = StateObject(wrappedValue: EngineClient())
+        _chatState = StateObject(wrappedValue: ChatSurfaceState())
+    }
+
+    init(client: EngineClient) {
+        _client = StateObject(wrappedValue: client)
+        _chatState = StateObject(wrappedValue: ChatSurfaceState())
+    }
+
+    init(client: EngineClient, chatState: ChatSurfaceState) {
+        _client = StateObject(wrappedValue: client)
+        _chatState = StateObject(wrappedValue: chatState)
+    }
+
+    var sectionFactory: RootSectionFactory {
+        RootSectionFactory(client: client, chatState: chatState)
+    }
+
     var body: some View {
-        if horizontalSizeClass == .regular {
-            splitLayout
-        } else {
-            tabLayout
+        Group {
+            if horizontalSizeClass == .regular {
+                splitLayout
+            } else {
+                tabLayout
+            }
+        }
+        .onChange(of: client.codexAccount?.profileId) { oldProfileID, newProfileID in
+            chatState.handleCodexAccountTransition(
+                from: oldProfileID,
+                to: newProfileID
+            )
         }
     }
 
@@ -50,12 +79,26 @@ struct RootView: View {
     @ViewBuilder
     private func sectionView(for tab: AppRouter.Tab) -> some View {
         switch tab {
-        case .chat: ChatView()
+        case .chat: sectionFactory.chat()
         case .repos: ReposView()
         case .companion: CompanionView()
         case .diff: DiffDemoView()
-        case .playground: SpikeView()
+        case .playground: sectionFactory.playground()
         }
+    }
+}
+
+@MainActor
+struct RootSectionFactory {
+    let client: EngineClient
+    let chatState: ChatSurfaceState
+
+    func chat() -> ChatView {
+        ChatView(client: client, chatState: chatState)
+    }
+
+    func playground() -> SpikeView {
+        SpikeView(client: client)
     }
 }
 

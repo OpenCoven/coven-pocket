@@ -36,6 +36,101 @@ struct ChatSettings: Equatable {
 }
 
 @MainActor
+enum CodexAccountTransitionCoordinator {
+    static func handle(
+        from oldProfileID: String?,
+        to newProfileID: String?,
+        invalidateRoutes: () -> Void,
+        resetOnDevice: () -> Void,
+        synchronizeFamiliar: () -> Void
+    ) {
+        guard oldProfileID != newProfileID else { return }
+        invalidateRoutes()
+        resetOnDevice()
+        synchronizeFamiliar()
+    }
+}
+
+@MainActor
+final class ChatSurfaceState: ObservableObject {
+    @Published var settings: ChatSettings
+
+    let model: ChatModel
+    let companion: CompanionModel
+    let companionModel: CompanionChatModel
+    let familiarModel: FamiliarSelectionModel
+    let routeCoordinator: ChatRouteGenerationCoordinator
+
+    convenience init() {
+        let sharedCompanion = CompanionModel()
+        self.init(
+            model: ChatModel(),
+            companion: sharedCompanion,
+            companionModel: CompanionChatModel(companion: sharedCompanion),
+            familiarModel: FamiliarSelectionModel(companion: sharedCompanion),
+            routeCoordinator: ChatRouteGenerationCoordinator(),
+            settings: ChatSettings(
+                daemonProjectRoot: UserDefaults.standard.string(
+                    forKey: "daemon-chat-project-root"
+                ) ?? ""
+            )
+        )
+    }
+
+    init(
+        model: ChatModel,
+        companion: CompanionModel,
+        companionModel: CompanionChatModel,
+        familiarModel: FamiliarSelectionModel,
+        routeCoordinator: ChatRouteGenerationCoordinator,
+        settings: ChatSettings
+    ) {
+        self.model = model
+        self.companion = companion
+        self.companionModel = companionModel
+        self.familiarModel = familiarModel
+        self.routeCoordinator = routeCoordinator
+        self.settings = settings
+    }
+
+    func activeFamiliarProfile(
+        codexProfileID: String?
+    ) -> FamiliarProfileKey? {
+        ChatFamiliarProfile.active(
+            backend: settings.backend,
+            codexProfileID: codexProfileID,
+            companionAvailability: companionModel.availability,
+            companionPairing: companionModel.configuredPairing,
+            previous: familiarModel.activeProfile
+        )
+    }
+
+    func synchronizeFamiliarProfile(codexProfileID: String?) {
+        settings.familiarID = ChatFamiliarProfile.synchronize(
+            activeFamiliarProfile(codexProfileID: codexProfileID),
+            model: familiarModel
+        )
+    }
+
+    func handleCodexAccountTransition(
+        from oldProfileID: String?,
+        to newProfileID: String?
+    ) {
+        CodexAccountTransitionCoordinator.handle(
+            from: oldProfileID,
+            to: newProfileID,
+            invalidateRoutes: { routeCoordinator.invalidate() },
+            resetOnDevice: { model.reset() },
+            synchronizeFamiliar: {
+                synchronizeFamiliarProfile(
+                    codexProfileID: newProfileID
+                )
+            }
+        )
+    }
+}
+
+@MainActor
 final class ChatRouteGenerationCoordinator: ObservableObject {
     struct Token: Equatable {
         fileprivate let generation: UInt64

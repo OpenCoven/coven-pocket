@@ -11,13 +11,17 @@ struct SpikeView: View {
         ("max", "◉ Max")
     ]
 
-    @StateObject private var client = EngineClient()
+    @ObservedObject var client: EngineClient
     @State private var provider: PocketProvider = .anthropic
     @State private var apiKey: String = Keychain.get("anthropic-api-key") ?? ""
     @State private var anthropicModel: String = ""
     @State private var codexModel: String = ""
     @State private var effort: String = "medium"
     @State private var prompt: String = "Say hello from the coven-code engine."
+
+    init(client: EngineClient) {
+        _client = ObservedObject(wrappedValue: client)
+    }
 
     private var model: String {
         provider == .anthropic ? anthropicModel : codexModel
@@ -185,5 +189,5 @@ struct SpikeView: View {
 }
 
 #Preview {
-    SpikeView()
+    SpikeView(client: EngineClient())
 }

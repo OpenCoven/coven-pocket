@@ -1,4 +1,7 @@
+import Combine
 import XCTest
+import SwiftUI
+import UIKit
 @testable import CovenPocket
 
 // Chat surface coverage is kept together to share the deterministic session seam.
@@ -37,6 +40,39 @@ private final class ChatSurfacePairingStore: PairingStore {
 
 // swiftlint:disable:next type_body_length
 final class ChatSurfaceTests: XCTestCase {
+    private struct AccountTransitionFamiliarFixture {
+        let suiteName: String
+        let defaults: UserDefaults
+        let store: FamiliarSelectionStore
+        let model: FamiliarSelectionModel
+        let profileA: FamiliarProfileKey
+        let profileB: FamiliarProfileKey
+        let sage: FamiliarIdentity
+        let forge: FamiliarIdentity
+    }
+
+    private struct HostedRootTransitionFixture {
+        let familiar: AccountTransitionFamiliarFixture
+        let boundary: SessionBoundary
+        let chatModel: ChatModel
+        let routes: ChatRouteGenerationCoordinator
+        let staleRoute: ChatRouteGenerationCoordinator.Token
+        let chatState: ChatSurfaceState
+        let client: EngineClient
+        let previousTab: AppRouter.Tab
+        let window: UIWindow
+
+        @MainActor
+        func cleanup() {
+            familiar.defaults.removePersistentDomain(
+                forName: familiar.suiteName
+            )
+            AppRouter.shared.selectedTab = previousTab
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+    }
+
     private struct SpotlightResumePreparation {
         let suiteName: String
         let defaults: UserDefaults
@@ -45,6 +81,339 @@ final class ChatSurfaceTests: XCTestCase {
         let settings: ChatSettings
         let codexProfile: FamiliarProfileKey
         let forge: FamiliarIdentity
+    }
+
+    @MainActor
+    func testRootSectionConstructionSharesOneEngineClient() {
+        let client = EngineClient()
+        let root = RootView(client: client)
+
+        XCTAssertTrue(root.sectionFactory.chat().client === client)
+        XCTAssertTrue(root.sectionFactory.playground().client === client)
+    }
+
+    @MainActor
+    func testRootTransitionFencesChatWorkWhileChatSectionIsUnmounted() async throws {
+        let fixture = try makeHostedRootTransitionFixture()
+        defer { fixture.cleanup() }
+        let pendingSend = Task {
+            await fixture.chatModel.send(
+                prompt: "account A",
+                settings: fixture.chatState.settings,
+                selectedFamiliar: fixture.familiar.sage
+            )
+        }
+        await fulfillment(of: [fixture.boundary.startRequested], timeout: 1)
+        let lateSession = TrackingChatSession()
+        AppRouter.shared.selectedTab = .playground
+        await Task.yield()
+
+        let transitioned = expectation(description: "root handled account transition")
+        let transitionObservation = fixture.chatState.$settings
+            .dropFirst()
+            .sink { updated in
+                if !fixture.routes.isCurrent(fixture.staleRoute),
+                   updated.familiarID == fixture.familiar.forge.id {
+                    transitioned.fulfill()
+                }
+            }
+        fixture.client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: "b@example.com",
+            accountId: nil
+        )
+        await fulfillment(of: [transitioned], timeout: 1)
+        transitionObservation.cancel()
+        fixture.boundary.finishStart(with: lateSession)
+        await pendingSend.value
+
+        XCTAssertEqual(lateSession.stopCallCount, 1)
+        XCTAssertFalse(fixture.routes.isCurrent(fixture.staleRoute))
+        XCTAssertFalse(fixture.chatModel.hasActiveSession)
+        XCTAssertTrue(fixture.chatModel.items.isEmpty)
+        XCTAssertEqual(fixture.familiar.model.activeProfile, fixture.familiar.profileB)
+        XCTAssertEqual(fixture.chatState.settings.familiarID, fixture.familiar.forge.id)
+    }
+
+    @MainActor
+    func testAccountAToBInvalidatesRouteResetsOnceAndRestoresBFamiliar() async throws {
+        let fixture = try makeAccountTransitionFamiliarFixture()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suiteName) }
+        var settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: fixture.sage.id
+        )
+
+        let session = TrackingChatSession()
+        let boundary = SessionBoundary()
+        boundary.startSessions = [session]
+        let chatModel = ChatModel(performSessionOperation: boundary.perform)
+        await chatModel.send(
+            prompt: "account A", settings: settings,
+            selectedFamiliar: fixture.sage
+        )
+        let routes = ChatRouteGenerationCoordinator()
+        let staleRoute = routes.begin()
+        var resetCount = 0
+        var callOrder: [String] = []
+
+        CodexAccountTransitionCoordinator.handle(
+            from: "profile-a",
+            to: "profile-b",
+            invalidateRoutes: {
+                callOrder.append("route")
+                routes.invalidate()
+            },
+            resetOnDevice: {
+                callOrder.append("reset")
+                resetCount += 1
+                chatModel.reset()
+            },
+            synchronizeFamiliar: {
+                callOrder.append("familiar")
+                settings.familiarID = ChatFamiliarProfile.synchronize(
+                    fixture.profileB,
+                    model: fixture.model
+                )
+            }
+        )
+
+        XCTAssertEqual(callOrder, ["route", "reset", "familiar"])
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertFalse(routes.isCurrent(staleRoute))
+        XCTAssertFalse(chatModel.hasActiveSession)
+        XCTAssertTrue(chatModel.items.isEmpty)
+        XCTAssertNil(chatModel.activeFamiliar)
+        XCTAssertEqual(session.stopCallCount, 1)
+        XCTAssertEqual(fixture.model.activeProfile, fixture.profileB)
+        XCTAssertEqual(fixture.model.selectedFamiliar, fixture.forge)
+        XCTAssertEqual(settings.familiarID, fixture.forge.id)
+        XCTAssertEqual(try fixture.store.load(for: fixture.profileA), fixture.sage)
+    }
+
+    @MainActor
+    func testAccountAToNilResetsAndClearsFamiliarState() async throws {
+        let suiteName = "account-transition-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let profileA = FamiliarProfileKey.codex(profileID: "profile-a")
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let store = FamiliarSelectionStore(defaults: defaults)
+        try store.save(sage, for: profileA)
+        let familiarModel = FamiliarSelectionModel(
+            client: NoopFamiliarRosterClient(),
+            store: store
+        )
+        familiarModel.activate(profileA)
+        var settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: sage.id
+        )
+
+        let session = TrackingChatSession()
+        let boundary = SessionBoundary()
+        boundary.startSessions = [session]
+        let chatModel = ChatModel(performSessionOperation: boundary.perform)
+        await chatModel.send(
+            prompt: "account A",
+            settings: settings,
+            selectedFamiliar: sage
+        )
+        var resetCount = 0
+
+        CodexAccountTransitionCoordinator.handle(
+            from: "profile-a",
+            to: nil,
+            invalidateRoutes: {},
+            resetOnDevice: {
+                resetCount += 1
+                chatModel.reset()
+            },
+            synchronizeFamiliar: {
+                settings.familiarID = ChatFamiliarProfile.synchronize(
+                    nil,
+                    model: familiarModel
+                )
+            }
+        )
+
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(session.stopCallCount, 1)
+        XCTAssertFalse(chatModel.hasActiveSession)
+        XCTAssertTrue(chatModel.items.isEmpty)
+        XCTAssertNil(chatModel.activeFamiliar)
+        XCTAssertNil(familiarModel.activeProfile)
+        XCTAssertNil(familiarModel.selectedFamiliar)
+        XCTAssertNil(settings.familiarID)
+    }
+
+    @MainActor
+    func testAccountNilToBResetsStaleAStateBeforeRestoringB() async throws {
+        let suiteName = "account-transition-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let profileA = FamiliarProfileKey.codex(profileID: "profile-a")
+        let profileB = FamiliarProfileKey.codex(profileID: "profile-b")
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+        let store = FamiliarSelectionStore(defaults: defaults)
+        try store.save(sage, for: profileA)
+        try store.save(forge, for: profileB)
+        let familiarModel = FamiliarSelectionModel(
+            client: NoopFamiliarRosterClient(),
+            store: store
+        )
+        familiarModel.activate(profileA)
+        var settings = ChatSettings(
+            backend: .codex,
+            model: "test",
+            familiarID: sage.id
+        )
+
+        let staleSession = TrackingChatSession()
+        let boundary = SessionBoundary()
+        boundary.startSessions = [staleSession]
+        let chatModel = ChatModel(performSessionOperation: boundary.perform)
+        await chatModel.send(
+            prompt: "stale account A",
+            settings: settings,
+            selectedFamiliar: sage
+        )
+
+        CodexAccountTransitionCoordinator.handle(
+            from: nil,
+            to: "profile-b",
+            invalidateRoutes: {},
+            resetOnDevice: {
+                chatModel.reset()
+            },
+            synchronizeFamiliar: {
+                settings.familiarID = ChatFamiliarProfile.synchronize(
+                    profileB,
+                    model: familiarModel
+                )
+            }
+        )
+
+        XCTAssertEqual(staleSession.stopCallCount, 1)
+        XCTAssertFalse(chatModel.hasActiveSession)
+        XCTAssertTrue(chatModel.items.isEmpty)
+        XCTAssertNil(chatModel.activeFamiliar)
+        XCTAssertEqual(familiarModel.activeProfile, profileB)
+        XCTAssertEqual(familiarModel.selectedFamiliar, forge)
+        XCTAssertEqual(settings.familiarID, forge.id)
+    }
+
+    @MainActor
+    func testSameProfileIDDoesNotResetLiveChat() async {
+        let session = TrackingChatSession()
+        let boundary = SessionBoundary()
+        boundary.startSessions = [session]
+        let chatModel = ChatModel(performSessionOperation: boundary.perform)
+        let settings = ChatSettings(backend: .codex, model: "test")
+        await chatModel.send(prompt: "preserve", settings: settings)
+        var callbacks = 0
+
+        CodexAccountTransitionCoordinator.handle(
+            from: "profile-a",
+            to: "profile-a",
+            invalidateRoutes: { callbacks += 1 },
+            resetOnDevice: {
+                callbacks += 1
+                chatModel.reset()
+            },
+            synchronizeFamiliar: { callbacks += 1 }
+        )
+
+        XCTAssertEqual(callbacks, 0)
+        XCTAssertTrue(chatModel.hasActiveSession)
+        XCTAssertEqual(chatModel.items.map(\.text), ["preserve"])
+        XCTAssertEqual(session.stopCallCount, 0)
+    }
+
+    @MainActor
+    func testAccountTransitionStopsLateSessionCreationWithoutAdoptingIt() async {
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = true
+        let chatModel = ChatModel(performSessionOperation: boundary.perform)
+        let settings = ChatSettings(backend: .codex, model: "test")
+        let pendingSend = Task {
+            await chatModel.send(prompt: "account A", settings: settings)
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+        let lateSession = TrackingChatSession()
+
+        CodexAccountTransitionCoordinator.handle(
+            from: "profile-a",
+            to: "profile-b",
+            invalidateRoutes: {},
+            resetOnDevice: { chatModel.reset() },
+            synchronizeFamiliar: {}
+        )
+        boundary.finishStart(with: lateSession)
+        await pendingSend.value
+
+        XCTAssertEqual(lateSession.stopCallCount, 1)
+        XCTAssertFalse(chatModel.isBusy)
+        XCTAssertFalse(chatModel.hasActiveSession)
+        XCTAssertTrue(chatModel.items.isEmpty)
+        XCTAssertNil(chatModel.activeFamiliar)
+    }
+
+    @MainActor
+    func testCodexAccountTransitionDoesNotKillActiveCompanionSession() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        let companionModel = CompanionChatModel(client: client)
+        await companionModel.send(prompt: "remote", projectRoot: "/srv/repo")
+        XCTAssertTrue(companionModel.hasActiveSession)
+
+        var onDeviceResetCount = 0
+        CodexAccountTransitionCoordinator.handle(
+            from: "profile-a",
+            to: "profile-b",
+            invalidateRoutes: {},
+            resetOnDevice: { onDeviceResetCount += 1 },
+            synchronizeFamiliar: {}
+        )
+
+        XCTAssertEqual(onDeviceResetCount, 1)
+        XCTAssertTrue(companionModel.hasActiveSession)
+        XCTAssertEqual(companionModel.items.map(\.text), ["remote"])
+        XCTAssertTrue(client.killedSessionIDs.isEmpty)
+    }
+
+    private final class TrackingChatSession: ChatSession, @unchecked Sendable {
+        private let sessionIdentifier = UUID().uuidString
+        private let lock = NSLock()
+        private var stops = 0
+
+        var stopCallCount: Int {
+            lock.withLock { stops }
+        }
+
+        init() {
+            super.init(noHandle: ChatSession.NoHandle())
+        }
+
+        required init(unsafeFromHandle handle: UInt64) {
+            super.init(unsafeFromHandle: handle)
+        }
+
+        override func send(prompt: String, delegate: ChatDelegate) async throws {}
+
+        override func sessionId() -> String {
+            sessionIdentifier
+        }
+
+        override func stop() {
+            lock.withLock {
+                stops += 1
+            }
+        }
     }
 
     private final class StubChatSession: ChatSession, @unchecked Sendable {
@@ -422,7 +791,7 @@ final class ChatSurfaceTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         for path in [
-            "Sources/Views/ChatView.swift",
+            "Sources/Support/ChatTypes.swift",
             "Sources/Views/ChatSettingsView.swift"
         ] {
             let source = try String(
@@ -475,13 +844,13 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertTrue(source.contains("Claude via Companion"))
     }
 
-    func testChatViewSharesOneCompanionModelWithFamiliarSelection() throws {
+    func testChatSurfaceStateSharesOneCompanionModelWithFamiliarSelection() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let source = try String(
             contentsOf: root.appendingPathComponent(
-                "Sources/Views/ChatView.swift"
+                "Sources/Support/ChatTypes.swift"
             ),
             encoding: .utf8
         )
@@ -1720,6 +2089,88 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertEqual(nano.updatedDate?.timeIntervalSince1970.rounded(),
                        plain.updatedDate?.timeIntervalSince1970.rounded())
         XCTAssertNil(makeSummary(updatedAt: "not a date").updatedDate)
+    }
+
+    @MainActor
+    private func makeAccountTransitionFamiliarFixture() throws
+        -> AccountTransitionFamiliarFixture {
+        let suiteName = "account-transition-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let store = FamiliarSelectionStore(defaults: defaults)
+        let profileA = FamiliarProfileKey.codex(profileID: "profile-a")
+        let profileB = FamiliarProfileKey.codex(profileID: "profile-b")
+        let sage = familiarIdentity(id: "sage", name: "Sage")
+        let forge = familiarIdentity(id: "forge", name: "Forge")
+        try store.save(sage, for: profileA)
+        try store.save(forge, for: profileB)
+        let model = FamiliarSelectionModel(
+            client: NoopFamiliarRosterClient(),
+            store: store
+        )
+        model.activate(profileA)
+        return AccountTransitionFamiliarFixture(
+            suiteName: suiteName,
+            defaults: defaults,
+            store: store,
+            model: model,
+            profileA: profileA,
+            profileB: profileB,
+            sage: sage,
+            forge: forge
+        )
+    }
+
+    @MainActor
+    private func makeHostedRootTransitionFixture() throws
+        -> HostedRootTransitionFixture {
+        let familiar = try makeAccountTransitionFamiliarFixture()
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = true
+        let chatModel = ChatModel(performSessionOperation: boundary.perform)
+        let routes = ChatRouteGenerationCoordinator()
+        let staleRoute = routes.begin()
+        let companion = CompanionModel(
+            store: ChatSurfacePairingStore(stored: nil)
+        )
+        let chatState = ChatSurfaceState(
+            model: chatModel,
+            companion: companion,
+            companionModel: CompanionChatModel(companion: companion),
+            familiarModel: familiar.model,
+            routeCoordinator: routes,
+            settings: ChatSettings(
+                backend: .codex,
+                model: "test",
+                familiarID: familiar.sage.id
+            )
+        )
+        let client = EngineClient()
+        client.codexAccount = CodexAccount(
+            profileId: "profile-a",
+            email: "a@example.com",
+            accountId: nil
+        )
+        let previousTab = AppRouter.shared.selectedTab
+        AppRouter.shared.selectedTab = .chat
+        let host = UIHostingController(
+            rootView: RootView(client: client, chatState: chatState)
+                .environment(\.horizontalSizeClass, .regular)
+        )
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.layoutIfNeeded()
+        return HostedRootTransitionFixture(
+            familiar: familiar,
+            boundary: boundary,
+            chatModel: chatModel,
+            routes: routes,
+            staleRoute: staleRoute,
+            chatState: chatState,
+            client: client,
+            previousTab: previousTab,
+            window: window
+        )
     }
 
     private func familiarIdentity(

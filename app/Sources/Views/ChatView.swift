@@ -5,29 +5,37 @@ import SwiftUI
 /// Multi-turn chat through either a verified companion daemon's Claude CLI
 /// or the on-device Codex engine.
 struct ChatView: View {
-    @StateObject private var model = ChatModel()
-    @StateObject private var client = EngineClient()
-    @StateObject private var companion: CompanionModel
-    @StateObject private var companionModel: CompanionChatModel
-    @StateObject private var familiarModel: FamiliarSelectionModel
-    @StateObject private var routeCoordinator = ChatRouteGenerationCoordinator()
+    @ObservedObject var client: EngineClient
+    @ObservedObject var chatState: ChatSurfaceState
+    @ObservedObject private var model: ChatModel
+    @ObservedObject private var companion: CompanionModel
+    @ObservedObject private var companionModel: CompanionChatModel
+    @ObservedObject private var familiarModel: FamiliarSelectionModel
+    private let routeCoordinator: ChatRouteGenerationCoordinator
     @ObservedObject private var router = AppRouter.shared
 
-    @State private var settings = ChatSettings(
-        daemonProjectRoot: UserDefaults.standard.string(
-            forKey: "daemon-chat-project-root"
-        ) ?? ""
-    )
     @State private var prompt = ""
     @State private var showSettings = false
     @State private var showSessions = false
     @State private var showShare = false
 
-    init() {
-        let sharedCompanion = CompanionModel()
-        _companion = StateObject(wrappedValue: sharedCompanion)
-        _companionModel = StateObject(wrappedValue: CompanionChatModel(companion: sharedCompanion))
-        _familiarModel = StateObject(wrappedValue: FamiliarSelectionModel(companion: sharedCompanion))
+    init(client: EngineClient, chatState: ChatSurfaceState) {
+        _client = ObservedObject(wrappedValue: client)
+        _chatState = ObservedObject(wrappedValue: chatState)
+        _model = ObservedObject(wrappedValue: chatState.model)
+        _companion = ObservedObject(wrappedValue: chatState.companion)
+        _companionModel = ObservedObject(
+            wrappedValue: chatState.companionModel
+        )
+        _familiarModel = ObservedObject(
+            wrappedValue: chatState.familiarModel
+        )
+        routeCoordinator = chatState.routeCoordinator
+    }
+
+    private var settings: ChatSettings {
+        get { chatState.settings }
+        nonmutating set { chatState.settings = newValue }
     }
 
     private var activeItems: [ChatItem] { settings.backend == .companionClaude ? companionModel.items : model.items }
@@ -151,9 +159,6 @@ struct ChatView: View {
             .onChange(of: settings.backend) {
                 synchronizeFamiliarProfile()
             }
-            .onChange(of: client.codexAccount?.profileId) {
-                synchronizeFamiliarProfile()
-            }
             .onChange(of: companionModel.availability) {
                 normalizeBackendSelection()
                 synchronizeFamiliarProfile()
@@ -202,12 +207,8 @@ extension ChatView {
 
 private extension ChatView {
     var activeFamiliarProfile: FamiliarProfileKey? {
-        ChatFamiliarProfile.active(
-            backend: settings.backend,
-            codexProfileID: client.codexAccount?.profileId,
-            companionAvailability: companionModel.availability,
-            companionPairing: companionModel.configuredPairing,
-            previous: familiarModel.activeProfile
+        chatState.activeFamiliarProfile(
+            codexProfileID: client.codexAccount?.profileId
         )
     }
 
@@ -218,7 +219,7 @@ private extension ChatView {
                 if updated.backend != settings.backend {
                     routeCoordinator.invalidate()
                 }
-                settings = updated
+                chatState.settings = updated
             }
         )
     }
@@ -271,7 +272,7 @@ private extension ChatView {
             routeCoordinator.retire(token)
             return
         }
-        settings = currentSettings
+        chatState.settings = currentSettings
         Task {
             await SpotlightSessionRouteRunner.run(
                 token: token,
@@ -450,9 +451,8 @@ private extension ChatView {
     }
 
     private func synchronizeFamiliarProfile() {
-        settings.familiarID = ChatFamiliarProfile.synchronize(
-            activeFamiliarProfile,
-            model: familiarModel
+        chatState.synchronizeFamiliarProfile(
+            codexProfileID: client.codexAccount?.profileId
         )
     }
 
@@ -475,5 +475,8 @@ private extension ChatView {
     }
 }
 #Preview {
-    ChatView()
+    ChatView(
+        client: EngineClient(),
+        chatState: ChatSurfaceState()
+    )
 }
