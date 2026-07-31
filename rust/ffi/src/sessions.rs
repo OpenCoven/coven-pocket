@@ -2953,12 +2953,24 @@ struct PersistState {
     uncertain_append: Option<String>,
 }
 
+#[cfg(test)]
+pub(crate) struct PersistStateGuardForTest<'a> {
+    _guard: tokio::sync::MutexGuard<'a, PersistState>,
+}
+
 struct PendingIndexWork {
     record: PendingIndexRecord,
     appended: bool,
 }
 
 impl SessionPersistence {
+    #[cfg(test)]
+    pub(crate) async fn lock_state_for_test(&self) -> PersistStateGuardForTest<'_> {
+        PersistStateGuardForTest {
+            _guard: self.state.lock().await,
+        }
+    }
+
     pub(crate) async fn create(
         storage_dir: &str,
         session_id: String,

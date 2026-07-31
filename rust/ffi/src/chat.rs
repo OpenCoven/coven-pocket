@@ -36,6 +36,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::remote::FamiliarIdentity;
 use crate::{PocketError, PocketProvider};
 
+#[cfg(test)]
+const TEST_IMMEDIATE_END_TURN_MODEL: &str = "coven-pocket-test-immediate-end-turn";
+
 /// The sandbox-safe tool allowlist, mirroring coven-code's hosted-repair
 /// profile (`filter_tools_for_hosted_review` in the CLI). Only repository
 /// file tools — never command/network/task/sub-agent/plugin/MCP surfaces.
@@ -216,6 +219,8 @@ pub struct ChatSession {
     session_id: String,
     /// `None` for unpersisted sessions (no storage dir configured).
     persistence: Option<crate::sessions::SessionPersistence>,
+    #[cfg(test)]
+    model_tool_loop_invocations: AtomicUsize,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -290,13 +295,25 @@ impl ChatSession {
         prompt: Option<String>,
         delegate: Arc<dyn ChatDelegate>,
     ) -> Result<(), PocketError> {
-        if self.busy.swap(true, Ordering::SeqCst) {
+        // Publish busy and its current token under the lock shared with
+        // `stop`, then release it before any async setup.
+        let cancel_token = {
+            let mut guard = self.cancel.lock();
+            if self.busy.swap(true, Ordering::SeqCst) {
+                None
+            } else {
+                let token = tokio_util::sync::CancellationToken::new();
+                *guard = token.clone();
+                Some(token)
+            }
+        };
+        let Some(cancel_token) = cancel_token else {
             let err = PocketError::Engine {
                 message: "a turn is already running — stop it or wait".to_string(),
             };
             delegate.on_error(err.to_string());
             return Err(err);
-        }
+        };
         // Hold the message lock for the whole turn; `busy` already serializes
         // callers, the lock just hands the loop `&mut Vec<Message>` safely.
         //
@@ -323,11 +340,13 @@ impl ChatSession {
             // failure must not take the turn down.
             self.persist_new(&messages, &delegate).await;
 
-            let cancel_token = {
-                let mut guard = self.cancel.lock();
-                *guard = tokio_util::sync::CancellationToken::new();
-                guard.clone()
-            };
+            if cancel_token.is_cancelled() {
+                return Ok("cancelled");
+            }
+
+            #[cfg(test)]
+            self.model_tool_loop_invocations
+                .fetch_add(1, Ordering::SeqCst);
 
             let (client, query_config, tool_ctx) = self.build_loop_inputs()?;
             let tools = sandbox_tools(
@@ -476,6 +495,15 @@ impl ChatSession {
             provider_registry: Some(Arc::new(registry)),
             ..QueryConfig::default()
         };
+        #[cfg(test)]
+        let query_config = if self.config.model == TEST_IMMEDIATE_END_TURN_MODEL {
+            QueryConfig {
+                max_turns: 0,
+                ..query_config
+            }
+        } else {
+            query_config
+        };
 
         let tool_ctx = ToolContext {
             working_dir: workspace.clone(),
@@ -597,6 +625,8 @@ pub(crate) async fn start_session(
         perms: Arc::new(PermissionState::new(permission_mode)),
         session_id,
         persistence,
+        #[cfg(test)]
+        model_tool_loop_invocations: AtomicUsize::new(0),
     }))
 }
 
@@ -638,6 +668,8 @@ pub(crate) async fn resume_session(
         perms: Arc::new(PermissionState::new(permission_mode)),
         session_id,
         persistence: Some(persistence),
+        #[cfg(test)]
+        model_tool_loop_invocations: AtomicUsize::new(0),
     }))
 }
 
@@ -1271,6 +1303,242 @@ mod tests {
         );
         assert!(!session.is_busy());
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    async fn cancellation_test_session(storage: Option<&Path>) -> (Arc<ChatSession>, PathBuf) {
+        let workspace = temp_dir("cancellation-workspace");
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            TEST_IMMEDIATE_END_TURN_MODEL.to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage.map(|path| path.display().to_string()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        (session, workspace)
+    }
+
+    async fn wait_until_busy(session: &ChatSession) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !session.is_busy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn never claimed busy");
+    }
+
+    async fn wait_until_messages_locked(session: &ChatSession) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.messages.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn never acquired the messages lock");
+    }
+
+    async fn await_turn(
+        handle: tokio::task::JoinHandle<Result<(), PocketError>>,
+    ) -> Result<(), PocketError> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("turn timed out")
+            .expect("turn task panicked")
+    }
+
+    fn assert_cancelled_turn(
+        session: &ChatSession,
+        delegate: &RecordingDelegate,
+        expected_loop_invocations: usize,
+    ) {
+        assert_eq!(
+            delegate.done.lock().clone(),
+            vec!["cancelled".to_string()],
+            "cancelled turns emit exactly one done callback"
+        );
+        assert!(
+            delegate.errors.lock().is_empty(),
+            "cancellation must not emit on_error"
+        );
+        assert!(!session.is_busy(), "terminal cancellation clears busy");
+        assert_eq!(
+            session.model_tool_loop_invocations.load(Ordering::SeqCst),
+            expected_loop_invocations,
+            "stopped setup must not enter provider/query/tool loop setup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_while_waiting_for_messages_cancels_before_loop_setup() {
+        let (session, workspace) = cancellation_test_session(None).await;
+        let messages = session.messages.lock().await;
+        let delegate = Arc::new(RecordingDelegate::default());
+        let turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = delegate.clone();
+            async move { session.send("held message".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        session.stop();
+        drop(messages);
+
+        assert!(await_turn(turn).await.is_ok());
+        assert_cancelled_turn(&session, &delegate, 0);
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_while_persisting_cancels_before_loop_setup() {
+        let storage = temp_dir("cancellation-storage");
+        let (session, workspace) = cancellation_test_session(Some(&storage)).await;
+        let persistence = session.persistence.as_ref().expect("persisted session");
+        let persistence_state = persistence.lock_state_for_test().await;
+        let delegate = Arc::new(RecordingDelegate::default());
+        let turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = delegate.clone();
+            async move { session.send("held persistence".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        wait_until_messages_locked(&session).await;
+        session.stop();
+        drop(persistence_state);
+
+        assert!(await_turn(turn).await.is_ok());
+        assert_cancelled_turn(&session, &delegate, 0);
+        drop(session);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_immediately_after_busy_claim_never_loses_cancellation() {
+        let (session, workspace) = cancellation_test_session(None).await;
+
+        for iteration in 0..100 {
+            let messages = session.messages.lock().await;
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let delegate = Arc::new(RecordingDelegate::default());
+            let turn = tokio::spawn({
+                let session = session.clone();
+                let start = start.clone();
+                let delegate = delegate.clone();
+                async move {
+                    start.wait().await;
+                    session
+                        .send(format!("barrier turn {iteration}"), delegate)
+                        .await
+                }
+            });
+            let stopper = tokio::spawn({
+                let session = session.clone();
+                async move {
+                    start.wait().await;
+                    wait_until_busy(&session).await;
+                    session.stop();
+                }
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopper)
+                .await
+                .expect("stopper timed out")
+                .expect("stopper task panicked");
+            drop(messages);
+
+            assert!(await_turn(turn).await.is_ok(), "iteration {iteration}");
+            assert_cancelled_turn(&session, &delegate, 0);
+        }
+
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_busy_send_does_not_replace_first_turn_token() {
+        let (session, workspace) = cancellation_test_session(None).await;
+        let messages = session.messages.lock().await;
+        let first_delegate = Arc::new(RecordingDelegate::default());
+        let first_turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = first_delegate.clone();
+            async move { session.send("first".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        let active_before = session.cancel.lock().clone();
+        let second_delegate = Arc::new(RecordingDelegate::default());
+        let second_result = session
+            .send("second".to_string(), second_delegate.clone())
+            .await;
+        let active_after = session.cancel.lock().clone();
+
+        assert!(second_result.is_err());
+        assert_eq!(
+            active_before, active_after,
+            "a rejected busy send must not replace the active token"
+        );
+        assert!(second_delegate.done.lock().is_empty());
+        assert_eq!(second_delegate.errors.lock().len(), 1);
+
+        session.stop();
+        drop(messages);
+
+        assert!(await_turn(first_turn).await.is_ok());
+        assert_cancelled_turn(&session, &first_delegate, 0);
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_after_setup_cancellation_uses_fresh_uncancelled_token() {
+        let (session, workspace) = cancellation_test_session(None).await;
+        let messages = session.messages.lock().await;
+        let cancelled_delegate = Arc::new(RecordingDelegate::default());
+        let cancelled_turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = cancelled_delegate.clone();
+            async move { session.send("cancel me".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        session.stop();
+        drop(messages);
+        assert!(await_turn(cancelled_turn).await.is_ok());
+        assert_cancelled_turn(&session, &cancelled_delegate, 0);
+        let cancelled_token = session.cancel.lock().clone();
+        assert!(cancelled_token.is_cancelled());
+
+        let next_delegate = Arc::new(RecordingDelegate::default());
+        assert!(session
+            .send("next turn".to_string(), next_delegate.clone())
+            .await
+            .is_ok());
+        let next_token = session.cancel.lock().clone();
+
+        assert_ne!(cancelled_token, next_token);
+        assert!(!next_token.is_cancelled());
+        assert_eq!(
+            next_delegate.done.lock().clone(),
+            vec!["end_turn".to_string()]
+        );
+        assert!(next_delegate.errors.lock().is_empty());
+        assert!(!session.is_busy());
+        assert_eq!(
+            session.model_tool_loop_invocations.load(Ordering::SeqCst),
+            1
+        );
+
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     // -- memory injection ---------------------------------------------------
