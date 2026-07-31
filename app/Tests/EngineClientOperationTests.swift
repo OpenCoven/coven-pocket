@@ -278,7 +278,7 @@ final class EngineClientOperationTests: XCTestCase {
 
         XCTAssertEqual(client.codexAccount?.profileId, "profile-b")
         XCTAssertEqual(engine.codexAccount()?.profileId, "profile-b")
-        XCTAssertEqual(engine.logoutCallCount, 3)
+        XCTAssertEqual(engine.logoutCallCount, 2)
         XCTAssertNil(client.authURL)
         XCTAssertFalse(client.isAuthenticating)
     }

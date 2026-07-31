@@ -398,6 +398,36 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testWindowsDoNotPublishPersistedStaleAccountDuringCleanupFailure() {
+        let engine = ControllableEngineClientEngine(
+            account: CodexAccount(
+                profileId: "profile-a",
+                email: "a@example.com",
+                accountId: nil
+            )
+        )
+        engine.failNextLogouts(1)
+        let store = TestAuthenticationCleanupStore(cleanupRequired: true)
+        let client = EngineClient(
+            engine: engine,
+            authenticationCleanupStore: store
+        )
+        let app = CovenPocketApp(
+            dependencies: CovenPocketAppDependencies(engineClient: client)
+        )
+
+        let first = app.rootWindowFactory.makeWindowState()
+        let second = app.rootWindowFactory.makeWindowState()
+
+        XCTAssertTrue(first.client === second.client)
+        XCTAssertNil(first.client.codexAccount)
+        XCTAssertNil(second.client.codexAccount)
+        XCTAssertTrue(client.authenticationCleanupRequired)
+        XCTAssertNotNil(client.authenticationCleanupError)
+        XCTAssertEqual(engine.codexAccountCallCount, 0)
+    }
+
+    @MainActor
     func testAccountChangeClearsModelsAndDropsPreviousProfileLoad() async {
         let engine = SuspendedCodexModelsEngine()
         let client = EngineClient(engine: engine)

@@ -1,6 +1,6 @@
 import Foundation
 
-private struct StreamOperationToken: Equatable, Sendable {
+struct StreamOperationToken: Equatable, Sendable {
     enum AccountScope: Equatable, Sendable {
         case unrelatedToCodex
         case codex(profileID: String?)
@@ -28,15 +28,16 @@ final class EngineClient: ObservableObject {
     @Published var codexAccount: CodexAccount? {
         didSet {
             guard oldValue?.profileId != codexAccount?.profileId else { return }
-            codexModels = []
-            codexModelLoadGeneration &+= 1
-            invalidateCurrentCodexStream()
+            invalidateCodexAccountState()
         }
     }
     @Published var authURL: URL?
     @Published var isAuthenticating = false
+    @Published private(set) var authenticationCleanupRequired = false
+    @Published private(set) var authenticationCleanupError: String?
 
     let engine: any EngineClientEngine
+    private let authenticationCleanupStore: any AuthenticationCleanupStore
 
     private var streamGeneration: UInt64 = 0
     private var currentStream: StreamOperationToken?
@@ -46,7 +47,6 @@ final class EngineClient: ObservableObject {
     // Rust login owns a fixed callback port and outlives Swift cancellation.
     private var isAuthenticationEngineInFlight = false
     private var pendingAuthenticationSlot: PendingAuthenticationSlot?
-    private var isAuthenticationCleanupRequired = false
     private var modelLoadGeneration: UInt64 = 0
     private var codexModelLoadGeneration: UInt64 = 0
 
@@ -54,9 +54,20 @@ final class EngineClient: ObservableObject {
     var defaultModel: String { engine.defaultModel() }
     var defaultCodexModel: String { engine.defaultCodexModel() }
 
-    init(engine: any EngineClientEngine = PocketEngine()) {
+    init(
+        engine: any EngineClientEngine = PocketEngine(),
+        authenticationCleanupStore: any AuthenticationCleanupStore =
+            UserDefaultsAuthenticationCleanupStore()
+    ) {
         self.engine = engine
-        codexAccount = engine.codexAccount()
+        self.authenticationCleanupStore = authenticationCleanupStore
+        authenticationCleanupRequired =
+            authenticationCleanupStore.cleanupRequired
+        if authenticationCleanupRequired {
+            attemptAuthenticationCleanup()
+        } else {
+            codexAccount = engine.codexAccount()
+        }
     }
 
     // Engine calls run to completion even when the surrounding Swift task is
@@ -136,12 +147,7 @@ final class EngineClient: ObservableObject {
         }
         let isCurrent = isCurrentAuthentication(generation)
         if !isCurrent, case .success = result {
-            do {
-                try engine.codexLogout()
-                isAuthenticationCleanupRequired = false
-            } catch {
-                isAuthenticationCleanupRequired = true
-            }
+            attemptAuthenticationCleanup()
         }
         releaseAuthenticationSlot()
         guard isCurrent else { return }
@@ -155,15 +161,29 @@ final class EngineClient: ObservableObject {
     }
 
     func codexLogout() {
+        let authenticationWasInFlight = isAuthenticationEngineInFlight
         invalidateAuthentication()
-        do {
-            try engine.codexLogout()
-            isAuthenticationCleanupRequired = false
-            codexAccount = nil
-        } catch {
-            isAuthenticationCleanupRequired = true
-            errorMessage = error.localizedDescription
+        retainAuthenticationCleanup(
+            error: authenticationWasInFlight
+                ? """
+                Codex sign-out cleanup is waiting for the active sign-in to \
+                finish. Choose Finish sign out to retry afterward.
+                """
+                : nil
+        )
+        guard !authenticationWasInFlight else { return }
+        attemptAuthenticationCleanup()
+    }
+
+    func retryAuthenticationCleanup() {
+        guard authenticationCleanupRequired else { return }
+        guard activeAuthGeneration == nil,
+              !isAuthenticationEngineInFlight
+        else {
+            return
         }
+        invalidateAuthentication()
+        attemptAuthenticationCleanup()
     }
 
     func send(provider: PocketProvider, apiKey: String, model: String, prompt: String, effort: String?) async {
@@ -199,7 +219,7 @@ final class EngineClient: ObservableObject {
 }
 
 extension EngineClient {
-    fileprivate func appendText(
+    func appendText(
         _ text: String,
         for token: StreamOperationToken
     ) {
@@ -207,7 +227,7 @@ extension EngineClient {
         transcript += text
     }
 
-    fileprivate func appendThinking(
+    func appendThinking(
         _ text: String,
         for token: StreamOperationToken
     ) {
@@ -215,7 +235,7 @@ extension EngineClient {
         thinking += text
     }
 
-    fileprivate func publishStreamError(
+    func publishStreamError(
         _ message: String,
         for token: StreamOperationToken
     ) {
@@ -223,7 +243,7 @@ extension EngineClient {
         errorMessage = message
     }
 
-    fileprivate func publishAuthURL(
+    func publishAuthURL(
         _ url: String,
         generation: UInt64
     ) {
@@ -262,6 +282,12 @@ extension EngineClient {
         transcript = ""
         thinking = ""
         errorMessage = nil
+    }
+
+    private func invalidateCodexAccountState() {
+        codexModels = []
+        codexModelLoadGeneration &+= 1
+        invalidateCurrentCodexStream()
     }
 
     private func isCurrentAuthentication(_ generation: UInt64) -> Bool {
@@ -323,66 +349,44 @@ extension EngineClient {
     private func prepareAuthenticationEngine(
         generation: UInt64
     ) -> Bool {
-        guard isAuthenticationCleanupRequired else { return true }
+        guard authenticationCleanupRequired else { return true }
+        guard isCurrentAuthentication(generation) else { return false }
+        return attemptAuthenticationCleanup()
+    }
+
+    private func attemptAuthenticationCleanup() -> Bool {
+        retainAuthenticationCleanup(error: nil)
         do {
             try engine.codexLogout()
-            isAuthenticationCleanupRequired = false
-            return true
         } catch {
-            guard isCurrentAuthentication(generation) else { return false }
-            errorMessage = error.localizedDescription
+            authenticationCleanupError = """
+            Codex sign-out cleanup failed: \(error.localizedDescription). \
+            Choose Finish sign out to retry.
+            """
             return false
         }
-    }
-}
-
-/// Callbacks arrive on Rust worker threads; hop to the main actor.
-/// The only mutable state is the ARC-managed weak reference, which is
-/// thread-safe to read, so `@unchecked Sendable` holds.
-private final class StreamBridge: StreamDelegate, @unchecked Sendable {
-    weak var client: EngineClient?
-    let token: StreamOperationToken
-
-    init(client: EngineClient, token: StreamOperationToken) {
-        self.client = client
-        self.token = token
+        authenticationCleanupStore.cleanupRequired = false
+        authenticationCleanupRequired = false
+        authenticationCleanupError = nil
+        clearAuthenticationPresentation()
+        return true
     }
 
-    func onText(text: String) {
-        Task { @MainActor [client, token] in
-            client?.appendText(text, for: token)
+    private func retainAuthenticationCleanup(error: String?) {
+        authenticationCleanupStore.cleanupRequired = true
+        authenticationCleanupRequired = true
+        clearAuthenticationPresentation()
+        if let error {
+            authenticationCleanupError = error
         }
     }
 
-    func onThinking(text: String) {
-        Task { @MainActor [client, token] in
-            client?.appendThinking(text, for: token)
-        }
-    }
-
-    func onDone(stopReason: String) {}
-
-    func onError(message: String) {
-        Task { @MainActor [client, token] in
-            client?.publishStreamError(message, for: token)
-        }
-    }
-}
-
-/// Login-flow callbacks arrive on Rust worker threads; hop to the main actor.
-/// Same `@unchecked Sendable` justification as `StreamBridge`.
-private final class AuthBridge: CodexAuthDelegate, @unchecked Sendable {
-    weak var client: EngineClient?
-    let generation: UInt64
-
-    init(client: EngineClient, generation: UInt64) {
-        self.client = client
-        self.generation = generation
-    }
-
-    func onAuthUrl(url: String) {
-        Task { @MainActor [client, generation] in
-            client?.publishAuthURL(url, generation: generation)
+    private func clearAuthenticationPresentation() {
+        authURL = nil
+        if codexAccount == nil {
+            invalidateCodexAccountState()
+        } else {
+            codexAccount = nil
         }
     }
 }

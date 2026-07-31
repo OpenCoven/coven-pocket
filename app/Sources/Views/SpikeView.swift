@@ -39,6 +39,7 @@ struct SpikeView: View {
         NavigationStack {
             Form {
                 providerSection
+                authenticationCleanupSection
                 promptSection
 
                 if let error = client.errorMessage {
@@ -165,6 +166,30 @@ struct SpikeView: View {
                 Task { await client.codexLogin() }
             }
             .disabled(client.isAuthenticating)
+        }
+    }
+
+    @ViewBuilder private var authenticationCleanupSection: some View {
+        if client.authenticationCleanupRequired {
+            Section("Sign-out cleanup") {
+                Text(
+                    client.authenticationCleanupError
+                        ?? "Stored Codex credentials still need to be removed."
+                )
+                .foregroundStyle(.red)
+                .accessibilityLabel(
+                    """
+                    Authentication cleanup required. \
+                    \(client.authenticationCleanupError ?? "")
+                    """
+                )
+                Button("Finish sign out") {
+                    client.retryAuthenticationCleanup()
+                }
+                .accessibilityHint(
+                    "Retries removal of persisted Codex credentials."
+                )
+            }
         }
     }
 

@@ -5,6 +5,8 @@ enum EngineClientTestError: LocalizedError {
     case staleStream
     case staleModelLoad
     case logoutCleanup
+    case logoutRetry
+    case logoutStillPending
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +16,27 @@ enum EngineClientTestError: LocalizedError {
             "stale model load failed"
         case .logoutCleanup:
             "logout cleanup failed"
+        case .logoutRetry:
+            "logout retry failed"
+        case .logoutStillPending:
+            "logout cleanup is still pending"
+        }
+    }
+}
+
+final class TestAuthenticationCleanupStore: AuthenticationCleanupStore {
+    private var value: Bool
+    private(set) var savedValues: [Bool] = []
+
+    init(cleanupRequired: Bool = false) {
+        value = cleanupRequired
+    }
+
+    var cleanupRequired: Bool {
+        get { value }
+        set {
+            value = newValue
+            savedValues.append(newValue)
         }
     }
 }
@@ -31,7 +54,9 @@ final class ControllableEngineClientEngine: EngineClientEngine, @unchecked Senda
         Int: CheckedContinuation<CodexAccount, Error>
     ] = [:]
     private var logoutCallTotal = 0
-    private var logoutFailureCount = 0
+    private var logoutFailures: [EngineClientTestError] = []
+    private var codexAccountCallTotal = 0
+    private var authenticationEventValues: [String] = []
     private var suspendedCodexModelLoadCount = 0
     private var codexModelLoadCallTotal = 0
     private var codexModelContinuations: [
@@ -62,6 +87,14 @@ final class ControllableEngineClientEngine: EngineClientEngine, @unchecked Senda
         lock.withLock { logoutCallTotal }
     }
 
+    var codexAccountCallCount: Int {
+        lock.withLock { codexAccountCallTotal }
+    }
+
+    var authenticationEvents: [String] {
+        lock.withLock { authenticationEventValues }
+    }
+
     var codexModelLoadCallCount: Int {
         lock.withLock { codexModelLoadCallTotal }
     }
@@ -83,7 +116,11 @@ final class ControllableEngineClientEngine: EngineClientEngine, @unchecked Senda
     }
 
     func codexAccount() -> CodexAccount? {
-        lock.withLock { account }
+        lock.withLock {
+            codexAccountCallTotal += 1
+            authenticationEventValues.append("account")
+            return account
+        }
     }
 
     func listModels(apiKey: String) async throws -> [PocketModel] {
@@ -124,23 +161,31 @@ final class ControllableEngineClientEngine: EngineClientEngine, @unchecked Senda
     }
 
     func codexLogout() throws {
-        let shouldFail = lock.withLock {
+        let failure: EngineClientTestError? = lock.withLock {
             logoutCallTotal += 1
-            guard logoutFailureCount > 0 else {
+            authenticationEventValues.append("logout")
+            guard !logoutFailures.isEmpty else {
                 account = nil
-                return false
+                return nil
             }
-            logoutFailureCount -= 1
-            return true
+            return logoutFailures.removeFirst()
         }
-        if shouldFail {
-            throw EngineClientTestError.logoutCleanup
+        if let failure {
+            throw failure
         }
     }
 
     func failNextLogouts(_ count: Int) {
         lock.withLock {
-            logoutFailureCount += count
+            logoutFailures.append(
+                contentsOf: repeatElement(.logoutCleanup, count: count)
+            )
+        }
+    }
+
+    func failLogouts(with failures: [EngineClientTestError]) {
+        lock.withLock {
+            logoutFailures.append(contentsOf: failures)
         }
     }
 
