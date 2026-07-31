@@ -41,7 +41,7 @@ use std::sync::{Arc, LazyLock, Weak};
 
 use claurst_core::session_storage::{
     load_transcript, make_assistant_entry, make_user_entry, messages_from_transcript,
-    write_transcript_entry, TranscriptEntry, MAX_TRANSCRIPT_BYTES,
+    TranscriptEntry, MAX_TRANSCRIPT_BYTES,
 };
 use claurst_core::types::{Message, Role};
 use claurst_core::SqliteSessionStore;
@@ -99,6 +99,9 @@ struct SessionTestFaults {
     fail_message_index_attempts: VecDeque<bool>,
     fail_transcript_append_remaining: usize,
     fail_transcript_after_write_remaining: usize,
+    fail_transcript_rollback_remaining: usize,
+    fail_transcript_recovery_remaining: usize,
+    fail_fork_stage_cleanup_remaining: usize,
 }
 
 #[cfg(test)]
@@ -1009,6 +1012,21 @@ fn rollback_transcript_append(
     original_len: u64,
     existed: bool,
 ) -> Result<(), PocketError> {
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(storage.root()) {
+            if faults.fail_transcript_rollback_remaining > 0 {
+                faults.fail_transcript_rollback_remaining -= 1;
+                return Err(engine_err(
+                    "cannot roll back partial transcript append",
+                    std::io::Error::other("injected transcript rollback failure"),
+                ));
+            }
+        }
+    }
     if existed {
         storage.validate_regular_file(path, false)?;
         let file = std::fs::OpenOptions::new()
@@ -1037,6 +1055,21 @@ fn recover_complete_transcript_append(
     line: &[u8],
     existed: bool,
 ) -> Result<bool, PocketError> {
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(storage.root()) {
+            if faults.fail_transcript_recovery_remaining > 0 {
+                faults.fail_transcript_recovery_remaining -= 1;
+                return Err(engine_err(
+                    "cannot inspect uncertain transcript append",
+                    std::io::Error::other("injected transcript recovery failure"),
+                ));
+            }
+        }
+    }
     storage.validate_regular_file(path, false)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -1719,6 +1752,21 @@ fn remove_fork_staging_artifacts(
     storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<(), PocketError> {
+    #[cfg(test)]
+    {
+        let mut faults = SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(faults) = faults.get_mut(storage.root()) {
+            if faults.fail_fork_stage_cleanup_remaining > 0 {
+                faults.fail_fork_stage_cleanup_remaining -= 1;
+                return Err(engine_err(
+                    "cannot delete fork staging artifacts",
+                    std::io::Error::other("injected fork staging cleanup failure"),
+                ));
+            }
+        }
+    }
     let stage_root = storage.fork_staging_root()?;
     let stage_directory = storage.fork_staging_dir(session_id)?;
     remove_tree_durably_if_present(
@@ -5246,16 +5294,14 @@ async fn fork_session_unlocked(
     for message in &messages {
         let uuid = uuid::Uuid::new_v4().to_string();
         let entry = build_entry(message.clone(), &uuid, parent.as_deref(), &new_id);
-        stage
-            .storage
-            .validate_regular_file(&stage.transcript, true)
-            .map_err(|err| {
-                fork_stage_error("cannot preflight staged fork transcript", err, &mut stage)
-            })?;
-        if let Err(err) = write_transcript_entry(&stage.transcript, &entry).await {
+        let prepared_append = prepare_transcript_append(&stage.storage, &stage.transcript, &entry)
+            .map_err(|err| fork_stage_error("cannot stage fork transcript", err, &mut stage))?;
+        if let Err(err) =
+            append_transcript_entry(&stage.storage, &stage.transcript, &prepared_append)
+        {
             return Err(fork_stage_error(
                 "cannot stage fork transcript",
-                err,
+                err.error,
                 &mut stage,
             ));
         }
@@ -5507,6 +5553,14 @@ mod tests {
         dir
     }
 
+    struct RemoveTestStorage(PathBuf);
+
+    impl Drop for RemoveTestStorage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn familiar() -> crate::remote::FamiliarIdentity {
         crate::remote::FamiliarIdentity {
             id: "familiar-1".to_string(),
@@ -5572,6 +5626,33 @@ mod tests {
             .entry(root.to_path_buf())
             .or_default()
             .fail_transcript_after_write_remaining = count;
+    }
+
+    fn fail_transcript_rollback(root: &Path, count: usize) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_transcript_rollback_remaining = count;
+    }
+
+    fn fail_transcript_recovery(root: &Path, count: usize) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_transcript_recovery_remaining = count;
+    }
+
+    fn fail_fork_stage_cleanup(root: &Path, count: usize) {
+        SESSION_TEST_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .fail_fork_stage_cleanup_remaining = count;
     }
 
     fn message_index_attempt_uuids(root: &Path, session_id: &str) -> Vec<String> {
@@ -5751,7 +5832,9 @@ mod tests {
                 parent.as_deref(),
                 session_id,
             );
-            write_transcript_entry(&transcript, &entry).await.unwrap();
+            claurst_core::session_storage::write_transcript_entry(&transcript, &entry)
+                .await
+                .unwrap();
             parent = Some(message_uuid.clone());
             uuids.push(message_uuid);
         }
@@ -5773,6 +5856,215 @@ mod tests {
             .save_session(session_id, Some("Legacy"), "model")
             .unwrap();
         seed_transcript(root, session_id, messages).await
+    }
+
+    struct CompactSourceSeed {
+        message_uuids: Vec<String>,
+        text_lengths: Vec<usize>,
+    }
+
+    fn compact_transcript_parts(
+        session_id: &str,
+        message_uuid: &str,
+        parent_uuid: Option<&str>,
+        role: &str,
+    ) -> (String, &'static [u8]) {
+        let parent_uuid = parent_uuid
+            .map(|uuid| format!("\"{uuid}\""))
+            .unwrap_or_else(|| "null".to_string());
+        (
+            format!(
+                "{{\"type\":\"{role}\",\"uuid\":\"{message_uuid}\",\"parentUuid\":\
+                 {parent_uuid},\"timestamp\":\"\",\"sessionId\":\"{session_id}\",\"cwd\":\"\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":\""
+            ),
+            b"\"}}\n",
+        )
+    }
+
+    fn seed_compact_fork_source(
+        root: &Path,
+        session_id: &str,
+        roles_and_fills: &[(&str, u8)],
+        target_len: u64,
+        familiar: Option<&FamiliarIdentity>,
+    ) -> CompactSourceSeed {
+        assert!(!roles_and_fills.is_empty());
+        let message_uuids = roles_and_fills
+            .iter()
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+        let parts = roles_and_fills
+            .iter()
+            .enumerate()
+            .map(|(index, (role, _))| {
+                assert!(matches!(*role, "user" | "assistant"));
+                compact_transcript_parts(
+                    session_id,
+                    &message_uuids[index],
+                    index
+                        .checked_sub(1)
+                        .and_then(|parent| message_uuids.get(parent))
+                        .map(String::as_str),
+                    role,
+                )
+            })
+            .collect::<Vec<_>>();
+        let fixed_len = parts.iter().try_fold(0_u64, |total, (prefix, suffix)| {
+            total
+                .checked_add(u64::try_from(prefix.len()).unwrap())
+                .and_then(|total| total.checked_add(u64::try_from(suffix.len()).unwrap()))
+        });
+        let total_text_len = target_len
+            .checked_sub(fixed_len.expect("compact transcript length must fit"))
+            .expect("target must leave room for compact transcript schema");
+        let entry_count = u64::try_from(roles_and_fills.len()).unwrap();
+        let base_text_len = total_text_len / entry_count;
+        let remainder = total_text_len % entry_count;
+        let text_lengths = (0..roles_and_fills.len())
+            .map(|index| {
+                usize::try_from(base_text_len + u64::from((index as u64) < remainder)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let texts = roles_and_fills
+            .iter()
+            .zip(&text_lengths)
+            .map(|((_, fill), len)| String::from_utf8(vec![*fill; *len]).unwrap())
+            .collect::<Vec<_>>();
+
+        let directory = root.join("transcripts");
+        std::fs::create_dir_all(&directory).unwrap();
+        let transcript = transcript_file(root, session_id);
+        let mut file = std::fs::File::create(&transcript).unwrap();
+        for ((prefix, suffix), text) in parts.iter().zip(&texts) {
+            file.write_all(prefix.as_bytes()).unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            file.write_all(suffix).unwrap();
+        }
+        file.sync_all().unwrap();
+        std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+        assert_eq!(std::fs::metadata(&transcript).unwrap().len(), target_len);
+
+        let store = index_store(root).unwrap();
+        store
+            .save_session(session_id, Some("Compact"), "model")
+            .unwrap();
+        for (((role, _), message_uuid), text) in
+            roles_and_fills.iter().zip(&message_uuids).zip(&texts)
+        {
+            store
+                .save_message(session_id, message_uuid, role, text, None)
+                .unwrap();
+        }
+        let storage = CheckedStorage::from_root(root).unwrap();
+        write_session_model_record(&storage, session_id, "model").unwrap();
+        seed_index_baseline_record(root, session_id);
+        save_familiar_metadata_at_root(root, session_id, familiar).unwrap();
+
+        CompactSourceSeed {
+            message_uuids,
+            text_lengths,
+        }
+    }
+
+    fn regenerated_line_len(
+        session_id: &str,
+        message_uuid: &str,
+        parent_uuid: Option<&str>,
+        role: &str,
+        text_len: usize,
+    ) -> u64 {
+        let message = match role {
+            "user" => Message::user(""),
+            "assistant" => Message::assistant(""),
+            _ => panic!("unsupported compact transcript role"),
+        };
+        let entry = build_entry(message, message_uuid, parent_uuid, session_id);
+        u64::try_from(serde_json::to_vec(&entry).unwrap().len())
+            .unwrap()
+            .checked_add(1)
+            .and_then(|len| len.checked_add(u64::try_from(text_len).unwrap()))
+            .unwrap()
+    }
+
+    fn file_fingerprint(path: &Path) -> (u64, u64) {
+        use std::hash::Hasher;
+
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut bytes = [0_u8; 64 * 1024];
+        let mut len = 0_u64;
+        loop {
+            let read = file.read(&mut bytes).unwrap();
+            if read == 0 {
+                break;
+            }
+            hasher.write(&bytes[..read]);
+            len += u64::try_from(read).unwrap();
+        }
+        (len, hasher.finish())
+    }
+
+    fn directory_entry_names(path: &Path) -> Vec<String> {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(err) => panic!("cannot read {}: {err}", path.display()),
+        };
+        let mut names = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn assert_no_published_fork_artifacts(root: &Path, source_id: &str, source_has_familiar: bool) {
+        let mut indexed_ids = index_store(root)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        indexed_ids.sort();
+        assert_eq!(indexed_ids, [source_id]);
+        assert_eq!(
+            directory_entry_names(&root.join("transcripts")),
+            [format!("{source_id}.jsonl")]
+        );
+        let expected_metadata = if source_has_familiar {
+            vec![format!("{source_id}.familiar.json")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            directory_entry_names(&root.join("metadata")),
+            expected_metadata
+        );
+        assert_eq!(
+            directory_entry_names(&root.join(".session-lifecycle").join("session-models")),
+            [format!("{source_id}.json")]
+        );
+        assert_eq!(
+            directory_entry_names(&root.join(".session-lifecycle").join("index-baselines")),
+            [format!("{source_id}.json")]
+        );
+        assert!(directory_entry_names(&pending_index_dir(root)).is_empty());
+    }
+
+    fn assert_fork_staging_clean(root: &Path) {
+        assert!(pending_fork_ids(root).unwrap().is_empty());
+        assert!(!root.join(".fork-staging").exists());
+    }
+
+    fn assert_repeated_text(message: &Message, expected: u8, expected_len: usize) {
+        match &message.content {
+            claurst_core::types::MessageContent::Text(text) => {
+                assert_eq!(text.len(), expected_len);
+                assert!(text.as_bytes().iter().all(|byte| *byte == expected));
+            }
+            _ => panic!("expected compact source text message"),
+        }
     }
 
     fn seed_pre_marker_session_row(root: &Path, session_id: &str, title: &str, model: &str) {
@@ -11001,6 +11293,229 @@ mod tests {
         assert_eq!(messages[0].get_all_text(), "replacement message");
 
         std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_compact_source_whose_regenerated_entry_exceeds_limit() {
+        let storage = test_storage("fork-compact-regeneration-overflow");
+        let _cleanup = RemoveTestStorage(storage.clone());
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let identity = familiar();
+        let roles = [("user", b'x')];
+        let seed = seed_compact_fork_source(
+            &storage,
+            &source_id,
+            &roles,
+            MAX_TRANSCRIPT_BYTES - 1,
+            Some(&identity),
+        );
+        let regenerated_len = regenerated_line_len(
+            &source_id,
+            &seed.message_uuids[0],
+            None,
+            roles[0].0,
+            seed.text_lengths[0],
+        );
+        assert!(regenerated_len > MAX_TRANSCRIPT_BYTES);
+        let source_transcript = transcript_file(&storage, &source_id);
+        let source_fingerprint = file_fingerprint(&source_transcript);
+        let source_familiar = std::fs::read(familiar_file(&storage, &source_id)).unwrap();
+        clear_message_index_attempts(&storage);
+
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+
+        assert!(err.to_string().contains("cannot stage fork transcript"));
+        assert!(err.to_string().contains(&format!(
+            "transcript size limit of {MAX_TRANSCRIPT_BYTES} bytes reached"
+        )));
+        assert_eq!(file_fingerprint(&source_transcript), source_fingerprint);
+        assert_eq!(
+            std::fs::read(familiar_file(&storage, &source_id)).unwrap(),
+            source_familiar
+        );
+        assert!(message_index_attempts_for(&storage).is_empty());
+        assert_no_published_fork_artifacts(&storage, &source_id, true);
+        assert_fork_staging_clean(&storage);
+    }
+
+    #[tokio::test]
+    async fn fork_cumulative_final_entry_overflow_rolls_back_entire_stage() {
+        let storage = test_storage("fork-cumulative-regeneration-overflow");
+        let _cleanup = RemoveTestStorage(storage.clone());
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let roles = [("user", b'a'), ("assistant", b'b')];
+        let seed =
+            seed_compact_fork_source(&storage, &source_id, &roles, MAX_TRANSCRIPT_BYTES - 1, None);
+        let first_len = regenerated_line_len(
+            &source_id,
+            &seed.message_uuids[0],
+            None,
+            roles[0].0,
+            seed.text_lengths[0],
+        );
+        let second_len = regenerated_line_len(
+            &source_id,
+            &seed.message_uuids[1],
+            Some(&seed.message_uuids[0]),
+            roles[1].0,
+            seed.text_lengths[1],
+        );
+        assert!(first_len < MAX_TRANSCRIPT_BYTES);
+        assert!(second_len < MAX_TRANSCRIPT_BYTES);
+        assert!(first_len + second_len > MAX_TRANSCRIPT_BYTES);
+        let source_transcript = transcript_file(&storage, &source_id);
+        let source_fingerprint = file_fingerprint(&source_transcript);
+        clear_message_index_attempts(&storage);
+
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+
+        assert!(err.to_string().contains("cannot stage fork transcript"));
+        assert!(err.to_string().contains(&format!(
+            "transcript size limit of {MAX_TRANSCRIPT_BYTES} bytes reached"
+        )));
+        assert_eq!(file_fingerprint(&source_transcript), source_fingerprint);
+        assert!(message_index_attempts_for(&storage).is_empty());
+        assert_no_published_fork_artifacts(&storage, &source_id, false);
+        assert_fork_staging_clean(&storage);
+    }
+
+    #[tokio::test]
+    async fn fork_safely_under_limit_is_durable_exact_and_resumable() {
+        let storage = test_storage("fork-near-limit-success");
+        let _cleanup = RemoveTestStorage(storage.clone());
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let roles = [("user", b'a'), ("assistant", b'b'), ("user", b'c')];
+        let seed = seed_compact_fork_source(
+            &storage,
+            &source_id,
+            &roles,
+            MAX_TRANSCRIPT_BYTES - 32 * 1024,
+            None,
+        );
+        let regenerated_total = roles
+            .iter()
+            .enumerate()
+            .map(|(index, (role, _))| {
+                regenerated_line_len(
+                    &source_id,
+                    &seed.message_uuids[index],
+                    index
+                        .checked_sub(1)
+                        .and_then(|parent| seed.message_uuids.get(parent))
+                        .map(String::as_str),
+                    role,
+                    seed.text_lengths[index],
+                )
+            })
+            .sum::<u64>();
+        assert!(regenerated_total < MAX_TRANSCRIPT_BYTES);
+        let source_transcript = transcript_file(&storage, &source_id);
+        let source_fingerprint = file_fingerprint(&source_transcript);
+        clear_message_index_attempts(&storage);
+        let sync_offset = DIRECTORY_SYNC_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+
+        let fork_id = fork_session(&storage_str, &source_id).await.unwrap();
+
+        assert_eq!(file_fingerprint(&source_transcript), source_fingerprint);
+        let fork_transcript = transcript_file(&storage, &fork_id);
+        assert!(std::fs::metadata(&fork_transcript).unwrap().len() <= MAX_TRANSCRIPT_BYTES);
+        let entries = load_transcript(&fork_transcript).await.unwrap();
+        assert_eq!(entries.len(), roles.len());
+        let mut previous_uuid = None;
+        let mut fork_uuids = Vec::with_capacity(entries.len());
+        for (index, ((role, fill), entry)) in roles.iter().zip(&entries).enumerate() {
+            let message = match (*role, entry) {
+                ("user", TranscriptEntry::User(message))
+                | ("assistant", TranscriptEntry::Assistant(message)) => message,
+                _ => panic!("fork transcript role/order changed"),
+            };
+            assert_eq!(message.session_id, fork_id);
+            assert_eq!(message.parent_uuid, previous_uuid);
+            assert_repeated_text(&message.message, *fill, seed.text_lengths[index]);
+            let uuid = message.uuid.clone().expect("fork message UUID");
+            previous_uuid = Some(uuid.clone());
+            fork_uuids.push(uuid);
+        }
+        assert_eq!(
+            indexed_message_count(&storage, &fork_id),
+            roles.len() as u32
+        );
+        assert_eq!(message_index_attempt_uuids(&storage, &fork_id), fork_uuids);
+        drop(entries);
+        let stage_directory = fork_staging_dir(&storage, &fork_id);
+        let stage_directory_was_synced = {
+            let syncs = DIRECTORY_SYNC_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            syncs[sync_offset..].contains(&stage_directory)
+        };
+        assert!(stage_directory_was_synced);
+        assert_fork_staging_clean(&storage);
+
+        let (resumed, messages, familiar) =
+            SessionPersistence::resume(&storage_str, fork_id.clone(), "model".to_string())
+                .await
+                .unwrap();
+        assert!(familiar.is_none());
+        assert_eq!(messages.len(), roles.len());
+        for (index, ((role, fill), message)) in roles.iter().zip(&messages).enumerate() {
+            assert_eq!(
+                role_str(&message.role),
+                if *role == "assistant" {
+                    "assistant"
+                } else {
+                    "user"
+                }
+            );
+            assert_repeated_text(message, *fill, seed.text_lengths[index]);
+        }
+        drop(resumed);
+    }
+
+    #[tokio::test]
+    async fn uncertain_fork_append_is_quarantined_until_restart_cleanup() {
+        let storage = test_storage("fork-uncertain-append-quarantine");
+        let _cleanup = RemoveTestStorage(storage.clone());
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        seed_compact_fork_source(&storage, &source_id, &[("user", b'q')], 1024, None);
+        let source_transcript = transcript_file(&storage, &source_id);
+        let source_fingerprint = file_fingerprint(&source_transcript);
+        clear_message_index_attempts(&storage);
+        fail_transcript_after_write(&storage, 1);
+        fail_transcript_rollback(&storage, 2);
+        fail_transcript_recovery(&storage, 1);
+        fail_fork_stage_cleanup(&storage, 1);
+
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+
+        assert!(err.to_string().contains("cannot stage fork transcript"));
+        assert!(err
+            .to_string()
+            .contains("injected post-write transcript failure"));
+        assert!(err.to_string().contains("append rollback failed twice"));
+        assert!(err.to_string().contains("cleanup also failed"));
+        assert_eq!(file_fingerprint(&source_transcript), source_fingerprint);
+        assert!(message_index_attempts_for(&storage).is_empty());
+        assert_no_published_fork_artifacts(&storage, &source_id, false);
+        let pending_ids = pending_fork_ids(&storage).unwrap();
+        assert_eq!(pending_ids.len(), 1);
+        let fork_id = &pending_ids[0];
+        assert!(pending_fork_marker(&storage, fork_id).exists());
+        assert!(fork_staging_dir(&storage, fork_id).exists());
+
+        clear_module_state_for_root(&storage).await;
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, source_id);
+        assert_no_published_fork_artifacts(&storage, &source_id, false);
+        assert_fork_staging_clean(&storage);
     }
 
     #[tokio::test]
