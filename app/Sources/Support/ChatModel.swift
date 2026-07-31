@@ -6,6 +6,18 @@ private struct FamiliarUnavailableError: LocalizedError {
     }
 }
 
+private struct ActiveSessionDeletionError: LocalizedError {
+    var errorDescription: String? {
+        "Start a new chat before deleting the active session."
+    }
+}
+
+private struct BusySessionDeletionError: LocalizedError {
+    var errorDescription: String? {
+        "Finish the current chat operation before deleting sessions."
+    }
+}
+
 // Session lifecycle state intentionally stays with the main-actor model.
 // swiftlint:disable file_length
 
@@ -495,7 +507,17 @@ final class ChatModel: ObservableObject {
         return runningSession
     }
 
+    func canDeleteSession(_ summary: ChatSessionSummary) -> Bool {
+        !isBusy && activeSessionID != summary.sessionId
+    }
+
     func deleteSession(_ summary: ChatSessionSummary) async throws {
+        guard !isBusy else {
+            throw BusySessionDeletionError()
+        }
+        guard canDeleteSession(summary) else {
+            throw ActiveSessionDeletionError()
+        }
         try await engine.deleteChatSession(
             storageDir: Self.sessionStoreURL.path,
             sessionId: summary.sessionId

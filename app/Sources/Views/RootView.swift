@@ -94,7 +94,10 @@ struct RootView: View {
 
     private var splitLayout: some View {
         NavigationSplitView {
-            SidebarView(router: router)
+            SidebarView(
+                router: router,
+                chatModel: windowState.chatState.model
+            )
         } content: {
             sectionView(for: router.selectedTab)
                 .id(router.selectedTab)
@@ -173,8 +176,17 @@ struct RootSectionFactory {
 /// iPad sidebar: app sections plus stored sessions with tap-to-resume.
 private struct SidebarView: View {
     @ObservedObject var router: AppRouter
-    @StateObject private var sessions = SidebarSessionsModel()
+    @ObservedObject var chatModel: ChatModel
+    @StateObject private var sessions: SidebarSessionsModel
     @State private var pendingDelete: [ChatSessionSummary]?
+
+    init(router: AppRouter, chatModel: ChatModel) {
+        self.router = router
+        self.chatModel = chatModel
+        _sessions = StateObject(
+            wrappedValue: SidebarSessionsModel(chatModel: chatModel)
+        )
+    }
 
     var body: some View {
         List(selection: sectionSelection) {
@@ -223,7 +235,10 @@ private struct SidebarView: View {
                     }
                     .buttonStyle(.plain)
                     .hoverEffect(.highlight)
-                    .deleteDisabled(sessions.isMutating)
+                    .deleteDisabled(
+                        sessions.isMutating ||
+                            !chatModel.canDeleteSession(summary)
+                    )
                 }
                 .onDelete { offsets in
                     let selected = offsets.compactMap { index in

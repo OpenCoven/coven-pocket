@@ -762,6 +762,17 @@ final class FamiliarSelectionTests: XCTestCase {
         )
     }
 
+    func testPersistedSelectionCanBeClearedWithoutRoster() {
+        XCTAssertFalse(
+            FamiliarPickerSection.isPickerDisabled(
+                profile: .codex(profileID: "profile-a"),
+                roster: [],
+                state: .failed(reason: "Offline"),
+                selectedFamiliarID: "owl"
+            )
+        )
+    }
+
     func testPickerIdleProfileExplainsPairedDaemonSource() {
         XCTAssertEqual(
             FamiliarPickerSection.idleExplanation(

@@ -142,7 +142,10 @@ struct SessionsView: View {
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
-                    .disabled(sessions.isMutating)
+                    .disabled(
+                        sessions.isMutating ||
+                            !model.canDeleteSession(summary)
+                    )
                 }
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
@@ -150,7 +153,10 @@ struct SessionsView: View {
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
-                    .disabled(sessions.isMutating)
+                    .disabled(
+                        sessions.isMutating ||
+                            !model.canDeleteSession(summary)
+                    )
                 }
             }
         }

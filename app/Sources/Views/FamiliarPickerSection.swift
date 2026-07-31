@@ -165,7 +165,8 @@ struct FamiliarPickerSection: View {
             .disabled(Self.isPickerDisabled(
                 profile: profile,
                 roster: model.roster,
-                state: model.state
+                state: model.state,
+                selectedFamiliarID: model.selectedFamiliar?.id
             ))
             .accessibilityHint(
                 "Chooses the identity used when the next conversation starts."
@@ -196,10 +197,11 @@ struct FamiliarPickerSection: View {
     static func isPickerDisabled(
         profile: FamiliarProfileKey?,
         roster: [RemoteFamiliar],
-        state: FamiliarSelectionModel.State
+        state: FamiliarSelectionModel.State,
+        selectedFamiliarID: String? = nil
     ) -> Bool {
-        guard profile != nil, !roster.isEmpty else { return true }
-        return state == .loading
+        guard profile != nil, state != .loading else { return true }
+        return roster.isEmpty && selectedFamiliarID == nil
     }
 
     static func idleExplanation(

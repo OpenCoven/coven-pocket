@@ -275,6 +275,23 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertFalse(source.contains("rootWindowFactory.makeRoot()"))
     }
 
+    func testSidebarRoutesSessionDeletionThroughSharedChatModel() throws {
+        let appRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: appRoot.appendingPathComponent(
+                "Sources/Views/RootView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(
+            source.contains("chatModel: windowState.chatState.model")
+        )
+        XCTAssertFalse(source.contains("SidebarSessionsModel()"))
+    }
+
     @MainActor
     func testStandaloneRootInitializerIsExplicit() {
         let client = EngineClient(engine: SuspendedAuthEngine())
@@ -1841,6 +1858,66 @@ final class ChatSurfaceTests: XCTestCase {
             selectedFamiliar: familiarIdentity(id: "forge", name: "Forge")
         )
         XCTAssertEqual(boundary.startCallCount, 0)
+    }
+
+    @MainActor
+    func testDeletingLiveSessionIsRejectedUntilSessionIsReleased() async {
+        let summary = makeSummary()
+        let boundary = SessionBoundary()
+        boundary.resumeSessions = [
+            StubChatSession(sessionIdentifier: summary.sessionId)
+        ]
+        let model = ChatModel(performSessionOperation: boundary.perform)
+
+        let resumed = await model.resume(
+            summary,
+            settings: ChatSettings(backend: .codex, model: "test")
+        )
+        XCTAssertTrue(resumed)
+
+        do {
+            try await model.deleteSession(summary)
+            XCTFail("deleting the live session should be rejected")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Start a new chat before deleting the active session."
+            )
+        }
+        XCTAssertTrue(model.hasActiveSession)
+        XCTAssertEqual(model.activeSessionID, summary.sessionId)
+    }
+
+    @MainActor
+    func testDeletingSessionIsRejectedWhileResumeIsInstallingIt() async {
+        let summary = makeSummary()
+        let boundary = SessionBoundary()
+        boundary.suspendNextResume = true
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let resume = Task {
+            await model.resume(
+                summary,
+                settings: ChatSettings(backend: .codex, model: "test")
+            )
+        }
+        await fulfillment(of: [boundary.resumeRequested], timeout: 1)
+
+        do {
+            try await model.deleteSession(summary)
+            XCTFail("deletion should not race an installing session")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Finish the current chat operation before deleting sessions."
+            )
+        }
+
+        model.reset()
+        boundary.finishResume(
+            with: StubChatSession(sessionIdentifier: summary.sessionId)
+        )
+        let resumeSucceeded = await resume.value
+        XCTAssertFalse(resumeSucceeded)
     }
 
     @MainActor
