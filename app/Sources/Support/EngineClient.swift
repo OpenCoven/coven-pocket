@@ -10,17 +10,23 @@ final class EngineClient: ObservableObject {
     @Published var errorMessage: String?
     @Published var models: [PocketModel] = []
     @Published var codexModels: [PocketModel] = []
-    @Published var codexAccount: CodexAccount?
+    @Published var codexAccount: CodexAccount? {
+        didSet {
+            guard oldValue?.profileId != codexAccount?.profileId else { return }
+            codexModels = []
+        }
+    }
     @Published var authURL: URL?
     @Published var isAuthenticating = false
 
-    let engine = PocketEngine()
+    let engine: PocketEngine
 
     var engineVersion: String { engine.engineVersion() }
     var defaultModel: String { engine.defaultModel() }
     var defaultCodexModel: String { engine.defaultCodexModel() }
 
-    init() {
+    init(engine: PocketEngine = PocketEngine()) {
+        self.engine = engine
         codexAccount = engine.codexAccount()
     }
 
@@ -42,14 +48,18 @@ final class EngineClient: ObservableObject {
     }
 
     func loadCodexModels() async {
-        guard codexAccount != nil else { return }
+        guard let profileID = codexAccount?.profileId else { return }
         do {
             let loaded = try await engine.listCodexModels()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  codexAccount?.profileId == profileID
+            else { return }
             codexModels = loaded
             errorMessage = nil
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  codexAccount?.profileId == profileID
+            else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -58,6 +68,7 @@ final class EngineClient: ObservableObject {
     /// URL through `AuthBridge`, which publishes `authURL` for the UI to
     /// present; the call resolves once the user finishes (or fails) the flow.
     func codexLogin() async {
+        guard !isAuthenticating else { return }
         errorMessage = nil
         isAuthenticating = true
         defer {

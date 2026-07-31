@@ -1,13 +1,37 @@
 import SwiftUI
 import CoreSpotlight
 
+@MainActor
+struct CovenPocketAppDependencies {
+    let engineClient: EngineClient
+
+    static func live() -> Self {
+        Self(engineClient: EngineClient())
+    }
+}
+
 @main
 struct CovenPocketApp: App {
     @StateObject private var router = AppRouter.shared
+    @StateObject private var engineClient: EngineClient
+    let rootWindowFactory: RootWindowFactory
+
+    init() {
+        self.init(dependencies: .live())
+    }
+
+    init(dependencies: CovenPocketAppDependencies) {
+        _engineClient = StateObject(
+            wrappedValue: dependencies.engineClient
+        )
+        rootWindowFactory = RootWindowFactory(
+            client: dependencies.engineClient
+        )
+    }
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            rootWindowFactory.makeRoot()
                 // Spotlight result taps arrive as index continuations.
                 .onContinueUserActivity(CSSearchableItemActionType) { activity in
                     guard

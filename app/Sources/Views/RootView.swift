@@ -1,45 +1,92 @@
+import Combine
 import SwiftUI
 
-/// Adaptive app root: the phone keeps the tab bar; regular-width iPad gets
-/// a three-pane split — sections + sessions | selected section | context.
-struct RootView: View {
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @StateObject private var client: EngineClient
-    @StateObject private var chatState: ChatSurfaceState
-    @ObservedObject private var router = AppRouter.shared
+@MainActor
+final class CodexAccountTransitionObserver {
+    private var profileID: String?
+    private var observation: AnyCancellable?
 
-    init() {
-        _client = StateObject(wrappedValue: EngineClient())
-        _chatState = StateObject(wrappedValue: ChatSurfaceState())
+    init(
+        client: EngineClient,
+        onTransition: @escaping (String?, String?) -> Void
+    ) {
+        profileID = client.codexAccount?.profileId
+        observation = client.$codexAccount
+            .map { $0?.profileId }
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] newProfileID in
+                guard let self else { return }
+                let oldProfileID = profileID
+                profileID = newProfileID
+                onTransition(oldProfileID, newProfileID)
+            }
     }
+}
 
-    init(client: EngineClient) {
-        _client = StateObject(wrappedValue: client)
-        _chatState = StateObject(wrappedValue: ChatSurfaceState())
+@MainActor
+final class RootWindowState: ObservableObject {
+    let client: EngineClient
+    let chatState: ChatSurfaceState
+
+    private var accountObserver: CodexAccountTransitionObserver?
+
+    convenience init(client: EngineClient) {
+        self.init(client: client, chatState: ChatSurfaceState())
     }
 
     init(client: EngineClient, chatState: ChatSurfaceState) {
-        _client = StateObject(wrappedValue: client)
-        _chatState = StateObject(wrappedValue: chatState)
+        self.client = client
+        self.chatState = chatState
+        accountObserver = CodexAccountTransitionObserver(client: client) {
+            chatState.handleCodexAccountTransition(from: $0, to: $1)
+        }
     }
 
     var sectionFactory: RootSectionFactory {
         RootSectionFactory(client: client, chatState: chatState)
     }
+}
+
+/// Adaptive app root: the phone keeps the tab bar; regular-width iPad gets
+/// a three-pane split — sections + sessions | selected section | context.
+struct RootView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @StateObject private var windowState: RootWindowState
+    @ObservedObject private var router = AppRouter.shared
+
+    init(client: EngineClient) {
+        self.init(windowState: RootWindowState(client: client))
+    }
+
+    init(client: EngineClient, chatState: ChatSurfaceState) {
+        self.init(
+            windowState: RootWindowState(
+                client: client,
+                chatState: chatState
+            )
+        )
+    }
+
+    init(windowState: RootWindowState) {
+        _windowState = StateObject(
+            wrappedValue: windowState
+        )
+    }
+
+    init(standaloneClient client: EngineClient) {
+        self.init(client: client)
+    }
+
+    var sectionFactory: RootSectionFactory {
+        windowState.sectionFactory
+    }
 
     var body: some View {
-        Group {
-            if horizontalSizeClass == .regular {
-                splitLayout
-            } else {
-                tabLayout
-            }
-        }
-        .onChange(of: client.codexAccount?.profileId) { oldProfileID, newProfileID in
-            chatState.handleCodexAccountTransition(
-                from: oldProfileID,
-                to: newProfileID
-            )
+        if horizontalSizeClass == .regular {
+            splitLayout
+        } else {
+            tabLayout
         }
     }
 
@@ -85,6 +132,27 @@ struct RootView: View {
         case .diff: DiffDemoView()
         case .playground: sectionFactory.playground()
         }
+    }
+}
+
+@MainActor
+struct RootWindowFactory {
+    let client: EngineClient
+
+    func makeWindowState() -> RootWindowState {
+        RootWindowState(client: client)
+    }
+
+    func makeWindowState(chatState: ChatSurfaceState) -> RootWindowState {
+        RootWindowState(client: client, chatState: chatState)
+    }
+
+    func makeRoot() -> RootView {
+        RootView(windowState: makeWindowState())
+    }
+
+    func makeRoot(chatState: ChatSurfaceState) -> RootView {
+        RootView(windowState: makeWindowState(chatState: chatState))
     }
 }
 

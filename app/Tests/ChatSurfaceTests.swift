@@ -105,6 +105,127 @@ final class ChatSurfaceTests: XCTestCase {
         let forge: FamiliarIdentity
     }
 
+    private struct WindowAccountFixture {
+        let suiteName: String
+        let defaults: UserDefaults
+        let boundary: SessionBoundary
+        let model: ChatModel
+        let routes: ChatRouteGenerationCoordinator
+        let companionClient: FakeCompanionSessionClient
+        let companionModel: CompanionChatModel
+        let chatState: ChatSurfaceState
+
+        func cleanup() {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+    }
+
+    private struct WindowTransitionResult {
+        let firstWindow: RootWindowState
+        let secondWindow: RootWindowState
+        let client: EngineClient
+        let firstSession: TrackingChatSession
+        let lateSecondSession: TrackingChatSession
+        let firstRoute: ChatRouteGenerationCoordinator.Token
+        let secondRoute: ChatRouteGenerationCoordinator.Token
+    }
+
+    private final class SuspendedAuthEngine: PocketEngine, @unchecked Sendable {
+        let loginStarted = XCTestExpectation(description: "Codex login started")
+
+        private let lock = NSLock()
+        private var loginCalls = 0
+        private var loginContinuations: [CheckedContinuation<Void, Never>] = []
+
+        var loginCallCount: Int {
+            lock.withLock { loginCalls }
+        }
+
+        init() {
+            super.init(noHandle: PocketEngine.NoHandle())
+        }
+
+        required init(unsafeFromHandle handle: UInt64) {
+            super.init(unsafeFromHandle: handle)
+        }
+
+        override func codexAccount() -> CodexAccount? {
+            nil
+        }
+
+        override func codexLogin(delegate: CodexAuthDelegate) async throws -> CodexAccount {
+            let callCount = lock.withLock {
+                loginCalls += 1
+                return loginCalls
+            }
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    loginContinuations.append(continuation)
+                }
+                if callCount == 1 {
+                    loginStarted.fulfill()
+                }
+            }
+            return CodexAccount(
+                profileId: "profile-b",
+                email: "b@example.com",
+                accountId: nil
+            )
+        }
+
+        override func listCodexModels() async throws -> [PocketModel] {
+            []
+        }
+
+        func finishLogins() {
+            let continuations = lock.withLock {
+                let pending = loginContinuations
+                loginContinuations.removeAll()
+                return pending
+            }
+            continuations.forEach { $0.resume() }
+        }
+    }
+
+    private final class SuspendedCodexModelsEngine: PocketEngine, @unchecked Sendable {
+        let modelLoadStarted = XCTestExpectation(
+            description: "Codex model load started"
+        )
+
+        private let lock = NSLock()
+        private var pendingContinuation: CheckedContinuation<[PocketModel], Never>?
+
+        init() {
+            super.init(noHandle: PocketEngine.NoHandle())
+        }
+
+        required init(unsafeFromHandle handle: UInt64) {
+            super.init(unsafeFromHandle: handle)
+        }
+
+        override func codexAccount() -> CodexAccount? {
+            nil
+        }
+
+        override func listCodexModels() async throws -> [PocketModel] {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    pendingContinuation = continuation
+                }
+                modelLoadStarted.fulfill()
+            }
+        }
+
+        func finishModelLoad(with models: [PocketModel]) {
+            let continuation = lock.withLock {
+                let pending = pendingContinuation
+                pendingContinuation = nil
+                return pending
+            }
+            continuation?.resume(returning: models)
+        }
+    }
+
     @MainActor
     func testRootSectionConstructionSharesOneEngineClient() {
         let client = EngineClient()
@@ -112,6 +233,192 @@ final class ChatSurfaceTests: XCTestCase {
 
         XCTAssertTrue(root.sectionFactory.chat().client === client)
         XCTAssertTrue(root.sectionFactory.playground().client === client)
+    }
+
+    @MainActor
+    func testAppFactoryInjectsOneEngineClientAndCreatesPerWindowChatState() {
+        let client = EngineClient(engine: SuspendedAuthEngine())
+        let app = CovenPocketApp(
+            dependencies: CovenPocketAppDependencies(engineClient: client)
+        )
+
+        let first = app.rootWindowFactory.makeWindowState()
+        let second = app.rootWindowFactory.makeWindowState()
+
+        XCTAssertTrue(first.client === client)
+        XCTAssertTrue(second.client === client)
+        XCTAssertTrue(
+            first.sectionFactory.client === second.sectionFactory.client
+        )
+        XCTAssertFalse(
+            first.chatState === second.chatState
+        )
+    }
+
+    @MainActor
+    func testStandaloneRootInitializerIsExplicit() {
+        let client = EngineClient(engine: SuspendedAuthEngine())
+
+        _ = RootView(standaloneClient: client)
+    }
+
+    @MainActor
+    func testSharedAccountTransitionResetsBothWindowsAndPreservesCompanion() async throws {
+        let first = try await makeWindowAccountFixture(suspendsOnDeviceStart: false)
+        let second = try await makeWindowAccountFixture(suspendsOnDeviceStart: true)
+        defer {
+            first.cleanup()
+            second.cleanup()
+        }
+        let transition = await performSharedAccountTransition(
+            first: first,
+            second: second
+        )
+
+        assertAccountTransitionReset(
+            first: first,
+            second: second,
+            transition: transition
+        )
+        await assertSameProfilePreservesWindows(
+            first: first,
+            second: second,
+            client: transition.client
+        )
+    }
+
+    @MainActor
+    func testAccountObserversDeliverOneTransitionPerWindow() {
+        let client = EngineClient(engine: SuspendedAuthEngine())
+        client.codexAccount = CodexAccount(
+            profileId: "profile-a",
+            email: nil,
+            accountId: nil
+        )
+        var firstTransitions: [(String?, String?)] = []
+        var secondTransitions: [(String?, String?)] = []
+        let first = CodexAccountTransitionObserver(client: client) {
+            firstTransitions.append(($0, $1))
+        }
+        let second = CodexAccountTransitionObserver(client: client) {
+            secondTransitions.append(($0, $1))
+        }
+
+        client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: nil,
+            accountId: nil
+        )
+        client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: "same-profile@example.com",
+            accountId: nil
+        )
+
+        XCTAssertEqual(firstTransitions.count, 1)
+        XCTAssertEqual(secondTransitions.count, 1)
+        XCTAssertEqual(firstTransitions.first?.0, "profile-a")
+        XCTAssertEqual(firstTransitions.first?.1, "profile-b")
+        XCTAssertEqual(secondTransitions.first?.0, "profile-a")
+        XCTAssertEqual(secondTransitions.first?.1, "profile-b")
+        withExtendedLifetime((first, second)) {}
+    }
+
+    @MainActor
+    func testNewWindowAfterAccountChangeStartsFreshOnCurrentAccount() async throws {
+        let oldWindow = try await makeWindowAccountFixture(
+            suspendsOnDeviceStart: false
+        )
+        defer { oldWindow.cleanup() }
+        let oldSession = TrackingChatSession()
+        oldWindow.boundary.startSessions = [oldSession]
+        await oldWindow.model.send(
+            prompt: "account A",
+            settings: oldWindow.chatState.settings
+        )
+        let client = EngineClient(engine: SuspendedAuthEngine())
+        client.codexAccount = CodexAccount(
+            profileId: "profile-a",
+            email: nil,
+            accountId: nil
+        )
+        let app = CovenPocketApp(
+            dependencies: CovenPocketAppDependencies(engineClient: client)
+        )
+        let oldRoot = app.rootWindowFactory.makeWindowState(
+            chatState: oldWindow.chatState
+        )
+
+        client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: nil,
+            accountId: nil
+        )
+        let newRoot = app.rootWindowFactory.makeWindowState()
+
+        XCTAssertEqual(oldSession.stopCallCount, 1)
+        XCTAssertEqual(
+            newRoot.client.codexAccount?.profileId,
+            "profile-b"
+        )
+        XCTAssertFalse(
+            newRoot.chatState === oldRoot.chatState
+        )
+        XCTAssertFalse(newRoot.chatState.model.hasActiveSession)
+        XCTAssertTrue(newRoot.chatState.model.items.isEmpty)
+    }
+
+    @MainActor
+    func testSharedAuthenticationFenceStartsOnlyOneLogin() async {
+        let engine = SuspendedAuthEngine()
+        let client = EngineClient(engine: engine)
+        let app = CovenPocketApp(
+            dependencies: CovenPocketAppDependencies(engineClient: client)
+        )
+        let firstPlayground = app.rootWindowFactory.makeWindowState()
+            .sectionFactory.playground()
+        let secondPlayground = app.rootWindowFactory.makeWindowState()
+            .sectionFactory.playground()
+        XCTAssertTrue(firstPlayground.client === secondPlayground.client)
+
+        let firstLogin = Task { await client.codexLogin() }
+        await fulfillment(of: [engine.loginStarted], timeout: 1)
+        let secondLogin = Task { await client.codexLogin() }
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(client.isAuthenticating)
+        XCTAssertEqual(engine.loginCallCount, 1)
+        engine.finishLogins()
+        await firstLogin.value
+        await secondLogin.value
+        XCTAssertFalse(client.isAuthenticating)
+        XCTAssertEqual(client.codexAccount?.profileId, "profile-b")
+    }
+
+    @MainActor
+    func testAccountChangeClearsModelsAndDropsPreviousProfileLoad() async {
+        let engine = SuspendedCodexModelsEngine()
+        let client = EngineClient(engine: engine)
+        client.codexAccount = CodexAccount(
+            profileId: "profile-a",
+            email: nil,
+            accountId: nil
+        )
+        client.codexModels = [pocketModel(id: "profile-a-model")]
+        let load = Task { await client.loadCodexModels() }
+        await fulfillment(of: [engine.modelLoadStarted], timeout: 1)
+
+        client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: nil,
+            accountId: nil
+        )
+        engine.finishModelLoad(with: [pocketModel(id: "stale-profile-a-model")])
+        await load.value
+
+        XCTAssertTrue(client.codexModels.isEmpty)
     }
 
     @MainActor
@@ -2488,6 +2795,167 @@ final class ChatSurfaceTests: XCTestCase {
         )
     }
 
+    @MainActor
+    private func makeWindowAccountFixture(
+        suspendsOnDeviceStart: Bool
+    ) async throws -> WindowAccountFixture {
+        let suiteName = "window-account-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = suspendsOnDeviceStart
+        let model = ChatModel(
+            defaults: defaults,
+            performSessionOperation: boundary.perform
+        )
+        let routes = ChatRouteGenerationCoordinator()
+        let companion = CompanionModel(
+            store: ChatSurfacePairingStore(stored: nil)
+        )
+        let companionClient = FakeCompanionSessionClient(
+            gate: .ready(pairedDaemon())
+        )
+        let companionModel = CompanionChatModel(client: companionClient)
+        await companionModel.send(prompt: "remote", projectRoot: "/srv/repo")
+        let familiarModel = FamiliarSelectionModel(
+            client: NoopFamiliarRosterClient(),
+            store: FamiliarSelectionStore(defaults: defaults)
+        )
+        let chatState = ChatSurfaceState(
+            model: model,
+            companion: companion,
+            companionModel: companionModel,
+            familiarModel: familiarModel,
+            routeCoordinator: routes,
+            settings: ChatSettings(backend: .codex, model: "test")
+        )
+        return WindowAccountFixture(
+            suiteName: suiteName,
+            defaults: defaults,
+            boundary: boundary,
+            model: model,
+            routes: routes,
+            companionClient: companionClient,
+            companionModel: companionModel,
+            chatState: chatState
+        )
+    }
+
+    @MainActor
+    private func assertAccountTransitionReset(
+        first: WindowAccountFixture,
+        second: WindowAccountFixture,
+        transition: WindowTransitionResult
+    ) {
+        XCTAssertTrue(
+            transition.firstWindow.sectionFactory.client === transition.client
+        )
+        XCTAssertTrue(
+            transition.secondWindow.sectionFactory.client === transition.client
+        )
+        XCTAssertEqual(transition.firstSession.stopCallCount, 1)
+        XCTAssertEqual(transition.lateSecondSession.stopCallCount, 1)
+        XCTAssertFalse(first.routes.isCurrent(transition.firstRoute))
+        XCTAssertFalse(second.routes.isCurrent(transition.secondRoute))
+        XCTAssertFalse(first.model.hasActiveSession)
+        XCTAssertFalse(second.model.hasActiveSession)
+        XCTAssertTrue(first.model.items.isEmpty)
+        XCTAssertTrue(second.model.items.isEmpty)
+        XCTAssertTrue(first.companionModel.hasActiveSession)
+        XCTAssertTrue(second.companionModel.hasActiveSession)
+        XCTAssertEqual(first.companionModel.items.map(\.text), ["remote"])
+        XCTAssertEqual(second.companionModel.items.map(\.text), ["remote"])
+        XCTAssertTrue(first.companionClient.killedSessionIDs.isEmpty)
+        XCTAssertTrue(second.companionClient.killedSessionIDs.isEmpty)
+    }
+
+    @MainActor
+    private func performSharedAccountTransition(
+        first: WindowAccountFixture,
+        second: WindowAccountFixture
+    ) async -> WindowTransitionResult {
+        let firstSession = TrackingChatSession()
+        first.boundary.startSessions = [firstSession]
+        await first.model.send(
+            prompt: "account A active",
+            settings: first.chatState.settings
+        )
+        let pendingSend = Task {
+            await second.model.send(
+                prompt: "account A in flight",
+                settings: second.chatState.settings
+            )
+        }
+        await fulfillment(of: [second.boundary.startRequested], timeout: 1)
+        let lateSecondSession = TrackingChatSession()
+        let client = EngineClient(engine: SuspendedAuthEngine())
+        client.codexAccount = CodexAccount(
+            profileId: "profile-a",
+            email: "a@example.com",
+            accountId: nil
+        )
+        let app = CovenPocketApp(
+            dependencies: CovenPocketAppDependencies(engineClient: client)
+        )
+        let firstWindow = app.rootWindowFactory.makeWindowState(
+            chatState: first.chatState
+        )
+        let secondWindow = app.rootWindowFactory.makeWindowState(
+            chatState: second.chatState
+        )
+        let firstRoute = first.routes.begin()
+        let secondRoute = second.routes.begin()
+
+        client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: "b@example.com",
+            accountId: nil
+        )
+        second.boundary.finishStart(with: lateSecondSession)
+        await pendingSend.value
+        return WindowTransitionResult(
+            firstWindow: firstWindow,
+            secondWindow: secondWindow,
+            client: client,
+            firstSession: firstSession,
+            lateSecondSession: lateSecondSession,
+            firstRoute: firstRoute,
+            secondRoute: secondRoute
+        )
+    }
+
+    @MainActor
+    private func assertSameProfilePreservesWindows(
+        first: WindowAccountFixture,
+        second: WindowAccountFixture,
+        client: EngineClient
+    ) async {
+        let firstSession = TrackingChatSession()
+        let secondSession = TrackingChatSession()
+        first.boundary.startSessions = [firstSession]
+        second.boundary.startSessions = [secondSession]
+        await first.model.send(
+            prompt: "account B first",
+            settings: first.chatState.settings
+        )
+        await second.model.send(
+            prompt: "account B second",
+            settings: second.chatState.settings
+        )
+
+        client.codexAccount = CodexAccount(
+            profileId: "profile-b",
+            email: "updated@example.com",
+            accountId: "updated"
+        )
+
+        XCTAssertTrue(first.model.hasActiveSession)
+        XCTAssertTrue(second.model.hasActiveSession)
+        XCTAssertEqual(firstSession.stopCallCount, 0)
+        XCTAssertEqual(secondSession.stopCallCount, 0)
+        XCTAssertEqual(first.companionModel.items.map(\.text), ["remote"])
+        XCTAssertEqual(second.companionModel.items.map(\.text), ["remote"])
+    }
+
     private func familiarIdentity(
         id: String,
         name: String,
@@ -2499,6 +2967,16 @@ final class ChatSurfaceTests: XCTestCase {
             displayName: name,
             emoji: emoji,
             role: role
+        )
+    }
+
+    private func pocketModel(id: String) -> PocketModel {
+        PocketModel(
+            id: id,
+            providerId: "codex",
+            name: id,
+            contextWindow: 128_000,
+            maxOutputTokens: 16_000
         )
     }
 
