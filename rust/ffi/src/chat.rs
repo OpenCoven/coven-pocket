@@ -33,7 +33,7 @@ use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::remote::FamiliarIdentity;
+use crate::remote::{normalize_familiar_identity, FamiliarIdentity};
 use crate::{PocketError, PocketProvider};
 
 #[cfg(test)]
@@ -595,6 +595,7 @@ pub(crate) async fn start_session(
     familiar: Option<FamiliarIdentity>,
     inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
+    let familiar = familiar.map(normalize_familiar_identity).transpose()?;
     let workspace = resolve_workspace(&workspace_dir)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     let persistence = if let Some(storage_dir) = storage_dir.as_deref() {
@@ -1601,6 +1602,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_session_normalizes_arbitrary_familiar_input() {
+        let workspace = temp_dir("ws-normalize-familiar");
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+            Some(crate::remote::FamiliarIdentity {
+                id: " familiar-1 ".to_string(),
+                display_name: " Morgana ".to_string(),
+                emoji: Some(" moon ".to_string()),
+                role: Some(" repository guide ".to_string()),
+            }),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.config.familiar,
+            Some(crate::remote::FamiliarIdentity {
+                id: "familiar-1".to_string(),
+                display_name: "Morgana".to_string(),
+                emoji: Some("moon".to_string()),
+                role: Some("repository guide".to_string()),
+            })
+        );
+        assert!(session
+            .append_system_prompt()
+            .contains("[Identity: You are Morgana, a repository guide."));
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_oversized_familiar_before_persistence_or_prompt() {
+        let storage = temp_dir("store-oversized-familiar");
+        let workspace = temp_dir("ws-oversized-familiar");
+        let mut identity = test_familiar(Some("repository guide"));
+        identity.role = Some("r".repeat(1025));
+
+        let err = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            Some(storage.display().to_string()),
+            Some(identity),
+            false,
+        )
+        .await
+        .err()
+        .expect("oversized familiar must be rejected before creating a session");
+        let message = err.to_string();
+        assert!(message.contains("familiar role"), "got: {message}");
+        assert!(message.contains("1024-byte limit"), "got: {message}");
+        assert!(!storage.join("metadata").exists());
+        assert!(!storage.join(".session-lifecycle").exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
     async fn familiar_keeps_plan_mode_platform_note_and_memory_order() {
         let guard = crate::memory::tests::setup("chat-familiar");
         std::fs::write(guard.workspace.join("AGENTS.md"), "Pinned project memory.").unwrap();
@@ -2170,6 +2240,49 @@ mod tests {
         .err()
         .expect("malformed familiar metadata must fail resume");
         assert!(err.to_string().contains("cannot parse familiar metadata"));
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_oversized_familiar_metadata_before_reading_it() {
+        let storage = temp_dir("store-resume-oversized-familiar");
+        let workspace = temp_dir("ws-resume-oversized-familiar");
+        let storage_str = storage.display().to_string();
+        let original = persisted_session(&storage, &workspace).await;
+        let session_id = original.session_id();
+        let metadata = storage
+            .join("metadata")
+            .join(format!("{session_id}.familiar.json"));
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&metadata).unwrap();
+        file.set_len(crate::sessions::MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1)
+            .unwrap();
+        drop(file);
+        drop(original);
+
+        let err = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            storage_str,
+            session_id,
+            false,
+        )
+        .await
+        .err()
+        .expect("oversized familiar metadata must fail resume");
+        let message = err.to_string();
+        assert!(message.contains("familiar metadata"), "got: {message}");
+        assert!(message.contains("10240-byte limit"), "got: {message}");
+        assert_eq!(
+            std::fs::symlink_metadata(metadata).unwrap().len(),
+            crate::sessions::MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1
+        );
 
         std::fs::remove_dir_all(storage).unwrap();
         std::fs::remove_dir_all(workspace).unwrap();

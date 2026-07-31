@@ -7,12 +7,33 @@
 //! quiet in the background.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::time::Duration;
 
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::PocketError;
+
+/// Maximum number of rows retained from the daemon Familiar roster.
+pub(crate) const MAX_FAMILIAR_ROSTER_ENTRIES: usize = 256;
+/// Familiar IDs are compact daemon/UI keys, not free-form prompt text.
+pub(crate) const MAX_FAMILIAR_ID_BYTES: usize = 128;
+/// Display names and compact visual metadata stay UI-sized.
+pub(crate) const MAX_FAMILIAR_DISPLAY_NAME_BYTES: usize = 256;
+pub(crate) const MAX_FAMILIAR_EMOJI_BYTES: usize = 256;
+pub(crate) const MAX_FAMILIAR_ICON_BYTES: usize = 256;
+pub(crate) const MAX_FAMILIAR_PRONOUNS_BYTES: usize = 256;
+/// Roles can carry a short persona label used in the identity preamble.
+pub(crate) const MAX_FAMILIAR_ROLE_BYTES: usize = 1024;
+/// Roster descriptions are UI copy and never enter a pinned identity sidecar.
+pub(crate) const MAX_FAMILIAR_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum raw UTF-8 bytes retained by one pinned identity.
+pub(crate) const MAX_FAMILIAR_IDENTITY_FIELD_BYTES: usize = MAX_FAMILIAR_ID_BYTES
+    + MAX_FAMILIAR_DISPLAY_NAME_BYTES
+    + MAX_FAMILIAR_EMOJI_BYTES
+    + MAX_FAMILIAR_ROLE_BYTES;
 
 /// A familiar the UI can identify without loading the full roster row.
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,6 +100,9 @@ pub(crate) async fn launch(
     familiar_id: Option<&str>,
     timeout: Duration,
 ) -> Result<RemoteSession, PocketError> {
+    let familiar_id = familiar_id
+        .map(normalize_companion_familiar_id)
+        .transpose()?;
     let mut payload = serde_json::Map::from_iter([
         (
             "projectRoot".to_string(),
@@ -105,7 +129,7 @@ pub(crate) async fn launch(
             serde_json::Value::String("stream".to_string()),
         ),
     ]);
-    if let Some(familiar_id) = familiar_id.and_then(trimmed_nonblank) {
+    if let Some(familiar_id) = familiar_id {
         payload.insert(
             "familiarId".to_string(),
             serde_json::Value::String(familiar_id),
@@ -123,7 +147,7 @@ pub(crate) async fn launch(
     .await?;
     let row: serde_json::Value = serde_json::from_str(&body)
         .map_err(|error| daemon_shape_error("launched session", error))?;
-    Ok(session_from(&row))
+    session_from(&row)
 }
 
 /// List familiars on the daemon, in daemon order.
@@ -133,22 +157,7 @@ pub(crate) async fn familiars(
     timeout: Duration,
 ) -> Result<Vec<RemoteFamiliar>, PocketError> {
     let body = request(host, port, "GET", "/api/v1/familiars", None, timeout).await?;
-    let rows: Vec<DaemonFamiliar> = serde_json::from_str(&body)
-        .map_err(|error| daemon_shape_error("familiar roster", error))?;
-    let mut seen_ids = HashSet::new();
-    let mut familiars = Vec::with_capacity(rows.len());
-    for row in rows {
-        let familiar = row.normalize()?;
-        let canonical_id = familiar.id.to_lowercase();
-        if !seen_ids.insert(canonical_id) {
-            return Err(familiar_roster_error(format!(
-                "duplicate familiar id `{}`",
-                familiar.id
-            )));
-        }
-        familiars.push(familiar);
-    }
-    Ok(familiars)
+    decode_familiar_roster(&body)
 }
 
 /// List sessions on the daemon, newest first as the daemon returns them.
@@ -160,7 +169,7 @@ pub(crate) async fn sessions(
     let body = request(host, port, "GET", "/api/v1/sessions", None, timeout).await?;
     let rows: Vec<serde_json::Value> =
         serde_json::from_str(&body).map_err(|e| daemon_shape_error("session list", e))?;
-    Ok(rows.iter().map(session_from).collect())
+    rows.iter().map(session_from).collect()
 }
 
 /// Read one page of a session's events after `after_seq`.
@@ -225,14 +234,19 @@ pub(crate) async fn kill(
     Ok(())
 }
 
-fn session_from(row: &serde_json::Value) -> RemoteSession {
+fn session_from(row: &serde_json::Value) -> Result<RemoteSession, PocketError> {
     let text = |key: &str| {
         row.get(key)
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string()
     };
-    RemoteSession {
+    let familiar_id = row
+        .get("familiar_id")
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_companion_familiar_id)
+        .transpose()?;
+    Ok(RemoteSession {
         id: text("id"),
         harness: text("harness"),
         title: text("title"),
@@ -240,8 +254,8 @@ fn session_from(row: &serde_json::Value) -> RemoteSession {
         project_root: text("project_root"),
         created_at: text("created_at"),
         updated_at: text("updated_at"),
-        familiar_id: optional_json_text(row, "familiar_id"),
-    }
+        familiar_id,
+    })
 }
 
 fn event_from(row: &serde_json::Value) -> RemoteEvent {
@@ -273,9 +287,29 @@ struct DaemonFamiliar {
 }
 
 impl DaemonFamiliar {
-    fn normalize(self) -> Result<RemoteFamiliar, PocketError> {
-        let id = trimmed_nonblank(self.id.as_str())
-            .ok_or_else(|| familiar_roster_error("familiar id cannot be blank"))?;
+    fn normalize(self) -> Result<RemoteFamiliar, FamiliarValidationError> {
+        validate_familiar_field("id", &self.id, MAX_FAMILIAR_ID_BYTES)?;
+        validate_familiar_field(
+            "display name",
+            &self.display_name,
+            MAX_FAMILIAR_DISPLAY_NAME_BYTES,
+        )?;
+        validate_optional_familiar_field("emoji", self.emoji.as_deref(), MAX_FAMILIAR_EMOJI_BYTES)?;
+        validate_optional_familiar_field("role", self.role.as_deref(), MAX_FAMILIAR_ROLE_BYTES)?;
+        validate_optional_familiar_field(
+            "description",
+            self.description.as_deref(),
+            MAX_FAMILIAR_DESCRIPTION_BYTES,
+        )?;
+        validate_optional_familiar_field(
+            "pronouns",
+            self.pronouns.as_deref(),
+            MAX_FAMILIAR_PRONOUNS_BYTES,
+        )?;
+        validate_optional_familiar_field("icon", self.icon.as_deref(), MAX_FAMILIAR_ICON_BYTES)?;
+        validate_nonblank_familiar_id(&self.id)?;
+
+        let id = self.id.trim().to_string();
         let display_name =
             trimmed_nonblank(self.display_name.as_str()).unwrap_or_else(|| id.clone());
         Ok(RemoteFamiliar {
@@ -290,10 +324,231 @@ impl DaemonFamiliar {
     }
 }
 
-fn optional_json_text(row: &serde_json::Value, key: &str) -> Option<String> {
-    row.get(key)
-        .and_then(|value| value.as_str())
-        .and_then(trimmed_nonblank)
+#[derive(Debug)]
+struct FamiliarValidationError {
+    message: String,
+}
+
+impl FamiliarValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for FamiliarValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn validate_familiar_field(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), FamiliarValidationError> {
+    if value.len() > max_bytes {
+        return Err(FamiliarValidationError::new(format!(
+            "familiar {field} exceeds the {max_bytes}-byte limit for that field"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_familiar_field(
+    field: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), FamiliarValidationError> {
+    if let Some(value) = value {
+        validate_familiar_field(field, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_nonblank_familiar_id(id: &str) -> Result<(), FamiliarValidationError> {
+    if id.trim().is_empty() {
+        return Err(FamiliarValidationError::new("familiar id cannot be blank"));
+    }
+    Ok(())
+}
+
+fn validate_familiar_identity_fields(
+    familiar: &FamiliarIdentity,
+) -> Result<(), FamiliarValidationError> {
+    validate_familiar_field("id", &familiar.id, MAX_FAMILIAR_ID_BYTES)?;
+    validate_familiar_field(
+        "display name",
+        &familiar.display_name,
+        MAX_FAMILIAR_DISPLAY_NAME_BYTES,
+    )?;
+    validate_optional_familiar_field("emoji", familiar.emoji.as_deref(), MAX_FAMILIAR_EMOJI_BYTES)?;
+    validate_optional_familiar_field("role", familiar.role.as_deref(), MAX_FAMILIAR_ROLE_BYTES)?;
+    validate_nonblank_familiar_id(&familiar.id)
+}
+
+fn familiar_identity_error(error: FamiliarValidationError) -> PocketError {
+    PocketError::Engine {
+        message: format!("invalid familiar identity: {error}"),
+    }
+}
+
+/// Validate an exact pinned identity without allocating normalized copies.
+pub(crate) fn validate_familiar_identity(familiar: &FamiliarIdentity) -> Result<(), PocketError> {
+    validate_familiar_identity_fields(familiar).map_err(familiar_identity_error)
+}
+
+/// Validate all raw fields before allocating the small trimmed representation.
+pub(crate) fn normalize_familiar_identity(
+    familiar: FamiliarIdentity,
+) -> Result<FamiliarIdentity, PocketError> {
+    validate_familiar_identity(&familiar)?;
+    let id = familiar.id.trim().to_string();
+    let display_name = trimmed_nonblank(&familiar.display_name).unwrap_or_else(|| id.clone());
+    Ok(FamiliarIdentity {
+        id,
+        display_name,
+        emoji: trim_optional(familiar.emoji),
+        role: trim_optional(familiar.role),
+    })
+}
+
+fn normalize_companion_familiar_id(value: &str) -> Result<String, PocketError> {
+    validate_familiar_field("id", value, MAX_FAMILIAR_ID_BYTES).map_err(familiar_identity_error)?;
+    validate_nonblank_familiar_id(value).map_err(familiar_identity_error)?;
+    Ok(value.trim().to_string())
+}
+
+#[derive(Debug, Default)]
+struct FamiliarRosterDecodeMetrics {
+    rows_deserialized: usize,
+    max_rows_retained: usize,
+    max_vector_capacity: usize,
+}
+
+struct FamiliarRosterSeed<'a> {
+    metrics: &'a mut FamiliarRosterDecodeMetrics,
+}
+
+impl<'de> DeserializeSeed<'de> for FamiliarRosterSeed<'_> {
+    type Value = Vec<RemoteFamiliar>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(FamiliarRosterVisitor {
+            metrics: self.metrics,
+        })
+    }
+}
+
+struct FamiliarRosterVisitor<'a> {
+    metrics: &'a mut FamiliarRosterDecodeMetrics,
+}
+
+struct RejectExtraFamiliar;
+
+impl<'de> DeserializeSeed<'de> for RejectExtraFamiliar {
+    type Value = ();
+
+    fn deserialize<D>(self, _deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Err(serde::de::Error::custom(format!(
+            "familiar roster exceeds the {MAX_FAMILIAR_ROSTER_ENTRIES}-entry limit"
+        )))
+    }
+}
+
+impl<'de> Visitor<'de> for FamiliarRosterVisitor<'_> {
+    type Value = Vec<RemoteFamiliar>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a familiar roster array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let capacity = sequence
+            .size_hint()
+            .unwrap_or_default()
+            .min(MAX_FAMILIAR_ROSTER_ENTRIES);
+        let mut familiars = Vec::with_capacity(capacity);
+        let mut seen_ids = HashSet::with_capacity(capacity);
+        let mut first_validation_error = None;
+        self.metrics.max_vector_capacity = familiars.capacity();
+
+        for _ in 0..MAX_FAMILIAR_ROSTER_ENTRIES {
+            let Some(row) = sequence.next_element::<DaemonFamiliar>()? else {
+                return match first_validation_error {
+                    Some(error) => Err(serde::de::Error::custom(error)),
+                    None => Ok(familiars),
+                };
+            };
+            self.metrics.rows_deserialized += 1;
+            match row.normalize() {
+                Ok(familiar) => {
+                    let canonical_id = familiar.id.to_lowercase();
+                    if !seen_ids.insert(canonical_id) {
+                        first_validation_error.get_or_insert_with(|| {
+                            format!("duplicate familiar id `{}`", familiar.id)
+                        });
+                    } else {
+                        familiars.push(familiar);
+                        self.metrics.max_rows_retained =
+                            self.metrics.max_rows_retained.max(familiars.len());
+                        self.metrics.max_vector_capacity =
+                            self.metrics.max_vector_capacity.max(familiars.capacity());
+                    }
+                }
+                Err(error) => {
+                    first_validation_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+
+        let _ = sequence.next_element_seed(RejectExtraFamiliar)?;
+
+        match first_validation_error {
+            Some(error) => Err(serde::de::Error::custom(error)),
+            None => Ok(familiars),
+        }
+    }
+}
+
+fn decode_familiar_roster_with_metrics(
+    body: &str,
+    metrics: &mut FamiliarRosterDecodeMetrics,
+) -> Result<Vec<RemoteFamiliar>, PocketError> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let familiars = FamiliarRosterSeed { metrics }
+        .deserialize(&mut deserializer)
+        .map_err(|error| daemon_shape_error("familiar roster", error))?;
+    deserializer
+        .end()
+        .map_err(|error| daemon_shape_error("familiar roster", error))?;
+    Ok(familiars)
+}
+
+fn decode_familiar_roster(body: &str) -> Result<Vec<RemoteFamiliar>, PocketError> {
+    decode_familiar_roster_with_metrics(body, &mut FamiliarRosterDecodeMetrics::default())
+}
+
+#[cfg(test)]
+fn decode_familiar_roster_instrumented(
+    body: &str,
+) -> (
+    Result<Vec<RemoteFamiliar>, PocketError>,
+    FamiliarRosterDecodeMetrics,
+) {
+    let mut metrics = FamiliarRosterDecodeMetrics::default();
+    let result = decode_familiar_roster_with_metrics(body, &mut metrics);
+    (result, metrics)
 }
 
 fn trim_optional(value: Option<String>) -> Option<String> {
@@ -381,7 +636,12 @@ async fn write_request(
             format!("daemon response exceeded the {MAX_RESPONSE_BYTES}-byte cap"),
         ));
     }
-    Ok(String::from_utf8_lossy(&response).into_owned())
+    String::from_utf8(response).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("daemon response was not valid UTF-8: {error}"),
+        )
+    })
 }
 
 /// Split a raw HTTP/1.1 response into status code and body.
@@ -422,15 +682,6 @@ fn daemon_shape_error(what: &str, err: serde_json::Error) -> PocketError {
     }
 }
 
-fn familiar_roster_error(detail: impl Into<String>) -> PocketError {
-    PocketError::Engine {
-        message: format!(
-            "could not read the daemon's familiar roster: {}",
-            detail.into()
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,11 +693,12 @@ mod tests {
     /// Serve one canned HTTP response and capture the request line + body.
     async fn serve_once(
         status_line: &'static str,
-        body: &'static str,
+        body: impl Into<String>,
     ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = body.into();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 16 * 1024];
@@ -461,6 +713,41 @@ mod tests {
             }
         });
         (port, rx)
+    }
+
+    fn roster_body(rows: usize, row: impl Fn(usize) -> String) -> String {
+        let mut body = String::from("[");
+        for index in 0..rows {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push_str(&row(index));
+        }
+        body.push(']');
+        body
+    }
+
+    fn familiar_with_field(field: &str, value: String) -> DaemonFamiliar {
+        let mut familiar = DaemonFamiliar {
+            id: "sage".to_string(),
+            display_name: "Sage".to_string(),
+            emoji: None,
+            role: None,
+            description: None,
+            pronouns: None,
+            icon: None,
+        };
+        match field {
+            "id" => familiar.id = value,
+            "display name" => familiar.display_name = value,
+            "emoji" => familiar.emoji = Some(value),
+            "role" => familiar.role = Some(value),
+            "description" => familiar.description = Some(value),
+            "pronouns" => familiar.pronouns = Some(value),
+            "icon" => familiar.icon = Some(value),
+            other => panic!("unknown familiar field {other}"),
+        }
+        familiar
     }
 
     #[tokio::test]
@@ -479,6 +766,22 @@ mod tests {
         assert_eq!(rows[0].status, "running");
         assert_eq!(rows[0].project_root, "/w");
         assert_eq!(rows[0].familiar_id.as_deref(), Some("sage"));
+    }
+
+    #[tokio::test]
+    async fn session_rows_reject_oversized_familiar_ids_before_swift_bridge() {
+        let body = format!(
+            r#"[{{"id":"s-1","project_root":"/w","harness":"codex","title":"Fix bug",
+                "familiar_id":"{}","status":"running",
+                "created_at":"2026-01-01","updated_at":"2026-01-02"}}]"#,
+            "x".repeat(129)
+        );
+        let (port, _rx) = serve_once("HTTP/1.1 200 OK", body).await;
+
+        let err = sessions("127.0.0.1", port, TIMEOUT).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("familiar id"), "got: {message}");
+        assert!(message.contains("128-byte limit"), "got: {message}");
     }
 
     #[tokio::test]
@@ -539,6 +842,122 @@ mod tests {
             err.to_string().contains("duplicate familiar id"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn familiar_roster_rejects_entry_257() {
+        let body = roster_body(257, |index| {
+            format!(r#"{{"id":"familiar-{index}","display_name":"Familiar {index}"}}"#)
+        });
+        let (port, _rx) = serve_once("HTTP/1.1 200 OK", body).await;
+
+        let err = familiars("127.0.0.1", port, TIMEOUT).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("familiar roster"), "got: {message}");
+        assert!(message.contains("256-entry limit"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn familiar_roster_limit_stops_before_row_258_tail() {
+        let mut body = roster_body(257, |index| {
+            format!(r#"{{"id":"familiar-{index}","display_name":"Familiar {index}"}}"#)
+        });
+        body.pop();
+        body.push_str(r#",{"id":["malformed tail that must not be parsed"}]"#);
+        let (port, _rx) = serve_once("HTTP/1.1 200 OK", body).await;
+
+        let err = familiars("127.0.0.1", port, TIMEOUT).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("256-entry limit"), "got: {message}");
+        assert!(!message.contains("expected a string"), "got: {message}");
+    }
+
+    #[test]
+    fn familiar_roster_visitor_instrumentation_stays_bounded() {
+        let body = roster_body(257, |index| {
+            format!(r#"{{"id":"familiar-{index}","display_name":"Familiar {index}"}}"#)
+        });
+
+        let (result, metrics) = decode_familiar_roster_instrumented(&body);
+
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("256-entry limit"), "got: {message}");
+        assert_eq!(metrics.rows_deserialized, 256);
+        assert_eq!(metrics.max_rows_retained, 256);
+        assert!(metrics.max_vector_capacity <= 256, "{metrics:?}");
+    }
+
+    #[test]
+    fn familiar_roster_rejects_before_deserializing_huge_row_257() {
+        let mut body = roster_body(256, |index| {
+            format!(r#"{{"id":"familiar-{index}","display_name":"Familiar {index}"}}"#)
+        });
+        body.pop();
+        body.push_str(r#",{"id":""#);
+        body.push_str(&"x".repeat(1_000_000));
+        assert!(body.len() < MAX_RESPONSE_BYTES as usize);
+
+        let (result, metrics) = decode_familiar_roster_instrumented(&body);
+
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("256-entry limit"), "got: {message}");
+        assert_eq!(metrics.rows_deserialized, 256);
+        assert_eq!(metrics.max_rows_retained, 256);
+        assert!(metrics.max_vector_capacity <= 256, "{metrics:?}");
+    }
+
+    #[test]
+    fn million_empty_familiar_rows_reject_at_the_roster_limit() {
+        let body = roster_body(1_000_000, |_| "{}".to_string());
+        assert!(body.len() < MAX_RESPONSE_BYTES as usize);
+        let (result, metrics) = decode_familiar_roster_instrumented(&body);
+
+        let err = result.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("256-entry limit"), "got: {message}");
+        assert!(!message.contains("id cannot be blank"), "got: {message}");
+        assert_eq!(metrics.rows_deserialized, 256);
+        assert_eq!(metrics.max_rows_retained, 0);
+        assert!(metrics.max_vector_capacity <= 256, "{metrics:?}");
+    }
+
+    #[test]
+    fn familiar_field_byte_limits_accept_boundaries_and_reject_plus_one() {
+        for (field, limit) in [
+            ("id", MAX_FAMILIAR_ID_BYTES),
+            ("display name", MAX_FAMILIAR_DISPLAY_NAME_BYTES),
+            ("emoji", MAX_FAMILIAR_EMOJI_BYTES),
+            ("role", MAX_FAMILIAR_ROLE_BYTES),
+            ("description", MAX_FAMILIAR_DESCRIPTION_BYTES),
+            ("pronouns", MAX_FAMILIAR_PRONOUNS_BYTES),
+            ("icon", MAX_FAMILIAR_ICON_BYTES),
+        ] {
+            familiar_with_field(field, "x".repeat(limit))
+                .normalize()
+                .unwrap_or_else(|err| panic!("{field} boundary rejected: {err}"));
+
+            let err = familiar_with_field(field, "x".repeat(limit + 1))
+                .normalize()
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(field), "{field}: {message}");
+            assert!(message.contains("limit"), "{field}: {message}");
+        }
+    }
+
+    #[test]
+    fn familiar_field_limits_count_utf8_bytes() {
+        let accepted = familiar_with_field("id", "é".repeat(64))
+            .normalize()
+            .unwrap();
+        assert_eq!(accepted.id.len(), 128);
+
+        let err = familiar_with_field("id", "é".repeat(65))
+            .normalize()
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("id"), "got: {message}");
+        assert!(message.contains("128-byte limit"), "got: {message}");
     }
 
     #[tokio::test]
@@ -626,6 +1045,54 @@ mod tests {
         let body = request.split_once("\r\n\r\n").unwrap().1;
         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(payload["familiarId"], "sage");
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_oversized_familiar_id_before_transport() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let err = launch(
+            "127.0.0.1",
+            port,
+            "/srv/repo",
+            "Fix tests",
+            "Fix tests",
+            Some(&"x".repeat(129)),
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("familiar id"), "got: {message}");
+        assert!(message.contains("128-byte limit"), "got: {message}");
+        assert!(!message.contains("could not reach"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_blank_familiar_id_before_transport() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let err = launch(
+            "127.0.0.1",
+            port,
+            "/srv/repo",
+            "Fix tests",
+            "Fix tests",
+            Some("   "),
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("familiar id cannot be blank"),
+            "got: {message}"
+        );
+        assert!(!message.contains("could not reach"), "got: {message}");
     }
 
     #[tokio::test]
@@ -774,5 +1241,26 @@ mod tests {
             .unwrap_err();
         let text = format!("{err:?}");
         assert!(text.contains("byte cap"), "unexpected error: {text}");
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_response_is_rejected_without_lossy_field_expansion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = stream.read(&mut buf).await;
+                let mut response =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n[{\"id\":\"".to_vec();
+                response.push(0xff);
+                response.extend_from_slice(b"\"}]");
+                let _ = stream.write_all(&response).await;
+            }
+        });
+
+        let err = familiars("127.0.0.1", port, TIMEOUT).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("valid UTF-8"), "got: {message}");
     }
 }

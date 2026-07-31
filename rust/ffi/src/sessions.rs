@@ -46,7 +46,9 @@ use claurst_core::session_storage::{
 use claurst_core::types::{Message, Role};
 use claurst_core::SqliteSessionStore;
 
-use crate::remote::FamiliarIdentity;
+use crate::remote::{
+    validate_familiar_identity, FamiliarIdentity, MAX_FAMILIAR_IDENTITY_FIELD_BYTES,
+};
 use crate::PocketError;
 
 const INDEX_RECORD_VERSION: u32 = 1;
@@ -54,6 +56,13 @@ const LEGACY_RECONCILIATION_MODEL_MARKER: &str = "\0coven-pocket-legacy-index-re
 const MAX_BASELINE_RECORD_BYTES: u64 = 4 * 1024;
 const MAX_SESSION_MODEL_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_INDEX_RECORD_ENVELOPE_BYTES: u64 = 4 * 1024;
+/// A pinned identity has at most 1,664 UTF-8 field bytes. In the worst case,
+/// JSON escapes every byte as `\u00XX` (9,984 bytes), and the object syntax
+/// adds 48 bytes, so 10 KiB covers every valid identity with a small margin.
+pub(crate) const MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES: u64 = 10 * 1024;
+const _: () = assert!(
+    MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES as usize >= MAX_FAMILIAR_IDENTITY_FIELD_BYTES * 6 + 48
+);
 const MAX_SESSION_TITLE_CHARS: usize = 60;
 const MAX_LEGACY_INDEX_RECORD_BYTES: u64 = MAX_TRANSCRIPT_BYTES;
 /// A pending record duplicates the indexable text from one transcript entry.
@@ -2777,8 +2786,12 @@ fn save_familiar_metadata_at_storage(
         );
     };
 
+    validate_familiar_identity(familiar)?;
     let bytes = serde_json::to_vec(familiar)
         .map_err(|err| engine_err("cannot serialize familiar metadata", err))?;
+    if bytes.len() as u64 > MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES {
+        return Err(familiar_metadata_size_error(bytes.len() as u64));
+    }
     ensure_durable_directory(
         storage,
         storage.root(),
@@ -2877,15 +2890,41 @@ fn load_familiar_metadata_at_storage(
     storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<Option<FamiliarIdentity>, PocketError> {
-    let Some(bytes) = familiar_metadata_bytes_at_storage(storage, session_id)? else {
+    let Some(bytes) = read_familiar_metadata_bytes_at_storage(storage, session_id)? else {
         return Ok(None);
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|err| engine_err("cannot parse familiar metadata", err))
+    parse_familiar_metadata(&bytes).map(Some)
 }
 
 fn familiar_metadata_bytes_at_storage(
+    storage: &CheckedStorage,
+    session_id: &str,
+) -> Result<Option<Vec<u8>>, PocketError> {
+    let Some(bytes) = read_familiar_metadata_bytes_at_storage(storage, session_id)? else {
+        return Ok(None);
+    };
+    parse_familiar_metadata(&bytes)?;
+    Ok(Some(bytes))
+}
+
+fn familiar_metadata_size_error(size: u64) -> PocketError {
+    PocketError::Engine {
+        message: format!(
+            "familiar metadata exceeds the {MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES}-byte limit \
+             (found {size} bytes)"
+        ),
+    }
+}
+
+fn parse_familiar_metadata(bytes: &[u8]) -> Result<FamiliarIdentity, PocketError> {
+    let familiar = serde_json::from_slice::<FamiliarIdentity>(bytes)
+        .map_err(|err| engine_err("cannot parse familiar metadata", err))?;
+    validate_familiar_identity(&familiar)
+        .map_err(|err| engine_err("cannot parse familiar metadata", err))?;
+    Ok(familiar)
+}
+
+fn read_familiar_metadata_bytes_at_storage(
     storage: &CheckedStorage,
     session_id: &str,
 ) -> Result<Option<Vec<u8>>, PocketError> {
@@ -2894,13 +2933,52 @@ fn familiar_metadata_bytes_at_storage(
         return Ok(None);
     }
     storage.validate_regular_file(&path, false)?;
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(engine_err("cannot inspect familiar metadata", err)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(persistence_err(
+            &path,
+            "familiar metadata is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES {
+        return Err(familiar_metadata_size_error(metadata.len()));
+    }
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(engine_err("cannot read familiar metadata", err)),
     };
-    serde_json::from_slice::<FamiliarIdentity>(&bytes)
-        .map_err(|err| engine_err("cannot parse familiar metadata", err))?;
+    storage.validate_regular_file(&path, false)?;
+    let opened_size = file
+        .metadata()
+        .map_err(|err| engine_err("cannot inspect opened familiar metadata", err))?
+        .len();
+    if opened_size > MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES {
+        return Err(familiar_metadata_size_error(opened_size));
+    }
+
+    let capacity = usize::try_from(opened_size)
+        .unwrap_or(MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES as usize)
+        .min(MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES as usize);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| engine_err("cannot read familiar metadata", err))?;
+    if bytes.len() as u64 > MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES {
+        return Err(familiar_metadata_size_error(bytes.len() as u64));
+    }
+    storage.validate_regular_file(&path, false)?;
+    let final_size = std::fs::symlink_metadata(&path)
+        .map_err(|err| engine_err("cannot recheck familiar metadata", err))?
+        .len();
+    if final_size > MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES {
+        return Err(familiar_metadata_size_error(final_size));
+    }
     Ok(Some(bytes))
 }
 
@@ -3869,6 +3947,7 @@ fn preflight_legacy_zero_count_markers(
 async fn preflight_legacy_zero_count_migration(
     storage: &CheckedStorage,
     lifecycle: &SessionLifecycle,
+    skip_session_id: Option<&str>,
 ) -> Result<LegacyZeroCountMigrationPlan, PocketError> {
     let store = checked_index_store(storage)?;
     storage.validate_sqlite_files()?;
@@ -3878,6 +3957,9 @@ async fn preflight_legacy_zero_count_migration(
     validate_indexed_session_ids(rows.iter().map(|row| row.id.as_str()))?;
     let mut candidates = Vec::new();
     for row in rows.into_iter().filter(|row| row.message_count == 0) {
+        if skip_session_id == Some(row.id.as_str()) {
+            continue;
+        }
         if lifecycle
             .sessions
             .contains_key(&session_key(storage.root(), &row.id))
@@ -3909,10 +3991,12 @@ async fn preflight_legacy_zero_count_migration(
 async fn preflight_storage_recovery(
     storage: &CheckedStorage,
     lifecycle: &SessionLifecycle,
+    skip_legacy_session_id: Option<&str>,
 ) -> Result<StorageRecoveryPlan, PocketError> {
     let lifecycle_plan = preflight_pending_lifecycle_recovery(storage, lifecycle)?;
     let pending_index = preflight_pending_index_recovery(storage)?;
-    let legacy_zero_count = preflight_legacy_zero_count_migration(storage, lifecycle).await?;
+    let legacy_zero_count =
+        preflight_legacy_zero_count_migration(storage, lifecycle, skip_legacy_session_id).await?;
     Ok(StorageRecoveryPlan {
         lifecycle: lifecycle_plan,
         pending_index,
@@ -4412,7 +4496,7 @@ async fn recover_storage_unlocked(
     storage: &CheckedStorage,
     lifecycle: &mut SessionLifecycle,
 ) -> Result<(), PocketError> {
-    let plan = preflight_storage_recovery(storage, lifecycle).await?;
+    let plan = preflight_storage_recovery(storage, lifecycle, None).await?;
     recover_pending_lifecycle_plan(storage, lifecycle, plan.lifecycle)?;
     recover_pending_index_plan(storage, lifecycle, plan.pending_index).await?;
     recover_legacy_zero_count_migration_plan(storage, lifecycle, plan.legacy_zero_count).await
@@ -4875,7 +4959,7 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
     validate_session_id(session_id)?;
     let storage = CheckedStorage::open(storage_dir)?;
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
-    let recovery = preflight_storage_recovery(&storage, &lifecycle).await?;
+    let recovery = preflight_storage_recovery(&storage, &lifecycle, Some(session_id)).await?;
     recover_pending_lifecycle_plan(&storage, &mut lifecycle, recovery.lifecycle)?;
     let target_temporary = storage.pending_index_temporary(session_id)?;
     let remaining_pending_index = PendingIndexRecoveryPlan {
@@ -4920,9 +5004,10 @@ pub async fn fork_session(storage_dir: &str, session_id: &str) -> Result<String,
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+    let familiar_bytes = familiar_metadata_bytes_at_storage(&storage, session_id)?;
     recover_storage_unlocked(&storage, &mut lifecycle).await?;
     ensure_session_available(&lifecycle, &key)?;
-    fork_session_unlocked(&storage, session_id, &mut lifecycle, None).await
+    fork_session_unlocked(&storage, session_id, familiar_bytes, &mut lifecycle, None).await
 }
 
 #[cfg(test)]
@@ -4941,9 +5026,17 @@ async fn fork_session_with_stage_pause(
     let storage = CheckedStorage::open(storage_dir)?;
     let key = session_key(storage.root(), session_id);
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
+    let familiar_bytes = familiar_metadata_bytes_at_storage(&storage, session_id)?;
     recover_storage_unlocked(&storage, &mut lifecycle).await?;
     ensure_session_available(&lifecycle, &key)?;
-    fork_session_unlocked(&storage, session_id, &mut lifecycle, Some(stage_pause)).await
+    fork_session_unlocked(
+        &storage,
+        session_id,
+        familiar_bytes,
+        &mut lifecycle,
+        Some(stage_pause),
+    )
+    .await
 }
 
 struct ForkStage {
@@ -5015,6 +5108,10 @@ impl ForkStage {
     }
 
     fn stage_metadata(&mut self, bytes: &[u8]) -> Result<(), PocketError> {
+        if bytes.len() as u64 > MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES {
+            return Err(familiar_metadata_size_error(bytes.len() as u64));
+        }
+        parse_familiar_metadata(bytes)?;
         let storage = self.storage.clone();
         self.stage_metadata_with(bytes, |path, bytes, context| {
             write_new_file(&storage, path, bytes, context)
@@ -5220,6 +5317,7 @@ fn fork_publication_error(
 async fn fork_session_unlocked(
     storage: &CheckedStorage,
     session_id: &str,
+    familiar_bytes: Option<Vec<u8>>,
     lifecycle: &mut SessionLifecycle,
     #[cfg(test)] mut stage_pause: Option<ForkStagePause>,
     #[cfg(not(test))] _stage_pause: Option<()>,
@@ -5282,7 +5380,6 @@ async fn fork_session_unlocked(
         lifecycle.sessions.remove(&key);
     }
 
-    let familiar_bytes = familiar_metadata_bytes_at_storage(storage, session_id)?;
     let mut stage = ForkStage::begin(storage, &new_id)?;
     if let Err(err) = stage.create_staging_directory() {
         return Err(fork_stage_error(
@@ -5580,6 +5677,22 @@ mod tests {
             emoji: Some("moon".to_string()),
             role: Some("repository guide".to_string()),
         }
+    }
+
+    fn max_serialized_familiar() -> crate::remote::FamiliarIdentity {
+        crate::remote::FamiliarIdentity {
+            id: "\0".repeat(crate::remote::MAX_FAMILIAR_ID_BYTES),
+            display_name: "\0".repeat(crate::remote::MAX_FAMILIAR_DISPLAY_NAME_BYTES),
+            emoji: Some("\0".repeat(crate::remote::MAX_FAMILIAR_EMOJI_BYTES)),
+            role: Some("\0".repeat(crate::remote::MAX_FAMILIAR_ROLE_BYTES)),
+        }
+    }
+
+    fn familiar_identity_field_bytes(identity: &FamiliarIdentity) -> usize {
+        identity.id.len()
+            + identity.display_name.len()
+            + identity.emoji.as_deref().map(str::len).unwrap_or_default()
+            + identity.role.as_deref().map(str::len).unwrap_or_default()
     }
 
     fn configure_session_faults(
@@ -11153,6 +11266,116 @@ mod tests {
         std::fs::remove_dir_all(storage).unwrap();
     }
 
+    #[test]
+    fn familiar_sidecar_save_rejects_invalid_identity_before_writing() {
+        let storage = test_storage("save-oversized-familiar");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut identity = familiar();
+        identity.role = Some("r".repeat(1025));
+
+        let err = save_familiar_metadata(&storage_str, &session_id, Some(&identity)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("familiar role"), "got: {message}");
+        assert!(message.contains("1024-byte limit"), "got: {message}");
+        assert!(!familiar_file(&storage, &session_id).exists());
+        assert!(!storage.join("metadata").exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_familiar_sidecar_fails_list_but_delete_removes_it() {
+        let storage = test_storage("oversized-familiar-delete");
+        let storage_str = storage.display().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        index_store(&storage)
+            .unwrap()
+            .save_session(&session_id, Some("Recoverable"), "model")
+            .unwrap();
+        std::fs::create_dir_all(storage.join("metadata")).unwrap();
+        let sidecar = familiar_file(&storage, &session_id);
+        let file = std::fs::File::create(&sidecar).unwrap();
+        file.set_len(MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        let err = match list_sessions(&storage_str).await {
+            Ok(_) => panic!("oversized familiar metadata must fail the list"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("familiar metadata"), "got: {message}");
+        assert!(message.contains("10240-byte limit"), "got: {message}");
+        assert_eq!(
+            std::fs::symlink_metadata(&sidecar).unwrap().len(),
+            MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1
+        );
+
+        delete_session(&storage_str, &session_id).await.unwrap();
+        assert!(!sidecar.exists());
+        assert!(index_store(&storage)
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .all(|row| row.id != session_id));
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn listing_one_hundred_maximum_familiar_sidecars_has_a_fixed_bound() {
+        let storage = test_storage("max-familiar-history");
+        let storage_str = storage.display().to_string();
+        let identity = max_serialized_familiar();
+        assert_eq!(
+            familiar_identity_field_bytes(&identity),
+            MAX_FAMILIAR_IDENTITY_FIELD_BYTES
+        );
+        let serialized = serde_json::to_vec(&identity).unwrap();
+        assert!(serialized.len() as u64 <= MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES);
+        let store = index_store(&storage).unwrap();
+
+        let mut session_ids = Vec::with_capacity(100);
+        for index in 0..100 {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            store
+                .save_session(&session_id, Some(&format!("Session {index}")), "model")
+                .unwrap();
+            seed_index_baseline_record(&storage, &session_id);
+            save_familiar_metadata(&storage_str, &session_id, Some(&identity)).unwrap();
+            assert!(
+                std::fs::symlink_metadata(familiar_file(&storage, &session_id))
+                    .unwrap()
+                    .len()
+                    <= MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES
+            );
+            session_ids.push(session_id);
+        }
+
+        let listed = list_sessions(&storage_str).await.unwrap();
+        assert_eq!(listed.len(), 100);
+        let aggregate_field_bytes = listed
+            .iter()
+            .map(|row| {
+                familiar_identity_field_bytes(
+                    row.familiar
+                        .as_ref()
+                        .expect("every listed session has a familiar"),
+                )
+            })
+            .sum::<usize>();
+        assert_eq!(
+            aggregate_field_bytes,
+            100 * MAX_FAMILIAR_IDENTITY_FIELD_BYTES
+        );
+        assert!(aggregate_field_bytes <= 100 * MAX_FAMILIAR_IDENTITY_FIELD_BYTES);
+        assert_eq!(session_ids.len(), 100);
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
     #[tokio::test]
     async fn list_sessions_rejects_path_shaped_index_id_before_sidecar_access() {
         let storage = test_storage("list-invalid-index-id");
@@ -12047,6 +12270,54 @@ mod tests {
             .unwrap();
         assert!(metadata.is_empty());
         assert!(!storage.join(".fork-staging").exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_source_familiar_fails_fork_before_source_mutation() {
+        let storage = test_storage("fork-oversized-source-safe");
+        let storage_str = storage.display().to_string();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let persistence =
+            SessionPersistence::create(&storage_str, source_id.clone(), "model".to_string(), None)
+                .await
+                .unwrap();
+        persistence
+            .persist_new(&[Message::user("source must remain unchanged")])
+            .await
+            .unwrap();
+        let transcript = transcript_file(&storage, &source_id);
+        let transcript_before = std::fs::read(&transcript).unwrap();
+        std::fs::remove_file(index_baseline_marker(&storage, &source_id)).unwrap();
+        std::fs::remove_file(session_model_marker(&storage, &source_id)).unwrap();
+        let recovery_temporary = pending_index_temporary(&storage, &source_id);
+        std::fs::create_dir_all(recovery_temporary.parent().unwrap()).unwrap();
+        std::fs::write(&recovery_temporary, b"incomplete recovery state").unwrap();
+        std::fs::create_dir_all(storage.join("metadata")).unwrap();
+        let sidecar = familiar_file(&storage, &source_id);
+        let file = std::fs::File::create(&sidecar).unwrap();
+        file.set_len(MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        let err = fork_session(&storage_str, &source_id).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("familiar metadata"), "got: {message}");
+        assert!(message.contains("10240-byte limit"), "got: {message}");
+        assert!(!index_baseline_marker(&storage, &source_id).exists());
+        assert!(!session_model_marker(&storage, &source_id).exists());
+        assert!(recovery_temporary.exists());
+        assert_eq!(std::fs::read(&transcript).unwrap(), transcript_before);
+        assert_eq!(
+            std::fs::symlink_metadata(&sidecar).unwrap().len(),
+            MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1
+        );
+        let rows = index_store(&storage).unwrap().list_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, source_id);
+        assert!(!storage.join(".fork-staging").exists());
+        assert!(pending_fork_ids(&storage).unwrap().is_empty());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
