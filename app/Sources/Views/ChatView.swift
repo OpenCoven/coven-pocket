@@ -169,11 +169,10 @@ struct ChatView: View {
                 else { return }
                 synchronizeFamiliarProfile()
             }
-            .task(id: router.pendingPrompt) { await consumeRouterPrompt() }
-            .task(id: router.pendingSessionID) { await consumeRouterSession() }
+            .task(id: router.pendingPrompt) { consumeRouterPrompt() }
+            .task(id: router.pendingSessionID) { consumeRouterSession() }
             .task(id: router.pendingReset) {
-                guard router.consumeReset() else { return }
-                await resetActiveConversation()
+                consumeRouterReset()
             }
         }
     }
@@ -247,53 +246,81 @@ private extension ChatView {
 
     /// Send a queued intent when configured; the nested task survives
     /// cancellation caused by consuming the router value.
-    private func consumeRouterPrompt() async {
-        guard let queued = Self.consumeQueuedPrompt(
-            router.consumePrompt(),
-            coordinator: routeCoordinator,
-            stage: { prompt = $0 },
-            canSend: { canSend }
-        ) else { return }
-        prompt = ""
-        startSend(queued)
+    private func consumeRouterPrompt() {
+        consumePendingRouterReset()
+        guard let queued = router.consumePrompt() else { return }
+        let token = routeCoordinator.begin()
+        Task { @MainActor in
+            await routeCoordinator.runAfterRoutedReset(token: token) {
+                guard let queuedForSend = Self.consumeQueuedPrompt(
+                    queued,
+                    coordinator: routeCoordinator,
+                    stage: { prompt = $0 },
+                    canSend: { canSend }
+                ) else { return }
+                prompt = ""
+                startSend(queuedForSend)
+            }
+        }
     }
 
     /// Spotlight indexes on-device sessions, so this explicit history choice
     /// switches to Codex rather than acting as an error fallback.
-    private func consumeRouterSession() async {
+    private func consumeRouterSession() {
+        consumePendingRouterReset()
         guard let sessionID = router.consumeSessionID() else { return }
         let token = routeCoordinator.begin()
-        guard let currentSettings = ChatFamiliarProfile.settingsForCodexResume(
-            current: settings,
-            codexProfileID: client.codexAccount?.profileId,
-            defaultModel: client.defaultCodexModel,
-            model: familiarModel
-        ) else {
-            routeCoordinator.retire(token)
-            return
-        }
-        chatState.settings = currentSettings
-        Task {
-            await SpotlightSessionRouteRunner.run(
+        Task { @MainActor in
+            await routeCoordinator.runAfterRoutedReset(
                 token: token,
-                coordinator: routeCoordinator,
-                lookup: {
-                    await ChatView.spotlightSession(
-                        sessionID: sessionID,
-                        loader: { try await model.storedSessions() }
-                    )
-                },
-                cancelResume: {
-                    model.stop()
-                },
-                resume: { summary in
-                    _ = await model.resume(
-                        summary,
-                        settings: currentSettings
+                canProceed: { !companionModel.hasPendingCleanup },
+                operation: {
+                    guard let currentSettings =
+                            ChatFamiliarProfile.settingsForCodexResume(
+                                current: settings,
+                                codexProfileID: client.codexAccount?.profileId,
+                                defaultModel: client.defaultCodexModel,
+                                model: familiarModel
+                            ) else {
+                        routeCoordinator.retire(token)
+                        return
+                    }
+                    chatState.settings = currentSettings
+                    await SpotlightSessionRouteRunner.run(
+                        token: token,
+                        coordinator: routeCoordinator,
+                        lookup: {
+                            await ChatView.spotlightSession(
+                                sessionID: sessionID,
+                                loader: { try await model.storedSessions() }
+                            )
+                        },
+                        cancelResume: {
+                            model.stop()
+                        },
+                        resume: { summary in
+                            _ = await model.resume(
+                                summary,
+                                settings: currentSettings
+                            )
+                        }
                     )
                 }
             )
         }
+    }
+
+    private func consumeRouterReset() {
+        guard router.consumeReset() else { return }
+        let backend = settings.backend
+        routeCoordinator.launchRoutedReset {
+            await resetActiveConversation(backend: backend)
+        }
+    }
+
+    private func consumePendingRouterReset() {
+        guard router.pendingReset else { return }
+        consumeRouterReset()
     }
 
     private var transcript: some View {
@@ -428,9 +455,8 @@ private extension ChatView {
         }
     }
 
-    private func resetActiveConversation() async {
-        routeCoordinator.invalidate()
-        switch settings.backend {
+    private func resetActiveConversation(backend: ChatBackend) async {
+        switch backend {
         case .companionClaude:
             await companionModel.reset()
         case .codex:

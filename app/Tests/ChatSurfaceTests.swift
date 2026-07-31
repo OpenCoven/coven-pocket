@@ -73,6 +73,28 @@ final class ChatSurfaceTests: XCTestCase {
         }
     }
 
+    private struct HostedRoutedResetFixture {
+        let suiteName: String
+        let defaults: UserDefaults
+        let pairing: DaemonPairing
+        let remoteClient: FakeCompanionSessionClient
+        let companionChat: CompanionChatModel
+        let router: AppRouter
+        let previousTab: AppRouter.Tab
+        let window: UIWindow
+
+        @MainActor
+        func cleanup() {
+            defaults.removePersistentDomain(forName: suiteName)
+            router.selectedTab = previousTab
+            _ = router.consumePrompt()
+            _ = router.consumeSessionID()
+            _ = router.consumeReset()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+    }
+
     private struct SpotlightResumePreparation {
         let suiteName: String
         let defaults: UserDefaults
@@ -1675,6 +1697,189 @@ final class ChatSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func testRoutedResetRunnerOutlivesCancelledLaunchingTaskAndCompletesOnce() async {
+        let runner = RoutedResetRunner()
+        let resetStarted = expectation(description: "routed reset started")
+        var resetContinuation: CheckedContinuation<Void, Never>?
+        var completionCount = 0
+
+        let outerRouteTask = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            XCTAssertTrue(Task.isCancelled)
+            runner.launch {
+                XCTAssertFalse(Task.isCancelled)
+                resetStarted.fulfill()
+                await withCheckedContinuation { continuation in
+                    resetContinuation = continuation
+                }
+                XCTAssertFalse(Task.isCancelled)
+                completionCount += 1
+            }
+        }
+        await fulfillment(of: [resetStarted], timeout: 1)
+
+        outerRouteTask.cancel()
+        runner.launch {
+            XCTFail("an active routed reset must coalesce later requests")
+        }
+        resetContinuation?.resume()
+        await runner.waitForCompletion()
+        await outerRouteTask.value
+
+        XCTAssertEqual(completionCount, 1)
+    }
+
+    @MainActor
+    func testRoutesWaitForResetAndOnlyCurrentRouteProceedsOnce() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        let resetStarted = expectation(description: "routed reset started")
+        var resetContinuation: CheckedContinuation<Void, Never>?
+        var events: [String] = []
+        coordinator.launchRoutedReset {
+            events.append("reset-started")
+            resetStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                resetContinuation = continuation
+            }
+            events.append("reset-finished")
+        }
+        await fulfillment(of: [resetStarted], timeout: 1)
+
+        let promptToken = coordinator.begin()
+        let promptRoute = Task { @MainActor in
+            await coordinator.runAfterRoutedReset(token: promptToken) {
+                events.append("prompt")
+            }
+        }
+        let sessionToken = coordinator.begin()
+        let sessionRoute = Task { @MainActor in
+            await coordinator.runAfterRoutedReset(token: sessionToken) {
+                events.append("session")
+            }
+        }
+        await Task.yield()
+        XCTAssertEqual(events, ["reset-started"])
+
+        resetContinuation?.resume()
+        await promptRoute.value
+        await sessionRoute.value
+
+        XCTAssertEqual(
+            events,
+            ["reset-started", "reset-finished", "session"]
+        )
+    }
+
+    @MainActor
+    func testSessionRouteIsRejectedUntilPendingCleanupClears() async {
+        let coordinator = ChatRouteGenerationCoordinator()
+        var hasPendingCleanup = true
+        var resumeCount = 0
+        let blockedToken = coordinator.begin()
+
+        await coordinator.runAfterRoutedReset(
+            token: blockedToken,
+            canProceed: { !hasPendingCleanup },
+            operation: { resumeCount += 1 }
+        )
+
+        XCTAssertEqual(resumeCount, 0)
+        XCTAssertFalse(coordinator.isCurrent(blockedToken))
+
+        hasPendingCleanup = false
+        let readyToken = coordinator.begin()
+        await coordinator.runAfterRoutedReset(
+            token: readyToken,
+            canProceed: { !hasPendingCleanup },
+            operation: { resumeCount += 1 }
+        )
+
+        XCTAssertEqual(resumeCount, 1)
+    }
+
+    @MainActor
+    func testRoutedCodexResetCoalescesAndRemainsGenerationSafe() async {
+        let boundary = SessionBoundary()
+        boundary.suspendNextStart = true
+        let model = ChatModel(performSessionOperation: boundary.perform)
+        let settings = ChatSettings(backend: .codex, model: "test")
+        let pendingSend = Task {
+            await model.send(prompt: "stale", settings: settings)
+        }
+        await fulfillment(of: [boundary.startRequested], timeout: 1)
+
+        let coordinator = ChatRouteGenerationCoordinator()
+        var resetCount = 0
+        coordinator.launchRoutedReset {
+            resetCount += 1
+            model.reset()
+        }
+        coordinator.launchRoutedReset {
+            resetCount += 1
+            model.reset()
+        }
+        await coordinator.waitForRoutedReset()
+
+        let lateSession = TrackingChatSession()
+        boundary.finishStart(with: lateSession)
+        await pendingSend.value
+
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(lateSession.stopCallCount, 1)
+        XCTAssertFalse(model.hasActiveSession)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.items.isEmpty)
+    }
+
+    @MainActor
+    func testRoutedCompanionResetSurvivesFlagCancellationAndViewDisappearance() async throws {
+        let fixture = try await makeHostedRoutedResetFixture()
+        defer { fixture.cleanup() }
+        await finishInitialHostedAvailability(fixture)
+        let gateCallsBeforeReset = fixture.remoteClient.gateCallCount
+
+        fixture.remoteClient.suspendsKill = true
+        fixture.remoteClient.killChecksCancellation = true
+        fixture.router.startFreshChat()
+        fixture.router.openChat(prompt: "after cleanup")
+        for _ in 0..<100
+                where fixture.remoteClient.gateCallCount == gateCallsBeforeReset {
+            await Task.yield()
+        }
+        XCTAssertGreaterThan(
+            fixture.remoteClient.gateCallCount,
+            gateCallsBeforeReset
+        )
+
+        fixture.window.isHidden = true
+        fixture.window.rootViewController = nil
+        fixture.remoteClient.resumeNextGate(with: .ready(fixture.pairing))
+        await fulfillment(
+            of: [fixture.remoteClient.killRequested],
+            timeout: 1
+        )
+
+        XCTAssertTrue(fixture.companionChat.hasPendingCleanup)
+        XCTAssertTrue(fixture.companionChat.isBusy)
+        XCTAssertEqual(fixture.remoteClient.launchedPrompts, ["remote"])
+        fixture.remoteClient.suspendsGate = false
+        fixture.remoteClient.resumeKill()
+        for _ in 0..<100 where fixture.remoteClient.launchedPrompts.count == 1 {
+            await Task.yield()
+        }
+        completeTurn(on: fixture.companionChat)
+
+        XCTAssertEqual(fixture.remoteClient.killedSessionIDs, ["session-1"])
+        XCTAssertEqual(
+            fixture.remoteClient.launchedPrompts,
+            ["remote", "after cleanup"]
+        )
+        XCTAssertFalse(fixture.companionChat.hasPendingCleanup)
+        XCTAssertFalse(fixture.companionChat.isBusy)
+        XCTAssertFalse(fixture.companionChat.canRetry)
+    }
+
+    @MainActor
     func testOlderSpotlightLookupCannotResumeAfterNewerRouteBegins() async {
         let coordinator = ChatRouteGenerationCoordinator()
         let lookupRequested = XCTestExpectation(
@@ -2054,6 +2259,94 @@ final class ChatSurfaceTests: XCTestCase {
             updatedAt: updatedAt,
             messageCount: 2,
             familiar: familiar
+        )
+    }
+
+    @MainActor
+    private func makeHostedRoutedResetFixture() async throws
+        -> HostedRoutedResetFixture {
+        let pairing = pairedDaemon()
+        let remoteClient = FakeCompanionSessionClient(gate: .ready(pairing))
+        let companion = CompanionModel(
+            store: ChatSurfacePairingStore(stored: pairing)
+        )
+        let companionChat = CompanionChatModel(
+            companion: companion,
+            client: remoteClient
+        )
+        await companionChat.send(prompt: "remote", projectRoot: "/srv/repo")
+        let suiteName = "routed-reset-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let chatState = makeRoutedResetChatState(
+            companion: companion,
+            companionChat: companionChat,
+            defaults: defaults
+        )
+        let router = AppRouter.shared
+        let previousTab = router.selectedTab
+        _ = router.consumePrompt()
+        _ = router.consumeSessionID()
+        _ = router.consumeReset()
+        router.selectedTab = .chat
+        remoteClient.suspendsGate = true
+        let host = UIHostingController(
+            rootView: ChatView(client: EngineClient(), chatState: chatState)
+        )
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.layoutIfNeeded()
+        return HostedRoutedResetFixture(
+            suiteName: suiteName,
+            defaults: defaults,
+            pairing: pairing,
+            remoteClient: remoteClient,
+            companionChat: companionChat,
+            router: router,
+            previousTab: previousTab,
+            window: window
+        )
+    }
+
+    @MainActor
+    private func makeRoutedResetChatState(
+        companion: CompanionModel,
+        companionChat: CompanionChatModel,
+        defaults: UserDefaults
+    ) -> ChatSurfaceState {
+        let familiarModel = FamiliarSelectionModel(
+            client: NoopFamiliarRosterClient(),
+            store: FamiliarSelectionStore(defaults: defaults)
+        )
+        return ChatSurfaceState(
+            model: ChatModel(),
+            companion: companion,
+            companionModel: companionChat,
+            familiarModel: familiarModel,
+            routeCoordinator: ChatRouteGenerationCoordinator(),
+            settings: ChatSettings(
+                backend: .companionClaude,
+                daemonProjectRoot: "/srv/repo"
+            )
+        )
+    }
+
+    @MainActor
+    private func finishInitialHostedAvailability(
+        _ fixture: HostedRoutedResetFixture
+    ) async {
+        await fulfillment(
+            of: [fixture.remoteClient.gateRequested],
+            timeout: 1
+        )
+        fixture.remoteClient.resumeNextGate(with: .ready(fixture.pairing))
+        for _ in 0..<100
+                where fixture.companionChat.availability == .checking {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            fixture.companionChat.availability,
+            .ready(fixture.pairing)
         )
     }
 

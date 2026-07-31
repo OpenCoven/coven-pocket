@@ -138,6 +138,7 @@ final class ChatRouteGenerationCoordinator: ObservableObject {
 
     private var generation: UInt64 = 0
     private var cancelResume: (() -> Void)?
+    private let routedResetRunner = RoutedResetRunner()
 
     func begin() -> Token {
         advanceGeneration()
@@ -146,6 +147,31 @@ final class ChatRouteGenerationCoordinator: ObservableObject {
 
     func invalidate() {
         advanceGeneration()
+    }
+
+    func launchRoutedReset(
+        _ reset: @escaping @MainActor () async -> Void
+    ) {
+        invalidate()
+        routedResetRunner.launch(reset)
+    }
+
+    func waitForRoutedReset() async {
+        await routedResetRunner.waitForCompletion()
+    }
+
+    func runAfterRoutedReset(
+        token: Token,
+        canProceed: @escaping @MainActor () -> Bool = { true },
+        operation: @escaping @MainActor () async -> Void
+    ) async {
+        await waitForRoutedReset()
+        guard isCurrent(token) else { return }
+        guard canProceed() else {
+            retire(token)
+            return
+        }
+        await operation()
     }
 
     func isCurrent(_ token: Token) -> Bool {

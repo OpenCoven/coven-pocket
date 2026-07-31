@@ -3,6 +3,43 @@ import XCTest
 
 @MainActor
 final class CompanionChatCleanupOwnershipTests: XCTestCase {
+    func testRoutedResetCoalescesAndRouteInvalidationCannotCancelKill() async {
+        let client = FakeCompanionSessionClient(gate: .ready(pairedDaemon()))
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/repo")
+        client.suspendsKill = true
+        client.killChecksCancellation = true
+        let coordinator = ChatRouteGenerationCoordinator()
+        var resetCount = 0
+
+        coordinator.launchRoutedReset {
+            resetCount += 1
+            await model.reset()
+        }
+        await fulfillment(of: [client.killRequested], timeout: 1)
+        coordinator.launchRoutedReset {
+            resetCount += 1
+            await model.reset()
+        }
+        coordinator.invalidate()
+
+        XCTAssertEqual(
+            client.operationLog.filter { $0 == "kill:session-1" }.count,
+            1
+        )
+        XCTAssertTrue(model.hasPendingCleanup)
+        XCTAssertTrue(model.isBusy)
+
+        client.resumeKill()
+        await coordinator.waitForRoutedReset()
+
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertFalse(model.hasPendingCleanup)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.canRetry)
+    }
+
     func testResetJoinsSuspendedCleanupBeforePairingAndDoesNotKillTwice() async {
         let pairing = pairedDaemon()
         let client = FakeCompanionSessionClient(gate: .ready(pairing))
