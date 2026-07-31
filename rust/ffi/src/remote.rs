@@ -288,25 +288,37 @@ struct DaemonFamiliar {
 
 impl DaemonFamiliar {
     fn normalize(self) -> Result<RemoteFamiliar, FamiliarValidationError> {
-        validate_familiar_field("id", &self.id, MAX_FAMILIAR_ID_BYTES)?;
-        validate_familiar_field(
+        validate_trimmed_familiar_field("id", &self.id, MAX_FAMILIAR_ID_BYTES)?;
+        validate_trimmed_familiar_field(
             "display name",
             &self.display_name,
             MAX_FAMILIAR_DISPLAY_NAME_BYTES,
         )?;
-        validate_optional_familiar_field("emoji", self.emoji.as_deref(), MAX_FAMILIAR_EMOJI_BYTES)?;
-        validate_optional_familiar_field("role", self.role.as_deref(), MAX_FAMILIAR_ROLE_BYTES)?;
-        validate_optional_familiar_field(
+        validate_trimmed_optional_familiar_field(
+            "emoji",
+            self.emoji.as_deref(),
+            MAX_FAMILIAR_EMOJI_BYTES,
+        )?;
+        validate_trimmed_optional_familiar_field(
+            "role",
+            self.role.as_deref(),
+            MAX_FAMILIAR_ROLE_BYTES,
+        )?;
+        validate_trimmed_optional_familiar_field(
             "description",
             self.description.as_deref(),
             MAX_FAMILIAR_DESCRIPTION_BYTES,
         )?;
-        validate_optional_familiar_field(
+        validate_trimmed_optional_familiar_field(
             "pronouns",
             self.pronouns.as_deref(),
             MAX_FAMILIAR_PRONOUNS_BYTES,
         )?;
-        validate_optional_familiar_field("icon", self.icon.as_deref(), MAX_FAMILIAR_ICON_BYTES)?;
+        validate_trimmed_optional_familiar_field(
+            "icon",
+            self.icon.as_deref(),
+            MAX_FAMILIAR_ICON_BYTES,
+        )?;
         validate_nonblank_familiar_id(&self.id)?;
 
         let id = self.id.trim().to_string();
@@ -367,6 +379,22 @@ fn validate_optional_familiar_field(
     Ok(())
 }
 
+fn validate_trimmed_familiar_field(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), FamiliarValidationError> {
+    validate_familiar_field(field, value.trim(), max_bytes)
+}
+
+fn validate_trimmed_optional_familiar_field(
+    field: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), FamiliarValidationError> {
+    validate_optional_familiar_field(field, value.map(str::trim), max_bytes)
+}
+
 fn validate_nonblank_familiar_id(id: &str) -> Result<(), FamiliarValidationError> {
     if id.trim().is_empty() {
         return Err(FamiliarValidationError::new("familiar id cannot be blank"));
@@ -399,11 +427,31 @@ pub(crate) fn validate_familiar_identity(familiar: &FamiliarIdentity) -> Result<
     validate_familiar_identity_fields(familiar).map_err(familiar_identity_error)
 }
 
-/// Validate all raw fields before allocating the small trimmed representation.
+/// Validate normalized field bounds before allocating the small trimmed representation.
 pub(crate) fn normalize_familiar_identity(
     familiar: FamiliarIdentity,
 ) -> Result<FamiliarIdentity, PocketError> {
-    validate_familiar_identity(&familiar)?;
+    validate_trimmed_familiar_field("id", &familiar.id, MAX_FAMILIAR_ID_BYTES)
+        .map_err(familiar_identity_error)?;
+    validate_trimmed_familiar_field(
+        "display name",
+        &familiar.display_name,
+        MAX_FAMILIAR_DISPLAY_NAME_BYTES,
+    )
+    .map_err(familiar_identity_error)?;
+    validate_trimmed_optional_familiar_field(
+        "emoji",
+        familiar.emoji.as_deref(),
+        MAX_FAMILIAR_EMOJI_BYTES,
+    )
+    .map_err(familiar_identity_error)?;
+    validate_trimmed_optional_familiar_field(
+        "role",
+        familiar.role.as_deref(),
+        MAX_FAMILIAR_ROLE_BYTES,
+    )
+    .map_err(familiar_identity_error)?;
+    validate_nonblank_familiar_id(&familiar.id).map_err(familiar_identity_error)?;
     let id = familiar.id.trim().to_string();
     let display_name = trimmed_nonblank(&familiar.display_name).unwrap_or_else(|| id.clone());
     Ok(FamiliarIdentity {
@@ -415,9 +463,10 @@ pub(crate) fn normalize_familiar_identity(
 }
 
 fn normalize_companion_familiar_id(value: &str) -> Result<String, PocketError> {
+    let value = value.trim();
     validate_familiar_field("id", value, MAX_FAMILIAR_ID_BYTES).map_err(familiar_identity_error)?;
     validate_nonblank_familiar_id(value).map_err(familiar_identity_error)?;
-    Ok(value.trim().to_string())
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Default)]
@@ -958,6 +1007,50 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("id"), "got: {message}");
         assert!(message.contains("128-byte limit"), "got: {message}");
+    }
+
+    #[test]
+    fn familiar_roster_field_limits_apply_after_trimming() {
+        let normalized = DaemonFamiliar {
+            id: format!(" {} ", "x".repeat(MAX_FAMILIAR_ID_BYTES)),
+            display_name: " ".repeat(MAX_FAMILIAR_DISPLAY_NAME_BYTES + 1),
+            emoji: Some(" ".repeat(MAX_FAMILIAR_EMOJI_BYTES + 1)),
+            role: Some(" ".repeat(MAX_FAMILIAR_ROLE_BYTES + 1)),
+            description: Some(" ".repeat(MAX_FAMILIAR_DESCRIPTION_BYTES + 1)),
+            pronouns: Some(" ".repeat(MAX_FAMILIAR_PRONOUNS_BYTES + 1)),
+            icon: Some(" ".repeat(MAX_FAMILIAR_ICON_BYTES + 1)),
+        }
+        .normalize()
+        .unwrap();
+
+        assert_eq!(normalized.id.len(), MAX_FAMILIAR_ID_BYTES);
+        assert_eq!(normalized.display_name, normalized.id);
+        assert_eq!(normalized.emoji, None);
+        assert_eq!(normalized.role, None);
+        assert_eq!(normalized.description, None);
+        assert_eq!(normalized.pronouns, None);
+        assert_eq!(normalized.icon, None);
+    }
+
+    #[test]
+    fn familiar_identity_and_companion_id_limits_apply_after_trimming() {
+        let normalized = normalize_familiar_identity(FamiliarIdentity {
+            id: format!(" {} ", "x".repeat(MAX_FAMILIAR_ID_BYTES)),
+            display_name: " ".repeat(MAX_FAMILIAR_DISPLAY_NAME_BYTES + 1),
+            emoji: Some(" ".repeat(MAX_FAMILIAR_EMOJI_BYTES + 1)),
+            role: Some(" ".repeat(MAX_FAMILIAR_ROLE_BYTES + 1)),
+        })
+        .unwrap();
+
+        assert_eq!(normalized.id.len(), MAX_FAMILIAR_ID_BYTES);
+        assert_eq!(normalized.display_name, normalized.id);
+        assert_eq!(normalized.emoji, None);
+        assert_eq!(normalized.role, None);
+        assert_eq!(
+            normalize_companion_familiar_id(&format!(" {} ", "x".repeat(MAX_FAMILIAR_ID_BYTES)))
+                .unwrap(),
+            normalized.id
+        );
     }
 
     #[tokio::test]
