@@ -33,7 +33,11 @@ use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::remote::{normalize_familiar_identity, FamiliarIdentity};
 use crate::{PocketError, PocketProvider};
+
+#[cfg(test)]
+const TEST_IMMEDIATE_END_TURN_MODEL: &str = "coven-pocket-test-immediate-end-turn";
 
 /// The sandbox-safe tool allowlist, mirroring coven-code's hosted-repair
 /// profile (`filter_tools_for_hosted_review` in the CLI). Only repository
@@ -196,6 +200,7 @@ struct SessionConfig {
     model: String,
     effort: Option<String>,
     workspace_dir: PathBuf,
+    familiar: Option<crate::remote::FamiliarIdentity>,
     /// The workspace AGENTS.md chain + memdir notes, composed once at
     /// session creation (the per-workspace "Memory" toggle). `None` when the
     /// toggle is off or nothing is configured; turns reuse the snapshot so
@@ -214,6 +219,8 @@ pub struct ChatSession {
     session_id: String,
     /// `None` for unpersisted sessions (no storage dir configured).
     persistence: Option<crate::sessions::SessionPersistence>,
+    #[cfg(test)]
+    model_tool_loop_invocations: AtomicUsize,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -288,13 +295,25 @@ impl ChatSession {
         prompt: Option<String>,
         delegate: Arc<dyn ChatDelegate>,
     ) -> Result<(), PocketError> {
-        if self.busy.swap(true, Ordering::SeqCst) {
+        // Publish busy and its current token under the lock shared with
+        // `stop`, then release it before any async setup.
+        let cancel_token = {
+            let mut guard = self.cancel.lock();
+            if self.busy.swap(true, Ordering::SeqCst) {
+                None
+            } else {
+                let token = tokio_util::sync::CancellationToken::new();
+                *guard = token.clone();
+                Some(token)
+            }
+        };
+        let Some(cancel_token) = cancel_token else {
             let err = PocketError::Engine {
                 message: "a turn is already running — stop it or wait".to_string(),
             };
             delegate.on_error(err.to_string());
             return Err(err);
-        }
+        };
         // Hold the message lock for the whole turn; `busy` already serializes
         // callers, the lock just hands the loop `&mut Vec<Message>` safely.
         //
@@ -321,11 +340,13 @@ impl ChatSession {
             // failure must not take the turn down.
             self.persist_new(&messages, &delegate).await;
 
-            let cancel_token = {
-                let mut guard = self.cancel.lock();
-                *guard = tokio_util::sync::CancellationToken::new();
-                guard.clone()
-            };
+            if cancel_token.is_cancelled() {
+                return Ok("cancelled");
+            }
+
+            #[cfg(test)]
+            self.model_tool_loop_invocations
+                .fetch_add(1, Ordering::SeqCst);
 
             let (client, query_config, tool_ctx) = self.build_loop_inputs()?;
             let tools = sandbox_tools(
@@ -399,14 +420,31 @@ impl ChatSession {
     }
 
     /// Build the client, query config, and tool context for one turn.
-    /// The Pocket platform note, plus the workspace's project context when
-    /// the memory toggle is on. The context is a session-creation snapshot;
-    /// an empty or missing AGENTS.md never blocks a chat turn.
+    /// The immutable Pocket platform note, followed by the pinned familiar
+    /// identity and the workspace's project context when configured.
     fn append_system_prompt(&self) -> String {
         let mut appended = "You are running inside Coven Pocket on iOS. Only repository file \
              tools are available (no shell, no network tools); every path must \
              stay inside the current workspace."
             .to_string();
+        if let Some(familiar) = &self.config.familiar {
+            appended.push_str("\n\n");
+            match familiar
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|role| !role.is_empty())
+            {
+                Some(role) => appended.push_str(&format!(
+                    "[Identity: You are {}, a {}. Respond as {}, not as the underlying tool.]",
+                    familiar.display_name, role, familiar.display_name
+                )),
+                None => appended.push_str(&format!(
+                    "[Identity: You are {}. Respond as {}, not as the underlying tool.]",
+                    familiar.display_name, familiar.display_name
+                )),
+            }
+        }
         if let Some(context) = &self.config.injected_context {
             appended.push_str("\n\n");
             appended.push_str(context);
@@ -456,6 +494,15 @@ impl ChatSession {
             append_system_prompt: Some(self.append_system_prompt()),
             provider_registry: Some(Arc::new(registry)),
             ..QueryConfig::default()
+        };
+        #[cfg(test)]
+        let query_config = if self.config.model == TEST_IMMEDIATE_END_TURN_MODEL {
+            QueryConfig {
+                max_turns: 0,
+                ..query_config
+            }
+        } else {
+            query_config
         };
 
         let tool_ctx = ToolContext {
@@ -537,7 +584,7 @@ fn uuid_like_suffix() -> String {
 /// Create a new chat session. Exposed as a free function so `PocketEngine`
 /// stays the single app-facing entry point (see `PocketEngine::start_chat`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_session(
+pub(crate) async fn start_session(
     provider: PocketProvider,
     api_key: String,
     model: String,
@@ -545,21 +592,31 @@ pub(crate) fn start_session(
     workspace_dir: String,
     permission_mode: ChatPermissionMode,
     storage_dir: Option<String>,
+    familiar: Option<FamiliarIdentity>,
     inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
+    let familiar = familiar.map(normalize_familiar_identity).transpose()?;
     let workspace = resolve_workspace(&workspace_dir)?;
     let session_id = uuid::Uuid::new_v4().to_string();
-    let persistence = storage_dir
-        .map(|dir| {
-            crate::sessions::SessionPersistence::create(&dir, session_id.clone(), model.clone())
-        })
-        .transpose()?;
+    let persistence = if let Some(storage_dir) = storage_dir.as_deref() {
+        let persistence = crate::sessions::SessionPersistence::create(
+            storage_dir,
+            session_id.clone(),
+            model.clone(),
+            familiar.as_ref(),
+        )
+        .await?;
+        Some(persistence)
+    } else {
+        None
+    };
     Ok(Arc::new(ChatSession {
         config: SessionConfig {
             provider,
             api_key,
             model,
             effort,
+            familiar,
             injected_context: snapshot_context(inject_context, &workspace),
             workspace_dir: workspace,
         },
@@ -569,6 +626,8 @@ pub(crate) fn start_session(
         perms: Arc::new(PermissionState::new(permission_mode)),
         session_id,
         persistence,
+        #[cfg(test)]
+        model_tool_loop_invocations: AtomicUsize::new(0),
     }))
 }
 
@@ -588,21 +647,19 @@ pub(crate) async fn resume_session(
     inject_context: bool,
 ) -> Result<Arc<ChatSession>, PocketError> {
     let workspace = resolve_workspace(&workspace_dir)?;
-    let (messages, last_uuid) =
-        crate::sessions::load_session_messages(&storage_dir, &session_id).await?;
-    let persistence = crate::sessions::SessionPersistence::resumed(
+    let (persistence, messages, familiar) = crate::sessions::SessionPersistence::resume(
         &storage_dir,
         session_id.clone(),
         model.clone(),
-        messages.len(),
-        last_uuid,
-    )?;
+    )
+    .await?;
     Ok(Arc::new(ChatSession {
         config: SessionConfig {
             provider,
             api_key,
             model,
             effort,
+            familiar,
             injected_context: snapshot_context(inject_context, &workspace),
             workspace_dir: workspace,
         },
@@ -612,6 +669,8 @@ pub(crate) async fn resume_session(
         perms: Arc::new(PermissionState::new(permission_mode)),
         session_id,
         persistence: Some(persistence),
+        #[cfg(test)]
+        model_tool_loop_invocations: AtomicUsize::new(0),
     }))
 }
 
@@ -1024,7 +1083,7 @@ mod tests {
         ];
 
         let sandbox = sandbox_tools(
-            Path::new("/tmp/pocket-test"),
+            &std::env::current_dir().unwrap(),
             Arc::new(PermissionState::new(ChatPermissionMode::Default)),
             None,
         );
@@ -1147,8 +1206,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn session_rejects_relative_workspace() {
+    #[tokio::test]
+    async fn session_rejects_relative_workspace() {
         let err = start_session(
             PocketProvider::Anthropic,
             "key".to_string(),
@@ -1157,8 +1216,10 @@ mod tests {
             "relative/dir".to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             false,
-        );
+        )
+        .await;
         assert!(err.is_err());
     }
 
@@ -1216,8 +1277,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_without_pending_message_emits_exactly_one_terminal_callback() {
-        let workspace = std::env::temp_dir().join(format!("pocket-chat-{}", std::process::id()));
-        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = temp_dir("retry");
         let session = start_session(
             PocketProvider::Anthropic,
             "key".to_string(),
@@ -1226,8 +1286,10 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             false,
         )
+        .await
         .unwrap();
 
         let delegate = Arc::new(RecordingDelegate::default());
@@ -1244,11 +1306,403 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
+    async fn cancellation_test_session(storage: Option<&Path>) -> (Arc<ChatSession>, PathBuf) {
+        let workspace = temp_dir("cancellation-workspace");
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            TEST_IMMEDIATE_END_TURN_MODEL.to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage.map(|path| path.display().to_string()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        (session, workspace)
+    }
+
+    async fn wait_until_busy(session: &ChatSession) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !session.is_busy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn never claimed busy");
+    }
+
+    async fn wait_until_messages_locked(session: &ChatSession) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.messages.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn never acquired the messages lock");
+    }
+
+    async fn await_turn(
+        handle: tokio::task::JoinHandle<Result<(), PocketError>>,
+    ) -> Result<(), PocketError> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("turn timed out")
+            .expect("turn task panicked")
+    }
+
+    fn assert_cancelled_turn(
+        session: &ChatSession,
+        delegate: &RecordingDelegate,
+        expected_loop_invocations: usize,
+    ) {
+        assert_eq!(
+            delegate.done.lock().clone(),
+            vec!["cancelled".to_string()],
+            "cancelled turns emit exactly one done callback"
+        );
+        assert!(
+            delegate.errors.lock().is_empty(),
+            "cancellation must not emit on_error"
+        );
+        assert!(!session.is_busy(), "terminal cancellation clears busy");
+        assert_eq!(
+            session.model_tool_loop_invocations.load(Ordering::SeqCst),
+            expected_loop_invocations,
+            "stopped setup must not enter provider/query/tool loop setup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_while_waiting_for_messages_cancels_before_loop_setup() {
+        let (session, workspace) = cancellation_test_session(None).await;
+        let messages = session.messages.lock().await;
+        let delegate = Arc::new(RecordingDelegate::default());
+        let turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = delegate.clone();
+            async move { session.send("held message".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        session.stop();
+        drop(messages);
+
+        assert!(await_turn(turn).await.is_ok());
+        assert_cancelled_turn(&session, &delegate, 0);
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_while_persisting_cancels_before_loop_setup() {
+        let storage = temp_dir("cancellation-storage");
+        let (session, workspace) = cancellation_test_session(Some(&storage)).await;
+        let persistence = session.persistence.as_ref().expect("persisted session");
+        let persistence_state = persistence.lock_state_for_test().await;
+        let delegate = Arc::new(RecordingDelegate::default());
+        let turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = delegate.clone();
+            async move { session.send("held persistence".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        wait_until_messages_locked(&session).await;
+        session.stop();
+        drop(persistence_state);
+
+        assert!(await_turn(turn).await.is_ok());
+        assert_cancelled_turn(&session, &delegate, 0);
+        drop(session);
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_immediately_after_busy_claim_never_loses_cancellation() {
+        let (session, workspace) = cancellation_test_session(None).await;
+
+        for iteration in 0..100 {
+            let messages = session.messages.lock().await;
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let delegate = Arc::new(RecordingDelegate::default());
+            let turn = tokio::spawn({
+                let session = session.clone();
+                let start = start.clone();
+                let delegate = delegate.clone();
+                async move {
+                    start.wait().await;
+                    session
+                        .send(format!("barrier turn {iteration}"), delegate)
+                        .await
+                }
+            });
+            let stopper = tokio::spawn({
+                let session = session.clone();
+                async move {
+                    start.wait().await;
+                    wait_until_busy(&session).await;
+                    session.stop();
+                }
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopper)
+                .await
+                .expect("stopper timed out")
+                .expect("stopper task panicked");
+            drop(messages);
+
+            assert!(await_turn(turn).await.is_ok(), "iteration {iteration}");
+            assert_cancelled_turn(&session, &delegate, 0);
+        }
+
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_busy_send_does_not_replace_first_turn_token() {
+        let (session, workspace) = cancellation_test_session(None).await;
+        let messages = session.messages.lock().await;
+        let first_delegate = Arc::new(RecordingDelegate::default());
+        let first_turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = first_delegate.clone();
+            async move { session.send("first".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        let active_before = session.cancel.lock().clone();
+        let second_delegate = Arc::new(RecordingDelegate::default());
+        let second_result = session
+            .send("second".to_string(), second_delegate.clone())
+            .await;
+        let active_after = session.cancel.lock().clone();
+
+        assert!(second_result.is_err());
+        assert_eq!(
+            active_before, active_after,
+            "a rejected busy send must not replace the active token"
+        );
+        assert!(second_delegate.done.lock().is_empty());
+        assert_eq!(second_delegate.errors.lock().len(), 1);
+
+        session.stop();
+        drop(messages);
+
+        assert!(await_turn(first_turn).await.is_ok());
+        assert_cancelled_turn(&session, &first_delegate, 0);
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_after_setup_cancellation_uses_fresh_uncancelled_token() {
+        let (session, workspace) = cancellation_test_session(None).await;
+        let messages = session.messages.lock().await;
+        let cancelled_delegate = Arc::new(RecordingDelegate::default());
+        let cancelled_turn = tokio::spawn({
+            let session = session.clone();
+            let delegate = cancelled_delegate.clone();
+            async move { session.send("cancel me".to_string(), delegate).await }
+        });
+
+        wait_until_busy(&session).await;
+        session.stop();
+        drop(messages);
+        assert!(await_turn(cancelled_turn).await.is_ok());
+        assert_cancelled_turn(&session, &cancelled_delegate, 0);
+        let cancelled_token = session.cancel.lock().clone();
+        assert!(cancelled_token.is_cancelled());
+
+        let next_delegate = Arc::new(RecordingDelegate::default());
+        assert!(session
+            .send("next turn".to_string(), next_delegate.clone())
+            .await
+            .is_ok());
+        let next_token = session.cancel.lock().clone();
+
+        assert_ne!(cancelled_token, next_token);
+        assert!(!next_token.is_cancelled());
+        assert_eq!(
+            next_delegate.done.lock().clone(),
+            vec!["end_turn".to_string()]
+        );
+        assert!(next_delegate.errors.lock().is_empty());
+        assert!(!session.is_busy());
+        assert_eq!(
+            session.model_tool_loop_invocations.load(Ordering::SeqCst),
+            1
+        );
+
+        drop(session);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
     // -- memory injection ---------------------------------------------------
 
+    fn test_familiar(role: Option<&str>) -> crate::remote::FamiliarIdentity {
+        crate::remote::FamiliarIdentity {
+            id: "familiar-1".to_string(),
+            display_name: "Morgana".to_string(),
+            emoji: Some("moon".to_string()),
+            role: role.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn familiar_preamble_uses_exact_role_and_no_role_forms() {
+        let workspace = std::env::current_dir().unwrap();
+        let with_role = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+            Some(test_familiar(Some("repository guide"))),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            with_role.append_system_prompt(),
+            "You are running inside Coven Pocket on iOS. Only repository file tools are \
+             available (no shell, no network tools); every path must stay inside the current \
+             workspace.\n\n[Identity: You are Morgana, a repository guide. Respond as Morgana, \
+             not as the underlying tool.]"
+        );
+
+        for role in [None, Some("   ")] {
+            let without_role = start_session(
+                PocketProvider::Anthropic,
+                "key".to_string(),
+                "model".to_string(),
+                None,
+                workspace.display().to_string(),
+                ChatPermissionMode::Default,
+                None,
+                Some(test_familiar(role)),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                without_role.append_system_prompt(),
+                "You are running inside Coven Pocket on iOS. Only repository file tools are \
+                 available (no shell, no network tools); every path must stay inside the current \
+                 workspace.\n\n[Identity: You are Morgana. Respond as Morgana, not as the \
+                 underlying tool.]"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn start_session_normalizes_arbitrary_familiar_input() {
+        let workspace = temp_dir("ws-normalize-familiar");
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            None,
+            Some(crate::remote::FamiliarIdentity {
+                id: " familiar-1 ".to_string(),
+                display_name: " Morgana ".to_string(),
+                emoji: Some(" moon ".to_string()),
+                role: Some(" repository guide ".to_string()),
+            }),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.config.familiar,
+            Some(crate::remote::FamiliarIdentity {
+                id: "familiar-1".to_string(),
+                display_name: "Morgana".to_string(),
+                emoji: Some("moon".to_string()),
+                role: Some("repository guide".to_string()),
+            })
+        );
+        assert!(session
+            .append_system_prompt()
+            .contains("[Identity: You are Morgana, a repository guide."));
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_oversized_familiar_before_persistence_or_prompt() {
+        let storage = temp_dir("store-oversized-familiar");
+        let workspace = temp_dir("ws-oversized-familiar");
+        let mut identity = test_familiar(Some("repository guide"));
+        identity.role = Some("r".repeat(1025));
+
+        let err = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            Some(storage.display().to_string()),
+            Some(identity),
+            false,
+        )
+        .await
+        .err()
+        .expect("oversized familiar must be rejected before creating a session");
+        let message = err.to_string();
+        assert!(message.contains("familiar role"), "got: {message}");
+        assert!(message.contains("1024-byte limit"), "got: {message}");
+        assert!(!storage.join("metadata").exists());
+        assert!(!storage.join(".session-lifecycle").exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn familiar_keeps_plan_mode_platform_note_and_memory_order() {
+        let guard = crate::memory::tests::setup("chat-familiar");
+        std::fs::write(guard.workspace.join("AGENTS.md"), "Pinned project memory.").unwrap();
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "model".to_string(),
+            None,
+            guard.workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            None,
+            Some(test_familiar(Some("planner"))),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let prompt = session.append_system_prompt();
+        let platform = prompt
+            .find("You are running inside Coven Pocket on iOS.")
+            .unwrap();
+        let familiar = prompt
+            .find("[Identity: You are Morgana, a planner.")
+            .unwrap();
+        let memory = prompt.find("Pinned project memory.").unwrap();
+        assert!(platform < familiar && familiar < memory);
+        assert_eq!(session.permission_mode(), ChatPermissionMode::Plan);
+    }
+
     /// The workspace AGENTS.md must reach the model iff the toggle is on.
-    #[test]
-    fn inject_context_gates_agents_md_in_system_prompt() {
+    #[tokio::test]
+    async fn inject_context_gates_agents_md_in_system_prompt() {
         let guard = crate::memory::tests::setup("chat-inject");
         let workspace = guard.workspace.clone();
         std::fs::write(
@@ -1265,8 +1719,10 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             true,
         )
+        .await
         .unwrap();
         assert!(
             with_context
@@ -1283,8 +1739,10 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             false,
         )
+        .await
         .unwrap();
         assert!(
             !without_context
@@ -1329,7 +1787,7 @@ mod tests {
         let perms = Arc::new(PermissionState::new(mode));
         let tool = SandboxedTool {
             inner: Box::new(StubWriteTool { ran: ran.clone() }),
-            root: std::env::temp_dir(),
+            root: std::env::current_dir().unwrap(),
             perms: perms.clone(),
             delegate,
         };
@@ -1337,11 +1795,11 @@ mod tests {
     }
 
     fn write_input() -> Value {
-        let path = std::env::temp_dir().join("gate-test.txt");
+        let path = std::env::current_dir().unwrap().join("gate-test.txt");
         serde_json::json!({ "file_path": path, "content": "hello" })
     }
 
-    fn test_ctx() -> ToolContext {
+    async fn test_ctx() -> ToolContext {
         // Only fields the stub path touches matter; reuse the session builder
         // for a fully-populated context.
         let session = start_session(
@@ -1349,11 +1807,13 @@ mod tests {
             "key".to_string(),
             "model".to_string(),
             None,
-            std::env::temp_dir().display().to_string(),
+            std::env::current_dir().unwrap().display().to_string(),
             ChatPermissionMode::Default,
+            None,
             None,
             false,
         )
+        .await
         .unwrap();
         let (_client, _config, ctx) = session.build_loop_inputs().unwrap();
         ctx
@@ -1364,7 +1824,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Allow));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Plan, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst), "plan mode must not execute");
@@ -1376,7 +1836,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::AcceptEdits, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(!result.is_error);
         assert!(ran.load(Ordering::SeqCst));
@@ -1388,7 +1848,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst));
@@ -1400,7 +1860,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Allow));
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(!result.is_error);
         assert!(ran.load(Ordering::SeqCst));
@@ -1416,7 +1876,7 @@ mod tests {
             ChatPermissionDecision::AllowSession,
         ));
         let (tool, ran, perms) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
-        let ctx = test_ctx();
+        let ctx = test_ctx().await;
 
         assert!(!tool.execute(write_input(), &ctx).await.is_error);
         ran.store(false, Ordering::SeqCst);
@@ -1437,7 +1897,7 @@ mod tests {
         let delegate = Arc::new(RecordingDelegate::default());
         let (tool, ran, _) = gated_stub(ChatPermissionMode::Default, Some(delegate.clone()));
 
-        let result = tool.execute(write_input(), &test_ctx()).await;
+        let result = tool.execute(write_input(), &test_ctx().await).await;
 
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst));
@@ -1448,7 +1908,7 @@ mod tests {
     async fn read_only_tools_bypass_the_gate() {
         let delegate = Arc::new(RecordingDelegate::answering(ChatPermissionDecision::Deny));
         let perms = Arc::new(PermissionState::new(ChatPermissionMode::Default));
-        let workspace = std::env::temp_dir().canonicalize().unwrap();
+        let workspace = temp_dir("read-gate").canonicalize().unwrap();
         let tools = sandbox_tools(&workspace, perms, Some(delegate.clone()));
         let read = tools
             .iter()
@@ -1458,12 +1918,15 @@ mod tests {
         std::fs::write(&target, "content").unwrap();
 
         let result = read
-            .execute(serde_json::json!({ "file_path": target }), &test_ctx())
+            .execute(
+                serde_json::json!({ "file_path": target }),
+                &test_ctx().await,
+            )
             .await;
 
         assert!(!result.is_error);
         assert!(delegate.prompts.lock().is_empty());
-        let _ = std::fs::remove_file(&target);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
@@ -1494,7 +1957,11 @@ mod tests {
     // -- session persistence -------------------------------------------------
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pocket-{label}-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("chat-tests")
+            .join(format!("{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1510,8 +1977,10 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             Some(storage.display().to_string()),
+            None,
             false,
         )
+        .await
         .unwrap();
         let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
         {
@@ -1527,12 +1996,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_new_session_saves_familiar_before_returning() {
+        let storage = temp_dir("store-familiar");
+        let workspace = temp_dir("ws-familiar");
+        let identity = test_familiar(Some("repository guide"));
+        let session = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            Some(storage.display().to_string()),
+            Some(identity.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::sessions::load_familiar_metadata(
+                &storage.display().to_string(),
+                &session.session_id()
+            )
+            .unwrap(),
+            Some(identity)
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
     async fn persisted_session_shows_up_in_list_with_derived_title() {
         let storage = temp_dir("store");
         let workspace = temp_dir("ws");
 
         let session = persisted_session(&storage, &workspace).await;
-        let listed = crate::sessions::list_sessions(&storage.display().to_string()).unwrap();
+        let listed = crate::sessions::list_sessions(&storage.display().to_string())
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, session.session_id());
         assert_eq!(listed[0].title, "hello world");
@@ -1550,6 +2053,8 @@ mod tests {
         let storage_str = storage.display().to_string();
 
         let original = persisted_session(&storage, &workspace).await;
+        let session_id = original.session_id();
+        drop(original);
         let resumed = resume_session(
             PocketProvider::Anthropic,
             "key".to_string(),
@@ -1558,13 +2063,13 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             storage_str.clone(),
-            original.session_id(),
+            session_id.clone(),
             false,
         )
         .await
         .unwrap();
 
-        assert_eq!(resumed.session_id(), original.session_id());
+        assert_eq!(resumed.session_id(), session_id);
         let transcript = resumed.transcript().await;
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].role, "user");
@@ -1580,12 +2085,207 @@ mod tests {
             messages.push(Message::user("follow-up"));
             resumed.persist_new(&messages, &delegate).await;
         }
-        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].message_count, 3);
 
         let _ = std::fs::remove_dir_all(&storage);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn newly_started_session_blocks_resume_until_all_arcs_drop() {
+        let storage = temp_dir("store-writer-lease");
+        let workspace = temp_dir("ws-writer-lease");
+        let storage_str = storage.display().to_string();
+        let original = persisted_session(&storage, &workspace).await;
+        let surviving_clone = original.clone();
+        let session_id = original.session_id();
+
+        let first_error = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str.clone(),
+            session_id.clone(),
+            false,
+        )
+        .await
+        .err()
+        .expect("a newly started session must retain its writer lease");
+        assert!(first_error
+            .to_string()
+            .contains(&format!("session {session_id} is already open for writing")));
+
+        drop(original);
+        let clone_error = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str.clone(),
+            session_id.clone(),
+            false,
+        )
+        .await
+        .err()
+        .expect("a surviving ChatSession Arc must retain the writer lease");
+        assert!(clone_error
+            .to_string()
+            .contains(&format!("session {session_id} is already open for writing")));
+
+        drop(surviving_clone);
+        let resumed = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Default,
+            storage_str,
+            session_id.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.session_id(), session_id);
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn resume_loads_the_stored_familiar_snapshot() {
+        let storage = temp_dir("store-resume-familiar");
+        let workspace = temp_dir("ws-resume-familiar");
+        let storage_str = storage.display().to_string();
+        let identity = test_familiar(Some("repository guide"));
+        let original = start_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            Some(storage_str.clone()),
+            Some(identity.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+        let delegate: Arc<dyn ChatDelegate> = Arc::new(RecordingDelegate::default());
+        {
+            let mut messages = original.messages.lock().await;
+            messages.push(Message::user("remember me"));
+            original.persist_new(&messages, &delegate).await;
+        }
+        let session_id = original.session_id();
+        drop(original);
+
+        let resumed = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            storage_str,
+            session_id,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resumed.config.familiar, Some(identity));
+        assert!(resumed
+            .append_system_prompt()
+            .contains("[Identity: You are Morgana, a repository guide."));
+        assert_eq!(resumed.permission_mode(), ChatPermissionMode::Plan);
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_fails_visibly_for_malformed_familiar_metadata() {
+        let storage = temp_dir("store-resume-malformed");
+        let workspace = temp_dir("ws-resume-malformed");
+        let storage_str = storage.display().to_string();
+        let original = persisted_session(&storage, &workspace).await;
+        let session_id = original.session_id();
+        let metadata = storage
+            .join("metadata")
+            .join(format!("{session_id}.familiar.json"));
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        std::fs::write(metadata, b"not-json").unwrap();
+        drop(original);
+
+        let err = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            storage_str,
+            session_id,
+            false,
+        )
+        .await
+        .err()
+        .expect("malformed familiar metadata must fail resume");
+        assert!(err.to_string().contains("cannot parse familiar metadata"));
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_oversized_familiar_metadata_before_reading_it() {
+        let storage = temp_dir("store-resume-oversized-familiar");
+        let workspace = temp_dir("ws-resume-oversized-familiar");
+        let storage_str = storage.display().to_string();
+        let original = persisted_session(&storage, &workspace).await;
+        let session_id = original.session_id();
+        let metadata = storage
+            .join("metadata")
+            .join(format!("{session_id}.familiar.json"));
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&metadata).unwrap();
+        file.set_len(crate::sessions::MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1)
+            .unwrap();
+        drop(file);
+        drop(original);
+
+        let err = resume_session(
+            PocketProvider::Anthropic,
+            "key".to_string(),
+            "claude-test".to_string(),
+            None,
+            workspace.display().to_string(),
+            ChatPermissionMode::Plan,
+            storage_str,
+            session_id,
+            false,
+        )
+        .await
+        .err()
+        .expect("oversized familiar metadata must fail resume");
+        let message = err.to_string();
+        assert!(message.contains("familiar metadata"), "got: {message}");
+        assert!(message.contains("10240-byte limit"), "got: {message}");
+        assert_eq!(
+            std::fs::symlink_metadata(metadata).unwrap().len(),
+            crate::sessions::MAX_FAMILIAR_IDENTITY_SIDECAR_BYTES + 1
+        );
+
+        std::fs::remove_dir_all(storage).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]
@@ -1596,7 +2296,7 @@ mod tests {
             "key".to_string(),
             "claude-test".to_string(),
             None,
-            std::env::temp_dir().display().to_string(),
+            std::env::current_dir().unwrap().display().to_string(),
             ChatPermissionMode::Default,
             storage.display().to_string(),
             uuid::Uuid::new_v4().to_string(),
@@ -1619,7 +2319,7 @@ mod tests {
             .unwrap();
         assert_ne!(fork_id, original.session_id());
 
-        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 2);
         let fork_row = listed
             .iter()
@@ -1630,8 +2330,10 @@ mod tests {
         assert_eq!(fork_row.message_count, 2);
 
         // Deleting the original leaves the fork intact and resumable.
-        crate::sessions::delete_session(&storage_str, &original.session_id()).unwrap();
-        let listed = crate::sessions::list_sessions(&storage_str).unwrap();
+        crate::sessions::delete_session(&storage_str, &original.session_id())
+            .await
+            .unwrap();
+        let listed = crate::sessions::list_sessions(&storage_str).await.unwrap();
         assert_eq!(listed.len(), 1);
         let resumed_fork = resume_session(
             PocketProvider::Anthropic,
@@ -1659,11 +2361,14 @@ mod tests {
         let storage_str = storage.display().to_string();
 
         let session = persisted_session(&storage, &workspace).await;
-        crate::sessions::delete_session(&storage_str, &session.session_id()).unwrap();
+        crate::sessions::delete_session(&storage_str, &session.session_id())
+            .await
+            .unwrap();
         assert!(crate::sessions::list_sessions(&storage_str)
+            .await
             .unwrap()
             .is_empty());
-        let err = resume_session(
+        let err = match resume_session(
             PocketProvider::Anthropic,
             "key".to_string(),
             "claude-test".to_string(),
@@ -1674,8 +2379,12 @@ mod tests {
             session.session_id(),
             false,
         )
-        .await;
-        assert!(err.is_err());
+        .await
+        {
+            Ok(_) => panic!("deleted session must not resume"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("was deleted"));
 
         let _ = std::fs::remove_dir_all(&storage);
         let _ = std::fs::remove_dir_all(&workspace);
@@ -1694,8 +2403,10 @@ mod tests {
             workspace.display().to_string(),
             ChatPermissionMode::Default,
             None,
+            None,
             false,
         )
+        .await
         .unwrap();
         assert!(uuid::Uuid::parse_str(&session.session_id()).is_ok());
 
@@ -1707,6 +2418,7 @@ mod tests {
         }
         assert!(
             crate::sessions::list_sessions(&storage.display().to_string())
+                .await
                 .unwrap()
                 .is_empty()
         );

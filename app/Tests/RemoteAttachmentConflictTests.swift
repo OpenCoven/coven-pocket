@@ -87,7 +87,8 @@ final class RemoteAttachmentConflictTests: XCTestCase {
             status: "running",
             projectRoot: "/w",
             createdAt: "c",
-            updatedAt: "u"
+            updatedAt: "u",
+            familiarId: nil
         )
         return RemoteAttachModel(session: session, companion: companion)
     }

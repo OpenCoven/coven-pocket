@@ -7,7 +7,8 @@ protocol CompanionSessionClient: AnyObject {
         pairing: DaemonPairing,
         projectRoot: String,
         prompt: String,
-        title: String
+        title: String,
+        familiarID: String?
     ) async throws -> RemoteSession
     func events(
         pairing: DaemonPairing,
@@ -39,7 +40,8 @@ final class LiveCompanionSessionClient: CompanionSessionClient {
         pairing: DaemonPairing,
         projectRoot: String,
         prompt: String,
-        title: String
+        title: String,
+        familiarID: String?
     ) async throws -> RemoteSession {
         try await companion.engine.remoteLaunchSession(
             host: pairing.host,
@@ -47,6 +49,7 @@ final class LiveCompanionSessionClient: CompanionSessionClient {
             projectRoot: projectRoot,
             prompt: prompt,
             title: title,
+            familiarId: familiarID,
             timeoutMs: CompanionChatModel.requestTimeoutMs
         )
     }

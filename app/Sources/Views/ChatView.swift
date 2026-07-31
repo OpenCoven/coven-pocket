@@ -1,34 +1,48 @@
 import SwiftUI
 
+// swiftlint:disable file_length
+
 /// Multi-turn chat through either a verified companion daemon's Claude CLI
 /// or the on-device Codex engine.
 struct ChatView: View {
-    @StateObject private var model = ChatModel()
-    @StateObject private var client = EngineClient()
-    @StateObject private var companionModel = CompanionChatModel()
+    @ObservedObject var client: EngineClient
+    @ObservedObject var chatState: ChatSurfaceState
+    @ObservedObject private var model: ChatModel
+    @ObservedObject private var companion: CompanionModel
+    @ObservedObject private var companionModel: CompanionChatModel
+    @ObservedObject private var familiarModel: FamiliarSelectionModel
+    private let routeCoordinator: ChatRouteGenerationCoordinator
     @ObservedObject private var router = AppRouter.shared
 
-    @State private var settings = ChatSettings(
-        daemonProjectRoot: UserDefaults.standard.string(
-            forKey: "daemon-chat-project-root"
-        ) ?? ""
-    )
     @State private var prompt = ""
     @State private var showSettings = false
     @State private var showSessions = false
     @State private var showShare = false
 
-    private var activeItems: [ChatItem] {
-        settings.backend == .companionClaude ? companionModel.items : model.items
+    init(client: EngineClient, chatState: ChatSurfaceState) {
+        _client = ObservedObject(wrappedValue: client)
+        _chatState = ObservedObject(wrappedValue: chatState)
+        _model = ObservedObject(wrappedValue: chatState.model)
+        _companion = ObservedObject(wrappedValue: chatState.companion)
+        _companionModel = ObservedObject(
+            wrappedValue: chatState.companionModel
+        )
+        _familiarModel = ObservedObject(
+            wrappedValue: chatState.familiarModel
+        )
+        routeCoordinator = chatState.routeCoordinator
     }
 
-    private var activeIsBusy: Bool {
-        settings.backend == .companionClaude ? companionModel.isBusy : model.isBusy
+    private var settings: ChatSettings {
+        get { chatState.settings }
+        nonmutating set { chatState.settings = newValue }
     }
 
-    private var activeCanRetry: Bool {
-        settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry
-    }
+    private var activeItems: [ChatItem] { settings.backend == .companionClaude ? companionModel.items : model.items }
+
+    private var activeIsBusy: Bool { settings.backend == .companionClaude ? companionModel.isBusy : model.isBusy }
+
+    private var activeCanRetry: Bool { settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry }
 
     private var canSend: Bool {
         guard !activeIsBusy,
@@ -54,8 +68,11 @@ struct ChatView: View {
             .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if settings.backend == .codex {
-                    ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    if let identitySeal {
+                        FamiliarIdentitySeal(value: identitySeal)
+                    }
+                    if settings.backend == .codex {
                         Menu {
                             Picker("Permission mode", selection: $model.permissionMode) {
                                 ForEach(ChatPermissionMode.all, id: \.self) { mode in
@@ -80,6 +97,7 @@ struct ChatView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        routeCoordinator.invalidate()
                         showSessions = true
                     } label: {
                         Image(systemName: "clock.arrow.circlepath")
@@ -97,22 +115,28 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showSettings) {
                 ChatSettingsView(
-                    settings: $settings,
+                    settings: routedSettings,
                     client: client,
                     model: model,
-                    companionModel: companionModel
+                    companionModel: companionModel,
+                    familiarModel: familiarModel,
+                    onReset: { routeCoordinator.invalidate() }
                 )
             }
             .sheet(isPresented: $showSessions) {
                 if settings.backend == .companionClaude {
                     NavigationStack {
                         RemoteSessionsView(
-                            companion: companionModel.companion,
+                            companion: companion,
                             showsDoneButton: true
                         )
                     }
                 } else {
-                    SessionsView(model: model, settings: settings)
+                    SessionsView(
+                        model: model,
+                        settings: settings,
+                        onResume: { routeCoordinator.invalidate() }
+                    )
                 }
             }
             .sheet(isPresented: $showShare) {
@@ -129,52 +153,174 @@ struct ChatView: View {
             }
             .task(id: router.selectedTab) {
                 if router.selectedTab == .chat {
-                    await companionModel.refreshAvailability()
-                    normalizeBackendSelection()
+                    await refreshFamiliarContext()
                 }
             }
-            .task(id: router.pendingPrompt) { await consumeRouterPrompt() }
-            .task(id: router.pendingSessionID) { await consumeRouterSession() }
+            .onChange(of: settings.backend) {
+                synchronizeFamiliarProfile()
+            }
+            .onChange(of: companionModel.availability) {
+                normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            }
+            .onChange(of: familiarModel.selectedFamiliar?.id) { oldID, newID in
+                guard oldID != newID,
+                      familiarModel.activeProfile == activeFamiliarProfile
+                else { return }
+                synchronizeFamiliarProfile()
+            }
+            .task(id: router.pendingPrompt) { consumeRouterPrompt() }
+            .task(id: router.pendingSessionID) { consumeRouterSession() }
             .task(id: router.pendingReset) {
-                guard router.consumeReset() else { return }
-                await resetActiveConversation()
+                consumeRouterReset()
             }
         }
     }
 }
 
+extension ChatView {
+    static func spotlightSession(
+        sessionID: String,
+        loader: SessionListModel.Loader
+    ) async -> ChatSessionSummary? {
+        do {
+            let sessions = try await loader()
+            return sessions.first { $0.sessionId == sessionID }
+        } catch {
+            return nil
+        }
+    }
+
+    static func consumeQueuedPrompt(
+        _ queued: String?,
+        coordinator: ChatRouteGenerationCoordinator,
+        stage: (String) -> Void,
+        canSend: () -> Bool
+    ) -> String? {
+        guard let queued else { return nil }
+        coordinator.invalidate()
+        stage(queued)
+        return canSend() ? queued : nil
+    }
+}
+
 private extension ChatView {
+    var activeFamiliarProfile: FamiliarProfileKey? {
+        chatState.activeFamiliarProfile(
+            codexProfileID: client.codexAccount?.profileId
+        )
+    }
+
+    var routedSettings: Binding<ChatSettings> {
+        Binding(
+            get: { settings },
+            set: { updated in
+                if updated.backend != settings.backend {
+                    routeCoordinator.invalidate()
+                }
+                chatState.settings = updated
+            }
+        )
+    }
+
+    var identitySeal: FamiliarSealValue? {
+        switch settings.backend {
+        case .companionClaude:
+            return FamiliarSealResolver.companion(
+                activeFamiliar: companionModel.sessionFamiliar,
+                hasActiveSession: companionModel.hasActiveSession,
+                selectedFamiliar: familiarModel.selectedFamiliar,
+                roster: familiarModel.roster
+            )
+        case .codex:
+            return FamiliarSealResolver.onDevice(
+                activeFamiliar: model.activeFamiliar,
+                hasActiveSession: model.hasActiveSession,
+                selectedFamiliar: familiarModel.selectedFamiliar,
+                roster: familiarModel.roster
+            )
+        }
+    }
+
     // MARK: - Intent / Spotlight handoff
 
-    /// Run a prompt queued by `AskCovenIntent`: send it when the backend is
-    /// configured, otherwise leave it in the input bar for the user.
-    /// Consuming clears the published value (changing the task id), so the
-    /// actual work runs in a detached-lifetime `Task` that survives the
-    /// resulting cancellation.
-    private func consumeRouterPrompt() async {
+    /// Send a queued intent when configured; the nested task survives
+    /// cancellation caused by consuming the router value.
+    private func consumeRouterPrompt() {
+        consumePendingRouterReset()
         guard let queued = router.consumePrompt() else { return }
-        prompt = queued
-        guard canSend else { return }
-        prompt = ""
-        Task { await send(queued) }
+        let token = routeCoordinator.begin()
+        Task { @MainActor in
+            await routeCoordinator.runAfterRoutedReset(token: token) {
+                guard let queuedForSend = Self.consumeQueuedPrompt(
+                    queued,
+                    coordinator: routeCoordinator,
+                    stage: { prompt = $0 },
+                    canSend: { canSend }
+                ) else { return }
+                prompt = ""
+                startSend(queuedForSend)
+            }
+        }
     }
 
     /// Spotlight indexes on-device sessions, so this explicit history choice
     /// switches to Codex rather than acting as an error fallback.
-    private func consumeRouterSession() async {
+    private func consumeRouterSession() {
+        consumePendingRouterReset()
         guard let sessionID = router.consumeSessionID() else { return }
-        settings.backend = .codex
-        if settings.model.isEmpty {
-            settings.model = client.defaultCodexModel
+        let token = routeCoordinator.begin()
+        Task { @MainActor in
+            await routeCoordinator.runAfterRoutedReset(
+                token: token,
+                canProceed: { !companionModel.hasPendingCleanup },
+                operation: {
+                    guard let currentSettings =
+                            ChatFamiliarProfile.settingsForCodexResume(
+                                current: settings,
+                                codexProfileID: client.codexAccount?.profileId,
+                                defaultModel: client.defaultCodexModel,
+                                model: familiarModel
+                            ) else {
+                        routeCoordinator.retire(token)
+                        return
+                    }
+                    chatState.settings = currentSettings
+                    await SpotlightSessionRouteRunner.run(
+                        token: token,
+                        coordinator: routeCoordinator,
+                        lookup: {
+                            await ChatView.spotlightSession(
+                                sessionID: sessionID,
+                                loader: { try await model.storedSessions() }
+                            )
+                        },
+                        cancelResume: {
+                            model.stop()
+                        },
+                        resume: { summary in
+                            _ = await model.resume(
+                                summary,
+                                settings: currentSettings
+                            )
+                        }
+                    )
+                }
+            )
         }
-        let settings = settings
-        Task {
-            guard
-                let summary = await model.storedSessions()
-                    .first(where: { $0.sessionId == sessionID })
-            else { return }
-            await model.resume(summary, settings: settings)
+    }
+
+    private func consumeRouterReset() {
+        guard router.consumeReset() else { return }
+        let backend = settings.backend
+        routeCoordinator.launchRoutedReset(for: backend) {
+            await resetActiveConversation(backend: backend)
         }
+    }
+
+    private func consumePendingRouterReset() {
+        guard router.pendingReset else { return }
+        consumeRouterReset()
     }
 
     private var transcript: some View {
@@ -246,7 +392,7 @@ private extension ChatView {
                 Button {
                     let text = prompt
                     prompt = ""
-                    Task { await send(text) }
+                    startSend(text)
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
@@ -261,22 +407,40 @@ private extension ChatView {
         .padding(.vertical, 8)
     }
 
+    private func startSend(_ text: String) {
+        routeCoordinator.invalidate()
+        Task { await send(text) }
+    }
+
     private func send(_ text: String) async {
         switch settings.backend {
         case .companionClaude:
             await companionModel.send(
                 prompt: text,
-                projectRoot: settings.daemonProjectRoot
+                projectRoot: settings.daemonProjectRoot,
+                familiarID: settings.familiarID,
+                familiar: familiarModel.selectedFamiliar,
+                familiarProfile: familiarModel.activeProfile
             )
         case .codex:
-            await model.send(prompt: text, settings: settings)
+            await model.send(
+                prompt: text,
+                settings: settings,
+                selectedFamiliar: familiarModel.selectedFamiliar
+            )
         }
     }
 
     private func retryActiveConversation() async {
         switch settings.backend {
         case .companionClaude:
-            await companionModel.retry()
+            await companionModel.retry {
+                CompanionPromptRetrySelection(
+                    familiarID: settings.familiarID,
+                    familiar: familiarModel.selectedFamiliar,
+                    profile: familiarModel.activeProfile
+                )
+            }
         case .codex:
             await model.retry()
         }
@@ -291,13 +455,14 @@ private extension ChatView {
         }
     }
 
-    private func resetActiveConversation() async {
-        switch settings.backend {
+    private func resetActiveConversation(backend: ChatBackend) async {
+        switch backend {
         case .companionClaude:
             await companionModel.reset()
         case .codex:
             model.reset()
         }
+        synchronizeFamiliarProfile()
     }
 
     private func normalizeBackendSelection() {
@@ -310,13 +475,40 @@ private extension ChatView {
               let fallback = available.first else {
             return
         }
+        routeCoordinator.invalidate()
         settings.backend = fallback
         if fallback == .codex, settings.model.isEmpty {
             settings.model = client.defaultCodexModel
         }
     }
-}
 
+    private func synchronizeFamiliarProfile() {
+        chatState.synchronizeFamiliarProfile(
+            codexProfileID: client.codexAccount?.profileId
+        )
+    }
+
+    private func refreshFamiliarContext() async {
+        await FamiliarContextRefreshCoordinator.refresh(
+            availability: {
+                await companionModel.refreshAvailability()
+            },
+            synchronizeAfterAvailability: {
+                normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            },
+            roster: {
+                await familiarModel.refresh()
+            },
+            synchronizeAfterRoster: {
+                synchronizeFamiliarProfile()
+            }
+        )
+    }
+}
 #Preview {
-    ChatView()
+    ChatView(
+        client: EngineClient(),
+        chatState: ChatSurfaceState()
+    )
 }

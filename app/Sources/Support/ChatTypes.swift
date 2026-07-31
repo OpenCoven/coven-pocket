@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 enum ChatBackend: String, CaseIterable, Hashable {
@@ -31,6 +32,267 @@ struct ChatSettings: Equatable {
     var backend: ChatBackend = .companionClaude
     var model: String = ""
     var daemonProjectRoot: String = ""
+    var familiarID: String?
+}
+
+@MainActor
+enum CodexAccountTransitionCoordinator {
+    static func handle(
+        from oldProfileID: String?,
+        to newProfileID: String?,
+        invalidateRoutes: () -> Void,
+        resetOnDevice: () -> Void,
+        synchronizeFamiliar: () -> Void
+    ) {
+        guard oldProfileID != newProfileID else { return }
+        invalidateRoutes()
+        resetOnDevice()
+        synchronizeFamiliar()
+    }
+}
+
+@MainActor
+final class ChatSurfaceState: ObservableObject {
+    @Published var settings: ChatSettings
+
+    let model: ChatModel
+    let companion: CompanionModel
+    let companionModel: CompanionChatModel
+    let familiarModel: FamiliarSelectionModel
+    let routeCoordinator: ChatRouteGenerationCoordinator
+
+    convenience init() {
+        let sharedCompanion = CompanionModel()
+        self.init(
+            model: ChatModel(),
+            companion: sharedCompanion,
+            companionModel: CompanionChatModel(companion: sharedCompanion),
+            familiarModel: FamiliarSelectionModel(companion: sharedCompanion),
+            routeCoordinator: ChatRouteGenerationCoordinator(),
+            settings: ChatSettings(
+                daemonProjectRoot: UserDefaults.standard.string(
+                    forKey: "daemon-chat-project-root"
+                ) ?? ""
+            )
+        )
+    }
+
+    init(
+        model: ChatModel,
+        companion: CompanionModel,
+        companionModel: CompanionChatModel,
+        familiarModel: FamiliarSelectionModel,
+        routeCoordinator: ChatRouteGenerationCoordinator,
+        settings: ChatSettings
+    ) {
+        self.model = model
+        self.companion = companion
+        self.companionModel = companionModel
+        self.familiarModel = familiarModel
+        self.routeCoordinator = routeCoordinator
+        self.settings = settings
+    }
+
+    func activeFamiliarProfile(
+        codexProfileID: String?
+    ) -> FamiliarProfileKey? {
+        ChatFamiliarProfile.active(
+            backend: settings.backend,
+            codexProfileID: codexProfileID,
+            companionAvailability: companionModel.availability,
+            companionPairing: companionModel.configuredPairing,
+            previous: familiarModel.activeProfile
+        )
+    }
+
+    func synchronizeFamiliarProfile(codexProfileID: String?) {
+        settings.familiarID = ChatFamiliarProfile.synchronize(
+            activeFamiliarProfile(codexProfileID: codexProfileID),
+            model: familiarModel
+        )
+    }
+
+    func handleCodexAccountTransition(
+        from oldProfileID: String?,
+        to newProfileID: String?
+    ) {
+        CodexAccountTransitionCoordinator.handle(
+            from: oldProfileID,
+            to: newProfileID,
+            invalidateRoutes: { routeCoordinator.invalidate() },
+            resetOnDevice: { model.reset() },
+            synchronizeFamiliar: {
+                synchronizeFamiliarProfile(
+                    codexProfileID: newProfileID
+                )
+            }
+        )
+    }
+}
+
+@MainActor
+final class ChatRouteGenerationCoordinator: ObservableObject {
+    struct Token: Equatable {
+        fileprivate let generation: UInt64
+    }
+
+    private var generation: UInt64 = 0
+    private var cancelResume: (() -> Void)?
+    private let routedResetRunner = RoutedResetRunner()
+
+    func begin() -> Token {
+        advanceGeneration()
+        return Token(generation: generation)
+    }
+
+    func invalidate() {
+        advanceGeneration()
+    }
+
+    func launchRoutedReset(
+        for backend: ChatBackend,
+        _ reset: @escaping @MainActor () async -> Void
+    ) {
+        invalidate()
+        routedResetRunner.launch(for: backend, reset)
+    }
+
+    func waitForRoutedReset() async {
+        await routedResetRunner.waitForCompletion()
+    }
+
+    func runAfterRoutedReset(
+        token: Token,
+        canProceed: @escaping @MainActor () -> Bool = { true },
+        operation: @escaping @MainActor () async -> Void
+    ) async {
+        await waitForRoutedReset()
+        guard isCurrent(token) else { return }
+        guard canProceed() else {
+            retire(token)
+            return
+        }
+        await operation()
+    }
+
+    func isCurrent(_ token: Token) -> Bool {
+        token.generation == generation
+    }
+
+    func prepareToResume(
+        _ token: Token,
+        cancelOnInvalidation: @escaping () -> Void
+    ) -> Bool {
+        guard isCurrent(token) else { return false }
+        cancelResume = cancelOnInvalidation
+        return true
+    }
+
+    func retire(_ token: Token) {
+        guard isCurrent(token) else { return }
+        cancelResume = nil
+        generation &+= 1
+    }
+
+    private func advanceGeneration() {
+        let cancellation = cancelResume
+        cancelResume = nil
+        generation &+= 1
+        cancellation?()
+    }
+}
+
+@MainActor
+enum SpotlightSessionRouteRunner {
+    static func run<Summary>(
+        token: ChatRouteGenerationCoordinator.Token,
+        coordinator: ChatRouteGenerationCoordinator,
+        lookup: @escaping () async -> Summary?,
+        cancelResume: @escaping () -> Void,
+        resume: @escaping (Summary) async -> Void
+    ) async {
+        guard coordinator.isCurrent(token) else { return }
+        guard let summary = await lookup() else {
+            coordinator.retire(token)
+            return
+        }
+        guard coordinator.isCurrent(token),
+              coordinator.prepareToResume(
+                token,
+                cancelOnInvalidation: cancelResume
+              ) else { return }
+        await resume(summary)
+        guard coordinator.isCurrent(token) else { return }
+        coordinator.retire(token)
+    }
+}
+
+enum ChatFamiliarProfile {
+    static func active(
+        backend: ChatBackend,
+        codexProfileID: String?,
+        companionAvailability: CompanionChatModel.Availability,
+        companionPairing: DaemonPairing?,
+        previous: FamiliarProfileKey?
+    ) -> FamiliarProfileKey? {
+        switch backend {
+        case .codex:
+            return codexProfileID.map(FamiliarProfileKey.codex(profileID:))
+        case .companionClaude:
+            guard let companionPairing else { return nil }
+            switch companionAvailability {
+            case let .ready(pairing):
+                return .companion(pairing: pairing)
+            case .checking:
+                if case .companion = previous {
+                    return previous?.normalized
+                }
+                return .companion(pairing: companionPairing)
+            case .idle, .blocked:
+                return .companion(pairing: companionPairing)
+            }
+        }
+    }
+
+    @MainActor
+    static func synchronize(
+        _ profile: FamiliarProfileKey?,
+        model: FamiliarSelectionModel,
+        currentFamiliarID: String? = nil,
+        preserveCurrent: Bool = false
+    ) -> String? {
+        let profileChanged = model.activeProfile != profile?.normalized
+        if profileChanged {
+            model.activate(profile)
+        }
+        if preserveCurrent, !profileChanged {
+            return currentFamiliarID
+        }
+        return model.selectedFamiliar?.id
+    }
+
+    @MainActor
+    static func settingsForCodexResume(
+        current: ChatSettings,
+        codexProfileID: String?,
+        defaultModel: String,
+        model: FamiliarSelectionModel
+    ) -> ChatSettings? {
+        guard let codexProfileID, !codexProfileID.isEmpty else {
+            return nil
+        }
+
+        var prepared = current
+        prepared.backend = .codex
+        if prepared.model.isEmpty {
+            prepared.model = defaultModel
+        }
+        prepared.familiarID = synchronize(
+            .codex(profileID: codexProfileID),
+            model: model
+        )
+        return prepared
+    }
 }
 
 /// Answer sink for one approval request. `ChatPermissionResponder` conforms;

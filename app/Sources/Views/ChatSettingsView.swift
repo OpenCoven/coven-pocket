@@ -5,6 +5,8 @@ struct ChatSettingsView: View {
     @ObservedObject var client: EngineClient
     @ObservedObject var model: ChatModel
     @ObservedObject var companionModel: CompanionChatModel
+    @ObservedObject var familiarModel: FamiliarSelectionModel
+    let onReset: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -22,6 +24,7 @@ struct ChatSettingsView: View {
                             if backend == .codex, settings.model.isEmpty {
                                 settings.model = client.defaultCodexModel
                             }
+                            synchronizeFamiliarProfile()
                         }
                     } else {
                         LabeledContent(
@@ -37,6 +40,15 @@ struct ChatSettingsView: View {
                         codexRows
                     }
                 }
+
+                FamiliarPickerSection(
+                    settings: $settings,
+                    model: familiarModel,
+                    profile: activeFamiliarProfile,
+                    refreshContext: {
+                        await refreshFamiliarContext()
+                    }
+                )
 
                 if settings.backend == .codex {
                     Section {
@@ -62,7 +74,9 @@ struct ChatSettingsView: View {
 
                     Section {
                         Button("Clear conversation", role: .destructive) {
+                            onReset()
                             model.reset()
+                            synchronizeFamiliarProfile()
                             dismiss()
                         }
                     } footer: {
@@ -77,14 +91,21 @@ struct ChatSettingsView: View {
             .navigationTitle("Chat Settings")
             .navigationBarTitleDisplayMode(.inline)
             .task {
-                await companionModel.refreshAvailability()
-                normalizeBackendSelection()
+                await refreshFamiliarContext()
             }
             .onChange(of: companionModel.availability) {
                 normalizeBackendSelection()
+                synchronizeFamiliarProfile()
             }
-            .onChange(of: client.codexAccount != nil) {
+            .onChange(of: client.codexAccount?.profileId) {
                 normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            }
+            .onChange(of: familiarModel.selectedFamiliar?.id) { oldID, newID in
+                guard oldID != newID,
+                      familiarModel.activeProfile == activeFamiliarProfile
+                else { return }
+                synchronizeFamiliarProfile()
             }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -103,6 +124,16 @@ struct ChatSettingsView: View {
         )
     }
 
+    private var activeFamiliarProfile: FamiliarProfileKey? {
+        ChatFamiliarProfile.active(
+            backend: settings.backend,
+            codexProfileID: client.codexAccount?.profileId,
+            companionAvailability: companionModel.availability,
+            companionPairing: companionModel.configuredPairing,
+            previous: familiarModel.activeProfile
+        )
+    }
+
     private func normalizeBackendSelection() {
         guard companionModel.availability != .checking else { return }
         guard !availableBackends.contains(settings.backend),
@@ -115,6 +146,32 @@ struct ChatSettingsView: View {
         }
     }
 
+    private func synchronizeFamiliarProfile() {
+        settings.familiarID = ChatFamiliarProfile.synchronize(
+            activeFamiliarProfile,
+            model: familiarModel
+        )
+    }
+
+    @MainActor
+    private func refreshFamiliarContext() async {
+        await FamiliarContextRefreshCoordinator.refresh(
+            availability: {
+                await companionModel.refreshAvailability()
+            },
+            synchronizeAfterAvailability: {
+                normalizeBackendSelection()
+                synchronizeFamiliarProfile()
+            },
+            roster: {
+                await familiarModel.refresh()
+            },
+            synchronizeAfterRoster: {
+                synchronizeFamiliarProfile()
+            }
+        )
+    }
+
     @ViewBuilder private var companionRows: some View {
         TextField("Project path on daemon host", text: $settings.daemonProjectRoot)
             .textInputAutocapitalization(.never)
@@ -124,6 +181,18 @@ struct ChatSettingsView: View {
             }
 
         switch companionModel.availability {
+        case .idle:
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Daemon availability not checked")
+                    Text("Verify the daemon to enable Companion chat.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "questionmark.circle")
+                    .foregroundStyle(.secondary)
+            }
         case .checking:
             Label("Checking the daemon…", systemImage: "antenna.radiowaves.left.and.right")
                 .foregroundStyle(.secondary)
@@ -154,7 +223,7 @@ struct ChatSettingsView: View {
         }
 
         Button("Verify daemon") {
-            Task { await companionModel.refreshAvailability() }
+            Task { await refreshFamiliarContext() }
         }
 
         Button("Open Companion") {

@@ -22,30 +22,47 @@ enum FakeCompanionError: LocalizedError {
 final class FakeCompanionSessionClient: CompanionSessionClient {
     var gate: CompanionModel.SessionGate
     var launchedPrompts: [String] = []
+    var launchedFamiliarIDs: [String?] = []
+    var launchedPairings: [DaemonPairing] = []
     var sentInputs: [String] = []
+    var sentInputPairings: [DaemonPairing] = []
     var killedSessionIDs: [String] = []
+    var killPairings: [DaemonPairing] = []
+    var eventPairings: [DaemonPairing] = []
+    var operationLog: [String] = []
     var gateCallCount = 0
     var eventBatches: [RemoteEventBatch] = []
     var eventError: FakeCompanionError?
     var sendInputError: FakeCompanionError?
     var killError: FakeCompanionError?
+    var killChecksCancellation = false
     var launchError: FakeCompanionError?
     var launchedProjectRoot: String?
+    var launchResponseID = "session-1"
+    var echoesRequestedFamiliarID = true
+    var launchResponseFamiliarID: String?
     var suspendsEvents = false
     var suspendsGate = false
     var suspendsLaunch = false
+    var suspendsSendInput = false
     var suspendsKill = false
+    var beforeGateResponse: (() -> Void)?
     let eventsRequested = XCTestExpectation(description: "events requested")
     let gateRequested = XCTestExpectation(description: "session gate requested")
     let secondGateRequested = XCTestExpectation(description: "second session gate requested")
     let launchRequested = XCTestExpectation(description: "session launch requested")
+    let secondLaunchRequested = XCTestExpectation(description: "second session launch requested")
+    let sendInputRequested = XCTestExpectation(description: "session input requested")
     let killRequested = XCTestExpectation(description: "session kill requested")
     private var eventsContinuation: CheckedContinuation<RemoteEventBatch, Never>?
     private var gateContinuations: [
         CheckedContinuation<CompanionModel.SessionGate, Never>
     ] = []
     private var launchContinuation: CheckedContinuation<RemoteSession, Error>?
+    private var sendInputContinuation: CheckedContinuation<Void, Never>?
     private var killContinuation: CheckedContinuation<Void, Never>?
+    private var suspendedLaunchFamiliarID: String?
+    private var launchCallCount = 0
 
     init(gate: CompanionModel.SessionGate) {
         self.gate = gate
@@ -53,36 +70,42 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
 
     func sessionGate() async -> CompanionModel.SessionGate {
         gateCallCount += 1
+        let result: CompanionModel.SessionGate
         if suspendsGate {
             if gateContinuations.isEmpty {
                 gateRequested.fulfill()
             } else {
                 secondGateRequested.fulfill()
             }
-            return await withCheckedContinuation { continuation in
+            result = await withCheckedContinuation { continuation in
                 gateContinuations.append(continuation)
             }
+        } else {
+            result = gate
         }
-        return gate
+        let responseHook = beforeGateResponse
+        beforeGateResponse = nil
+        responseHook?()
+        return result
     }
 
     func launch(
         pairing: DaemonPairing,
         projectRoot: String,
         prompt: String,
-        title: String
+        title: String,
+        familiarID: String?
     ) async throws -> RemoteSession {
+        launchCallCount += 1
+        if launchCallCount == 2 {
+            secondLaunchRequested.fulfill()
+        }
         launchedPrompts.append(prompt)
-        let session = RemoteSession(
-            id: "session-1",
-            harness: "claude",
-            title: title,
-            status: "running",
-            projectRoot: launchedProjectRoot ?? projectRoot,
-            createdAt: "c",
-            updatedAt: "u"
-        )
+        launchedFamiliarIDs.append(familiarID)
+        launchedPairings.append(pairing)
+        operationLog.append("launch:\(familiarID ?? "nil")")
         if suspendsLaunch {
+            suspendedLaunchFamiliarID = familiarID
             launchRequested.fulfill()
             return try await withCheckedThrowingContinuation { continuation in
                 launchContinuation = continuation
@@ -91,7 +114,12 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         if let launchError {
             throw launchError
         }
-        return session
+        return remoteSession(
+            id: launchResponseID,
+            title: title,
+            projectRoot: launchedProjectRoot ?? projectRoot,
+            familiarID: responseFamiliarID(for: familiarID)
+        )
     }
 
     func events(
@@ -99,6 +127,7 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         sessionID: String,
         afterSeq: Int64
     ) async throws -> RemoteEventBatch {
+        eventPairings.append(pairing)
         if suspendsEvents {
             eventsRequested.fulfill()
             return await withCheckedContinuation { continuation in
@@ -123,18 +152,30 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         sessionID: String,
         data: String
     ) async throws {
+        sentInputs.append(data)
+        sentInputPairings.append(pairing)
+        if suspendsSendInput {
+            sendInputRequested.fulfill()
+            await withCheckedContinuation { continuation in
+                sendInputContinuation = continuation
+            }
+        }
         if let sendInputError {
             throw sendInputError
         }
-        sentInputs.append(data)
     }
 
     func kill(pairing: DaemonPairing, sessionID: String) async throws {
+        operationLog.append("kill:\(sessionID)")
+        killPairings.append(pairing)
         if suspendsKill {
             killRequested.fulfill()
             await withCheckedContinuation { continuation in
                 killContinuation = continuation
             }
+        }
+        if killChecksCancellation {
+            try Task.checkCancellation()
         }
         if let killError {
             throw killError
@@ -166,25 +207,34 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         continuation.resume(returning: result)
     }
 
-    func resumeLaunch(projectRoot: String = "/srv/repo") {
+    func resumeLaunch(
+        id: String = "session-1",
+        projectRoot: String = "/srv/repo"
+    ) {
         suspendsLaunch = false
         let continuation = launchContinuation
         launchContinuation = nil
+        let familiarID = suspendedLaunchFamiliarID
+        suspendedLaunchFamiliarID = nil
         if let launchError {
             continuation?.resume(throwing: launchError)
         } else {
             continuation?.resume(
-                returning: RemoteSession(
-                    id: "session-1",
-                    harness: "claude",
+                returning: remoteSession(
+                    id: id,
                     title: "title",
-                    status: "running",
                     projectRoot: projectRoot,
-                    createdAt: "c",
-                    updatedAt: "u"
+                    familiarID: responseFamiliarID(for: familiarID)
                 )
             )
         }
+    }
+
+    func resumeSendInput() {
+        suspendsSendInput = false
+        let continuation = sendInputContinuation
+        sendInputContinuation = nil
+        continuation?.resume()
     }
 
     func resumeKill() {
@@ -192,6 +242,10 @@ final class FakeCompanionSessionClient: CompanionSessionClient {
         let continuation = killContinuation
         killContinuation = nil
         continuation?.resume()
+    }
+
+    private func responseFamiliarID(for requested: String?) -> String? {
+        echoesRequestedFamiliarID ? requested : launchResponseFamiliarID
     }
 }
 
@@ -208,6 +262,48 @@ func pairedDaemon(
         pid: pid,
         startedAt: startedAt,
         pairedAt: Date()
+    )
+}
+
+@MainActor
+func verifiedPairingToken(
+    _ pairing: DaemonPairing,
+    on model: CompanionChatModel
+) -> VerifiedPairing {
+    VerifiedPairing(
+        pairing: pairing,
+        availabilityGeneration: model.availabilityGeneration,
+        trafficEpoch: model.trafficEpoch
+    )
+}
+
+@MainActor
+func completeTurn(on model: CompanionChatModel) {
+    model.apply(events: [
+        RemoteEvent(
+            seq: 1,
+            kind: "result",
+            payloadJson: #"{"type":"result","is_error":false}"#,
+            createdAt: "t"
+        )
+    ])
+}
+
+func remoteSession(
+    id: String = "session-1",
+    title: String = "title",
+    projectRoot: String = "/srv/repo",
+    familiarID: String? = nil
+) -> RemoteSession {
+    RemoteSession(
+        id: id,
+        harness: "claude",
+        title: title,
+        status: "running",
+        projectRoot: projectRoot,
+        createdAt: "c",
+        updatedAt: "u",
+        familiarId: familiarID
     )
 }
 

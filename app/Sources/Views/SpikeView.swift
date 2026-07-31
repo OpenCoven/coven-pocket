@@ -11,13 +11,17 @@ struct SpikeView: View {
         ("max", "◉ Max")
     ]
 
-    @StateObject private var client = EngineClient()
+    @ObservedObject var client: EngineClient
     @State private var provider: PocketProvider = .anthropic
     @State private var apiKey: String = Keychain.get("anthropic-api-key") ?? ""
     @State private var anthropicModel: String = ""
     @State private var codexModel: String = ""
     @State private var effort: String = "medium"
     @State private var prompt: String = "Say hello from the coven-code engine."
+
+    init(client: EngineClient) {
+        _client = ObservedObject(wrappedValue: client)
+    }
 
     private var model: String {
         provider == .anthropic ? anthropicModel : codexModel
@@ -35,6 +39,7 @@ struct SpikeView: View {
         NavigationStack {
             Form {
                 providerSection
+                authenticationCleanupSection
                 promptSection
 
                 if let error = client.errorMessage {
@@ -164,6 +169,30 @@ struct SpikeView: View {
         }
     }
 
+    @ViewBuilder private var authenticationCleanupSection: some View {
+        if client.authenticationCleanupRequired {
+            Section("Sign-out cleanup") {
+                Text(
+                    client.authenticationCleanupError
+                        ?? "Stored Codex credentials still need to be removed."
+                )
+                .foregroundStyle(.red)
+                .accessibilityLabel(
+                    """
+                    Authentication cleanup required. \
+                    \(client.authenticationCleanupError ?? "")
+                    """
+                )
+                Button("Finish sign out") {
+                    client.retryAuthenticationCleanup()
+                }
+                .accessibilityHint(
+                    "Retries removal of persisted Codex credentials."
+                )
+            }
+        }
+    }
+
     private var promptSection: some View {
         Section("Prompt") {
             TextField("Prompt", text: $prompt, axis: .vertical)
@@ -185,5 +214,5 @@ struct SpikeView: View {
 }
 
 #Preview {
-    SpikeView()
+    SpikeView(client: EngineClient())
 }

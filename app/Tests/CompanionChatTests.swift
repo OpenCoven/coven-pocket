@@ -80,6 +80,7 @@ final class CompanionChatTests: XCTestCase {
         client.resumeGate()
         await send.value
 
+        XCTAssertEqual(model.availability, .idle)
         XCTAssertTrue(client.launchedPrompts.isEmpty)
         XCTAssertTrue(model.items.isEmpty)
         XCTAssertFalse(model.isBusy)
@@ -236,7 +237,7 @@ final class CompanionChatHardeningStreamTests: XCTestCase {
         await model.retry()
 
         XCTAssertEqual(client.launchedPrompts, ["first", "second"])
-        XCTAssertEqual(client.sentInputs, [])
+        XCTAssertEqual(client.sentInputs, ["second"])
     }
 
     func testDaemonStreamExitSurfacesStderrAndAllowsFreshLaunch() async throws {

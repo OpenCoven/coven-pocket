@@ -75,7 +75,7 @@ final class CompanionChatStreamTests: XCTestCase {
         await model.retry()
 
         XCTAssertEqual(client.launchedPrompts, ["first", "second"])
-        XCTAssertEqual(client.sentInputs, [])
+        XCTAssertEqual(client.sentInputs, ["second"])
     }
 
     func testDaemonStreamExitSurfacesStderrAndAllowsFreshLaunch() async throws {

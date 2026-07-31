@@ -1,179 +1,462 @@
+// swiftlint:disable file_length
+
 import Foundation
 
 extension CompanionChatModel {
+    // swiftlint:disable:next function_body_length
     func performSend(
-        prompt: String,
-        projectRoot: String,
-        pairing verified: DaemonPairing,
-        generation: UInt64
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
+        generation: UInt64,
+        promptRetryFence: CompanionPromptRetryLaunchFence?
     ) async throws {
-        guard try await replaceSessionIfNeeded(
-            projectRoot: projectRoot,
+        guard !(await finishInvalidatedSendIfNeeded(
+            context: context,
+            generation: generation,
+            pairing: verified,
+            launchedSession: nil,
+            activeSession: nil,
+            verification: verification
+        )) else { return }
+        guard await replaceSessionIfNeeded(
+            context: context,
             pairing: verified,
             generation: generation
-        ) else { return }
-        guard generation == operationGeneration else { return }
+        ) else {
+            if Task.isCancelled {
+                finishCancelledSend(generation: generation)
+            }
+            return
+        }
+        guard !(await finishInvalidatedSendIfNeeded(
+            context: context,
+            generation: generation,
+            pairing: verified,
+            launchedSession: nil,
+            activeSession: session,
+            verification: verification
+        )) else { return }
 
-        if let session {
-            try await client.sendInput(
+        let reusedSession = try await sendInputIfSessionActive(
+            context: context,
+            pairing: verified,
+            generation: generation
+        )
+        if reusedSession, session == nil {
+            return
+        }
+        var finalizedContext = context
+        var launchedSession: RemoteSession?
+        if !reusedSession {
+            guard let preparedLaunch = try await prepareAndLaunch(
+                context: context,
                 pairing: verified,
-                sessionID: session.id,
-                data: prompt
+                verification: verification,
+                generation: generation,
+                promptRetryFence: promptRetryFence
+            ) else { return }
+            launchedSession = preparedLaunch.session
+            finalizedContext = preparedLaunch.context
+        }
+        await finalizeSendIfCurrent(
+            context: finalizedContext,
+            pairing: verified,
+            launchedSession: launchedSession,
+            verification: verification,
+            generation: generation
+        )
+    }
+
+    func finalizeSendIfCurrent(
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        launchedSession: RemoteSession?,
+        verification: CompanionOperationVerification,
+        generation: UInt64
+    ) async {
+        let finalVerification = launchedSession == nil
+            ? CompanionOperationVerification(
+                mode: .trafficEpoch,
+                expectedTrafficEpoch: verified.trafficEpoch
             )
-        } else {
-            try await prepareAndLaunch(
-                prompt: prompt,
-                projectRoot: projectRoot,
+            : verification
+        guard !(await finishInvalidatedSendIfNeeded(
+            context: context,
+            generation: generation,
+            pairing: verified,
+            launchedSession: launchedSession,
+            activeSession: nil,
+            verification: finalVerification
+        )) else { return }
+        if let launchedSession,
+           session?.id != launchedSession.id
+            || sessionVerifiedPairing != verified {
+            await discardAdoptedLaunch(
+                launchedSession,
                 pairing: verified,
                 generation: generation
             )
+            return
         }
-        guard generation == operationGeneration else { return }
-        pairing = verified
-        startPolling()
+        await finalizeSend(
+            verified,
+            generation: generation,
+            launchedSession: launchedSession
+        )
+    }
+
+    func sendInputIfSessionActive(
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        generation: UInt64
+    ) async throws -> Bool {
+        guard let activeSession = session else { return false }
+        pairing = verified.pairing
+        sessionVerifiedPairing = verified
+        do {
+            try await client.sendInput(
+                pairing: verified.pairing,
+                sessionID: activeSession.id,
+                data: context.prompt
+            )
+        } catch {
+            if await finishInvalidatedSendIfNeeded(
+                context: context,
+                generation: generation,
+                pairing: verified,
+                launchedSession: nil,
+                activeSession: activeSession,
+                verification: CompanionOperationVerification(
+                    mode: .trafficEpoch,
+                    expectedTrafficEpoch: verified.trafficEpoch
+                )
+            ) {
+                return true
+            }
+            handleSessionTrafficFailure(
+                error,
+                context: context,
+                pairing: verified,
+                generation: generation
+            )
+            return true
+        }
+        let invalidated = await finishInvalidatedSendIfNeeded(
+            context: context,
+            generation: generation,
+            pairing: verified,
+            launchedSession: nil,
+            activeSession: activeSession,
+            verification: CompanionOperationVerification(
+                mode: .trafficEpoch,
+                expectedTrafficEpoch: verified.trafficEpoch
+            )
+        )
+        if !invalidated {
+            canRetry = false
+            retryPrompt = nil
+            retryFamiliarID = nil
+            retryFamiliarPresentation = .empty
+            retryTargetProfile = nil
+        }
+        return true
     }
 
     func replaceSessionIfNeeded(
-        projectRoot: String,
-        pairing: DaemonPairing,
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
         generation: UInt64
-    ) async throws -> Bool {
+    ) async -> Bool {
         guard let activeSession = session else { return true }
         guard let sessionPairing = self.pairing else {
             abandonSession()
             return true
         }
-        guard Self.isSameDaemonEndpoint(sessionPairing, pairing) else {
-            abandonSession()
-            await beginCleanup(
-                of: activeSession,
+        guard Self.isSameDaemonEndpoint(
+            sessionPairing,
+            verified.pairing
+        ) else {
+            return await replaceSessionFromDifferentEndpoint(
+                activeSession,
                 pairing: sessionPairing,
-                completionText: nil
+                context: context,
+                verifiedPairing: verified,
+                generation: generation
             )
-            return false
         }
-        guard Self.isSameDaemonInstance(sessionPairing, pairing) else {
+        guard Self.isSameDaemonInstance(
+            sessionPairing,
+            verified.pairing
+        ) else {
             abandonSession()
             return true
         }
-        guard sessionProjectRoot != projectRoot else { return true }
-        do {
-            try await client.kill(pairing: pairing, sessionID: activeSession.id)
-        } catch {
-            guard Self.isSessionNotLive(error) else { throw error }
-        }
-        guard generation == operationGeneration else { return false }
-        abandonSession()
-        return true
-    }
-
-    func prepareSessionForPollingRetry(
-        pairing verified: DaemonPairing
-    ) async -> Bool {
-        guard let activeSession = session,
-              let sessionPairing = pairing else {
-            isBusy = false
-            canRetry = false
-            retriesPolling = false
-            return false
-        }
-        guard Self.isSameDaemonEndpoint(sessionPairing, verified) else {
-            abandonSession()
-            await beginCleanup(
-                of: activeSession,
-                pairing: sessionPairing,
-                completionText: nil
-            )
-            return false
-        }
-        guard Self.isSameDaemonInstance(sessionPairing, verified) else {
-            abandonSession()
-            isBusy = false
-            canRetry = false
-            retriesPolling = false
-            items.append(
-                ChatItem(
-                    kind: .error,
-                    text: "The companion daemon restarted. Send the prompt again."
-                )
-            )
-            return false
-        }
-        return true
-    }
-
-    func retryPolling() async {
-        operationGeneration &+= 1
-        pollTask?.cancel()
-        pollTask = nil
-        let generation = operationGeneration
-        isBusy = true
-        guard let verified = await verifiedPairing(
-            reportFailure: true,
+        guard sessionProjectRoot != context.projectRoot
+                || sessionFamiliarID != context.familiarID else { return true }
+        return await replaceSessionForChangedContext(
+            activeSession,
+            pairing: sessionPairing,
+            context: context,
+            verifiedPairing: verified,
             generation: generation
-        ) else {
-            guard generation == operationGeneration else { return }
-            isBusy = false
-            canRetry = true
-            return
-        }
+        )
+    }
+
+    func replaceSessionFromDifferentEndpoint(
+        _ activeSession: RemoteSession,
+        pairing sessionPairing: DaemonPairing,
+        context: CompanionSendContext,
+        verifiedPairing: VerifiedPairing,
+        generation: UInt64
+    ) async -> Bool {
+        guard canPerformVerifiedOperation(
+            pairing: verifiedPairing,
+            generation: generation
+        ) else { return false }
+        abandonSession()
+        await beginCleanup(
+            of: activeSession,
+            pairing: sessionPairing,
+            completionText: nil
+        )
         guard generation == operationGeneration,
-              await prepareSessionForPollingRetry(pairing: verified),
-              generation == operationGeneration else { return }
-        pairing = verified
-        retriesPolling = false
-        canRetry = false
-        await refreshOnce()
-        guard generation == operationGeneration else { return }
-        if session != nil, !retriesPolling {
-            startPolling()
+              !Task.isCancelled else { return false }
+        setRetryContext(context)
+        isBusy = false
+        return false
+    }
+
+    func replaceSessionForChangedContext(
+        _ activeSession: RemoteSession,
+        pairing sessionPairing: DaemonPairing,
+        context: CompanionSendContext,
+        verifiedPairing: VerifiedPairing,
+        generation: UInt64
+    ) async -> Bool {
+        guard canPerformVerifiedOperation(
+            pairing: verifiedPairing,
+            generation: generation
+        ) else { return false }
+        abandonSession()
+        let cleaned = await beginCleanup(
+            of: activeSession,
+            pairing: sessionPairing,
+            completionText: nil,
+            verifiedPairing: verifiedPairing,
+            trafficEpoch: verifiedPairing.trafficEpoch
+        )
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            if generation == operationGeneration, !Task.isCancelled {
+                setRetryContext(context)
+                isBusy = false
+            }
+            return false
+        }
+        guard cleaned else {
+            setRetryContext(context)
+            return false
+        }
+        retryPrompt = nil
+        retryFamiliarID = nil
+        retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
+        isBusy = false
+        await send(
+            prompt: context.prompt,
+            projectRoot: context.projectRoot,
+            familiarID: context.familiarID,
+            familiar: context.familiarPresentation.familiar,
+            familiarProfile: context.familiarPresentation.profile,
+            targetProfile: context.targetProfile,
+            verificationMode: .trafficEpoch,
+            expectedTrafficEpoch: verifiedPairing.trafficEpoch
+        )
+        return false
+    }
+
+    // swiftlint:disable:next function_body_length
+    func prepareAndLaunch(
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
+        generation: UInt64,
+        promptRetryFence: CompanionPromptRetryLaunchFence?
+    ) async throws -> CompanionPreparedLaunch? {
+        guard !(await finishInvalidatedSendIfNeeded(
+            context: context,
+            generation: generation,
+            pairing: verified,
+            launchedSession: nil,
+            activeSession: nil,
+            verification: verification
+        )) else { return nil }
+        let launchContext: CompanionSendContext
+        if let promptRetryFence {
+            guard let refreshedContext = promptRetryLaunchContext(
+                promptRetryFence,
+                pairing: verified.pairing
+            ) else {
+                rejectPromptRetry(
+                    context: promptRetryFence.originalContext,
+                    generation: generation
+                )
+                return nil
+            }
+            launchContext = refreshedContext
+        } else {
+            launchContext = context
+        }
+        do {
+            prepareForNewSession()
+            let launched: RemoteSession
+            do {
+                launched = try await requestLaunch(
+                    context: launchContext,
+                    pairing: verified
+                )
+            } catch {
+                guard !handleSupersededLaunchFailure(
+                    context: launchContext,
+                    pairing: verified,
+                    verification: verification,
+                    generation: generation
+                ) else { return nil }
+                throw error
+            }
+            if await discardReturnedLaunchIfNeeded(
+                launched,
+                pairing: verified,
+                context: launchContext,
+                verification: verification,
+                generation: generation
+            ) {
+                return nil
+            }
+            guard try await confirmLaunchedFamiliar(
+                launched,
+                context: launchContext,
+                pairing: verified,
+                verification: verification,
+                generation: generation
+            ) else { return nil }
+            guard !(await finishInvalidatedSendIfNeeded(
+                context: launchContext,
+                generation: generation,
+                pairing: verified,
+                launchedSession: launched,
+                activeSession: nil,
+                verification: verification
+            )) else { return nil }
+            adoptLaunchedSession(
+                launched,
+                context: launchContext,
+                pairing: verified
+            )
+            return CompanionPreparedLaunch(
+                session: launched,
+                context: launchContext
+            )
+        } catch {
+            throw CompanionContextualSendError(
+                underlying: error,
+                context: launchContext
+            )
         }
     }
 
-    func prepareAndLaunch(
-        prompt: String,
-        projectRoot: String,
-        pairing: DaemonPairing,
-        generation: UInt64
-    ) async throws {
-        prepareForNewSession()
+    func requestLaunch(
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing
+    ) async throws -> RemoteSession {
         launchInFlight = true
-        do {
-            let launched = try await client.launch(
-                pairing: pairing,
-                projectRoot: projectRoot,
-                prompt: prompt,
-                title: Self.title(from: prompt)
+        defer { launchInFlight = false }
+        return try await client.launch(
+            pairing: verified.pairing,
+            projectRoot: context.projectRoot,
+            prompt: context.prompt,
+            title: Self.title(from: context.prompt),
+            familiarID: context.familiarID
+        )
+    }
+
+    func handleSupersededLaunchFailure(
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
+        generation: UInt64
+    ) -> Bool {
+        guard generation == operationGeneration,
+              !Task.isCancelled,
+              !verification.isCurrent(verified, on: self) else { return false }
+        settleSupersededSend(
+            context: context,
+            generation: generation
+        )
+        return true
+    }
+
+    func adoptLaunchedSession(
+        _ launched: RemoteSession,
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing
+    ) {
+        trafficAuthority = .ready(verified.pairing)
+        trafficEpoch = verified.trafficEpoch
+        session = launched
+        pairing = verified.pairing
+        sessionVerifiedPairing = verified
+        sessionProjectRoot = context.projectRoot
+        pinSessionFamiliar(
+            id: context.familiarID,
+            presentation: context.familiarPresentation,
+            pairing: verified.pairing
+        )
+        initialPrompt = context.prompt
+        initialPromptID = "companion-initial-\(launched.id)"
+        items = [
+            ChatItem(
+                id: initialPromptID ?? "companion-initial",
+                kind: .user,
+                text: context.prompt
             )
-            launchInFlight = false
-            guard generation == operationGeneration else {
-                await beginCleanup(
-                    of: launched,
-                    pairing: pairing,
-                    completionText: nil
-                )
-                return
-            }
-            session = launched
-            sessionProjectRoot = projectRoot
-            initialPrompt = prompt
-            initialPromptID = "companion-initial-\(launched.id)"
-            items = [
-                ChatItem(
-                    id: initialPromptID ?? "companion-initial",
-                    kind: .user,
-                    text: prompt
-                )
-            ]
-        } catch {
-            launchInFlight = false
-            throw error
+        ]
+    }
+
+    func confirmLaunchedFamiliar(
+        _ launched: RemoteSession,
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
+        generation: UInt64
+    ) async throws -> Bool {
+        guard launched.familiarId != context.familiarID else { return true }
+        await cleanupReturnedLaunch(
+            of: launched,
+            pairing: verified,
+            revalidatePairing: false
+        )
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return false
         }
+        guard verification.isCurrent(verified, on: self) else {
+            settleSupersededSend(
+                context: context,
+                generation: generation
+            )
+            return false
+        }
+        throw FamiliarConfirmationError()
     }
 
     func handleSendFailure(
         _ error: Error,
-        prompt: String,
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
+        verification: CompanionOperationVerification,
         generation: UInt64
     ) {
         guard generation == operationGeneration else {
@@ -182,82 +465,72 @@ extension CompanionChatModel {
             }
             return
         }
+        guard !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
+        guard verification.isCurrent(verified, on: self) else {
+            settleSupersededSend(
+                context: context,
+                generation: generation
+            )
+            return
+        }
         isBusy = false
         if Self.isSessionNotLive(error) {
             abandonSession()
         }
-        fail(error.localizedDescription, retryPrompt: prompt)
+        items.append(ChatItem(kind: .error, text: error.localizedDescription))
+        setRetryContext(context)
     }
 
-    static func availability(
-        from gate: CompanionModel.SessionGate
-    ) -> Availability {
-        switch gate {
-        case let .ready(pairing):
-            return .ready(pairing)
-        case .notPaired:
-            return .blocked(
-                reason: "Not paired",
-                hint: "Pair with a daemon in the Companion tab first."
-            )
-        case let .blocked(reason, hint):
-            return .blocked(reason: reason, hint: hint)
-        }
-    }
-
-    func verifiedPairing(
-        reportFailure: Bool,
+    func handleSessionTrafficFailure(
+        _ error: Error,
+        context: CompanionSendContext,
+        pairing verified: VerifiedPairing,
         generation: UInt64
-    ) async -> DaemonPairing? {
-        let availabilityRequest = beginAvailabilityCheck()
-        let gate = await client.sessionGate()
-        guard generation == operationGeneration,
-              availabilityRequest == availabilityGeneration else { return nil }
-        availability = Self.availability(from: gate)
-        switch gate {
-        case let .ready(pairing):
-            return pairing
-        case .notPaired:
-            if reportFailure {
-                fail(
-                    "Not paired. Pair with a daemon in the Companion tab first.",
-                    retryPrompt: nil
-                )
+    ) {
+        guard generation == operationGeneration else {
+            if pendingCleanup == nil {
+                isBusy = false
             }
-        case let .blocked(reason, hint):
-            if reportFailure {
-                fail("\(reason). \(hint)", retryPrompt: nil)
-            }
+            return
         }
-        return nil
-    }
-
-    func startPolling() {
-        guard pollTask == nil else { return }
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refreshOnce()
-                try? await Task.sleep(for: Self.pollInterval)
-            }
+        guard !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
+        guard isSessionTrafficCurrent(verified) else {
+            settleSupersededSend(
+                context: context,
+                generation: generation
+            )
+            return
+        }
+        isBusy = false
+        let sessionEnded = Self.isSessionNotLive(error)
+        if sessionEnded {
+            pollTask?.cancel()
+            pollTask = nil
+            sessionVerifiedPairing = nil
+            abandonSession()
+            pairing = nil
+        }
+        items.append(ChatItem(kind: .error, text: error.localizedDescription))
+        setRetryContext(context)
+        if sessionEnded {
+            pollTask?.cancel()
+            pollTask = nil
+        } else {
+            pollTask = nil
+            startPolling(using: verified)
         }
     }
 
-    func prepareForNewSession() {
-        pollTask?.cancel()
-        pollTask = nil
-        accumulatedEvents = []
-        cursor = 0
-        lastCompletedResultSeq = 0
-        initialPrompt = nil
-        initialPromptID = nil
-        retriesPolling = false
-        items = []
-    }
+}
 
-    func abandonSession() {
-        pollTask?.cancel()
-        pollTask = nil
-        session = nil
-        sessionProjectRoot = nil
+private struct FamiliarConfirmationError: LocalizedError {
+    var errorDescription: String? {
+        "The companion daemon did not confirm the selected familiar."
     }
 }

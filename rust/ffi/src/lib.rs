@@ -32,7 +32,7 @@ pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
 pub use memory::{MemoryNote, ProjectContext};
-pub use remote::{RemoteEvent, RemoteEventBatch, RemoteSession};
+pub use remote::{FamiliarIdentity, RemoteEvent, RemoteEventBatch, RemoteFamiliar, RemoteSession};
 pub use sessions::ChatSessionSummary;
 pub use share::{RedactionFinding, RedactionResult};
 
@@ -241,7 +241,7 @@ impl PocketEngine {
     /// persists on device and shows up in [`Self::list_chat_sessions`];
     /// `None` keeps the session in memory only.
     #[allow(clippy::too_many_arguments)]
-    pub fn start_chat(
+    pub async fn start_chat(
         &self,
         provider: PocketProvider,
         api_key: String,
@@ -250,6 +250,7 @@ impl PocketEngine {
         workspace_dir: String,
         permission_mode: ChatPermissionMode,
         storage_dir: Option<String>,
+        familiar: Option<FamiliarIdentity>,
         inject_context: bool,
     ) -> Result<Arc<ChatSession>, PocketError> {
         chat::start_session(
@@ -260,8 +261,10 @@ impl PocketEngine {
             workspace_dir,
             permission_mode,
             storage_dir,
+            familiar,
             inject_context,
         )
+        .await
     }
 
     /// Resume a stored session at its head: the full transcript is restored
@@ -300,7 +303,7 @@ impl PocketEngine {
         &self,
         storage_dir: String,
     ) -> Result<Vec<ChatSessionSummary>, PocketError> {
-        sessions::list_sessions(&storage_dir)
+        sessions::list_sessions(&storage_dir).await
     }
 
     /// Delete a stored session and its transcript.
@@ -309,7 +312,7 @@ impl PocketEngine {
         storage_dir: String,
         session_id: String,
     ) -> Result<(), PocketError> {
-        sessions::delete_session(&storage_dir, &session_id)
+        sessions::delete_session(&storage_dir, &session_id).await
     }
 
     /// Copy a stored session at its head under a new id, returning that id.
@@ -459,6 +462,7 @@ impl PocketEngine {
         project_root: String,
         prompt: String,
         title: String,
+        familiar_id: Option<String>,
         timeout_ms: u32,
     ) -> Result<RemoteSession, PocketError> {
         remote::launch(
@@ -467,9 +471,20 @@ impl PocketEngine {
             &project_root,
             &prompt,
             &title,
+            familiar_id.as_deref(),
             millis(timeout_ms),
         )
         .await
+    }
+
+    /// List familiars on the paired daemon.
+    pub async fn remote_familiars(
+        &self,
+        host: String,
+        port: u16,
+        timeout_ms: u32,
+    ) -> Result<Vec<RemoteFamiliar>, PocketError> {
+        remote::familiars(&host, port, millis(timeout_ms)).await
     }
 
     /// List sessions on the paired daemon. Callers gate on a verified

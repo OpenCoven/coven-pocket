@@ -60,7 +60,8 @@ full-capability remote sessions.
 ## M3 — Extended scope
 
 - [x] Memory: AGENTS.md injection, memdir browser
-- [ ] Familiar companion (7 archetypes)
+- [x] Familiar companion: daemon-owned roster selection, profile-scoped
+      persistence, and identity pinned to each session
 - [ ] On-device `/goal` with Live Activity progress
 - [ ] Remote MCP servers (streamable HTTP/SSE + OAuth)
 - [x] Session sharing via unlisted Gists
