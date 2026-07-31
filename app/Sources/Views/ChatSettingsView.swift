@@ -129,6 +129,7 @@ struct ChatSettingsView: View {
             backend: settings.backend,
             codexProfileID: client.codexAccount?.profileId,
             companionAvailability: companionModel.availability,
+            companionPairing: companionModel.configuredPairing,
             previous: familiarModel.activeProfile
         )
     }

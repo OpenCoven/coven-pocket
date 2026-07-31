@@ -110,20 +110,24 @@ enum ChatFamiliarProfile {
         backend: ChatBackend,
         codexProfileID: String?,
         companionAvailability: CompanionChatModel.Availability,
+        companionPairing: DaemonPairing?,
         previous: FamiliarProfileKey?
     ) -> FamiliarProfileKey? {
         switch backend {
         case .codex:
             return codexProfileID.map(FamiliarProfileKey.codex(profileID:))
         case .companionClaude:
+            guard let companionPairing else { return nil }
             switch companionAvailability {
             case let .ready(pairing):
                 return .companion(pairing: pairing)
             case .checking:
-                guard case .companion = previous else { return nil }
-                return previous
+                if case .companion = previous {
+                    return previous?.normalized
+                }
+                return .companion(pairing: companionPairing)
             case .idle, .blocked:
-                return nil
+                return .companion(pairing: companionPairing)
             }
         }
     }
@@ -139,7 +143,7 @@ enum ChatFamiliarProfile {
         if profileChanged {
             model.activate(profile)
         }
-        if preserveCurrent {
+        if preserveCurrent, !profileChanged {
             return currentFamiliarID
         }
         return model.selectedFamiliar?.id

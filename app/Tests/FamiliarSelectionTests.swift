@@ -140,6 +140,7 @@ final class FamiliarSelectionTests: XCTestCase {
                 backend: .codex,
                 codexProfileID: "profile-a",
                 companionAvailability: .checking,
+                companionPairing: pairing,
                 previous: nil
             ),
             .codex(profileID: "profile-a")
@@ -149,12 +150,13 @@ final class FamiliarSelectionTests: XCTestCase {
                 backend: .codex,
                 codexProfileID: nil,
                 companionAvailability: .ready(pairing),
+                companionPairing: pairing,
                 previous: nil
             )
         )
     }
 
-    func testCompanionProfileDerivationPreservesCheckingAndSwitchesEndpoint() {
+    func testCompanionProfileDerivationUsesReadyAndCheckingEndpoint() {
         let firstPairing = daemonPairing(host: "Mac.Local", port: 7001)
         let secondPairing = daemonPairing(host: "other.local", port: 7002)
         let companion = FamiliarProfileKey.companion(pairing: firstPairing)
@@ -164,6 +166,7 @@ final class FamiliarSelectionTests: XCTestCase {
                 backend: .companionClaude,
                 codexProfileID: nil,
                 companionAvailability: .ready(firstPairing),
+                companionPairing: firstPairing,
                 previous: nil
             ),
             companion
@@ -173,19 +176,38 @@ final class FamiliarSelectionTests: XCTestCase {
                 backend: .companionClaude,
                 codexProfileID: nil,
                 companionAvailability: .checking,
+                companionPairing: firstPairing,
                 previous: companion
             ),
             companion
         )
-        XCTAssertNil(
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .ready(secondPairing),
+                companionPairing: secondPairing,
+                previous: companion
+            ),
+            .companion(host: "other.local", port: 7002)
+        )
+    }
+
+    func testCompanionProfileDerivationPreservesOfflineEndpoint() {
+        let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+        let companion = FamiliarProfileKey.companion(pairing: pairing)
+
+        XCTAssertEqual(
             ChatFamiliarProfile.active(
                 backend: .companionClaude,
                 codexProfileID: nil,
                 companionAvailability: .idle,
+                companionPairing: pairing,
                 previous: companion
-            )
+            ),
+            companion
         )
-        XCTAssertNil(
+        XCTAssertEqual(
             ChatFamiliarProfile.active(
                 backend: .companionClaude,
                 codexProfileID: nil,
@@ -193,17 +215,273 @@ final class FamiliarSelectionTests: XCTestCase {
                     reason: "Unavailable",
                     hint: "Retry."
                 ),
+                companionPairing: pairing,
                 previous: companion
+            ),
+            companion
+        )
+    }
+
+    func testBlockedStoredPairingRetainsCachedSelectionAndFailure() async throws {
+        try await withDefaultsAsync { defaults in
+            let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+            let profile = FamiliarProfileKey.companion(pairing: pairing)
+            let client = FakeFamiliarRosterClient(gate: .ready(pairing))
+            client.familiarResult = .success([
+                remoteFamiliar(id: "raven", name: "The Raven")
+            ])
+            let model = makeModel(defaults: defaults, client: client)
+            model.activate(profile)
+            await model.refresh()
+            model.select(id: "raven", for: profile)
+
+            let failure = CompanionChatModel.Availability.blocked(
+                reason: "Daemon unavailable",
+                hint: "Reconnect the tunnel."
             )
+            client.gateResult = .blocked(
+                reason: "Daemon unavailable",
+                hint: "Reconnect the tunnel."
+            )
+            await model.refresh()
+            let active = ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: failure,
+                companionPairing: pairing,
+                previous: model.activeProfile
+            )
+            let setting = ChatFamiliarProfile.synchronize(
+                active,
+                model: model,
+                currentFamiliarID: "raven"
+            )
+
+            XCTAssertEqual(active, profile)
+            XCTAssertEqual(setting, "raven")
+            XCTAssertEqual(model.activeProfile, profile)
+            XCTAssertEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(model.roster.map(\.id), ["raven"])
+            XCTAssertEqual(
+                model.state,
+                .failed(
+                    reason: "Daemon unavailable Reconnect the tunnel."
+                )
+            )
+            XCTAssertEqual(client.requestedPairings, [pairing])
+        }
+    }
+
+    func testIdleStoredPairingRestoresCachedSelectionAtStartup() throws {
+        try withDefaults { defaults in
+            let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+            let profile = FamiliarProfileKey.companion(pairing: pairing)
+            let familiar = familiarIdentity(id: "raven", name: "The Raven")
+            let store = FamiliarSelectionStore(defaults: defaults)
+            try store.save(familiar, for: profile)
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+
+            let active = ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .idle,
+                companionPairing: pairing,
+                previous: nil
+            )
+            let setting = ChatFamiliarProfile.synchronize(
+                active,
+                model: model
+            )
+
+            XCTAssertEqual(active, profile)
+            XCTAssertEqual(setting, "raven")
+            XCTAssertEqual(model.activeProfile, profile)
+            XCTAssertEqual(model.selectedFamiliar, familiar)
+        }
+    }
+
+    func testMissingStoredPairingClearsCompanionSelection() throws {
+        try withDefaults { defaults in
+            let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+            let profile = FamiliarProfileKey.companion(pairing: pairing)
+            let store = FamiliarSelectionStore(defaults: defaults)
+            try store.save(
+                familiarIdentity(id: "raven", name: "The Raven"),
+                for: profile
+            )
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+            model.activate(profile)
+
+            let active = ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .idle,
+                companionPairing: nil,
+                previous: profile
+            )
+            let setting = ChatFamiliarProfile.synchronize(
+                active,
+                model: model,
+                currentFamiliarID: "raven"
+            )
+
+            XCTAssertNil(active)
+            XCTAssertNil(setting)
+            XCTAssertNil(model.activeProfile)
+            XCTAssertNil(model.selectedFamiliar)
+            XCTAssertEqual(try store.load(for: profile)?.id, "raven")
+        }
+    }
+
+    func testBlockedStoredEndpointChangeRestoresOnlyNewEndpointSelection() throws {
+        try withDefaults { defaults in
+            let pairingA = daemonPairing(host: "a.local", port: 7001)
+            let pairingB = daemonPairing(host: "b.local", port: 7002)
+            let profileA = FamiliarProfileKey.companion(pairing: pairingA)
+            let profileB = FamiliarProfileKey.companion(pairing: pairingB)
+            let store = FamiliarSelectionStore(defaults: defaults)
+            try store.save(
+                familiarIdentity(id: "raven", name: "The Raven"),
+                for: profileA
+            )
+            try store.save(
+                familiarIdentity(id: "owl", name: "The Owl"),
+                for: profileB
+            )
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired),
+                store: store
+            )
+            model.activate(profileA)
+
+            let active = ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .blocked(
+                    reason: "Daemon unavailable",
+                    hint: "Retry."
+                ),
+                companionPairing: pairingB,
+                previous: profileA
+            )
+            let setting = ChatFamiliarProfile.synchronize(
+                active,
+                model: model,
+                currentFamiliarID: "raven"
+            )
+
+            XCTAssertEqual(active, profileB)
+            XCTAssertEqual(setting, "owl")
+            XCTAssertEqual(model.activeProfile, profileB)
+            XCTAssertEqual(model.selectedFamiliar?.id, "owl")
+            XCTAssertNotEqual(model.selectedFamiliar?.id, "raven")
+            XCTAssertEqual(try store.load(for: profileA)?.id, "raven")
+            XCTAssertEqual(try store.load(for: profileB)?.id, "owl")
+        }
+    }
+
+    func testCheckingPreservesPreviousCompanionProfile() {
+        let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+        let profile = FamiliarProfileKey.companion(pairing: pairing)
+
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .checking,
+                companionPairing: pairing,
+                previous: profile
+            ),
+            profile
         )
         XCTAssertEqual(
             ChatFamiliarProfile.active(
                 backend: .companionClaude,
                 codexProfileID: nil,
-                companionAvailability: .ready(secondPairing),
-                previous: companion
+                companionAvailability: .checking,
+                companionPairing: pairing,
+                previous: .codex(profileID: "profile-a")
             ),
-            .companion(host: "other.local", port: 7002)
+            profile
+        )
+    }
+
+    func testBackendFallbackKeepsCompanionAndCodexSelectionsIsolated() throws {
+        try withDefaults { defaults in
+            let pairing = daemonPairing(host: "Mac.Local", port: 7001)
+            let companion = FamiliarProfileKey.companion(pairing: pairing)
+            let codex = FamiliarProfileKey.codex(profileID: "profile-a")
+            let store = FamiliarSelectionStore(defaults: defaults)
+            try store.save(familiarIdentity(id: "raven", name: "The Raven"), for: companion)
+            try store.save(familiarIdentity(id: "forge", name: "The Forge"), for: codex)
+            let model = FamiliarSelectionModel(
+                client: FakeFamiliarRosterClient(gate: .notPaired), store: store
+            )
+            model.activate(companion)
+            var setting: String? = "raven"
+
+            setting = ChatFamiliarProfile.synchronize(
+                ChatFamiliarProfile.active(
+                    backend: .codex,
+                    codexProfileID: "profile-a",
+                    companionAvailability: .blocked(
+                        reason: "Daemon unavailable",
+                        hint: "Retry."
+                    ),
+                    companionPairing: pairing,
+                    previous: model.activeProfile
+                ),
+                model: model,
+                currentFamiliarID: setting
+            )
+            XCTAssertEqual(setting, "forge")
+            XCTAssertEqual(model.activeProfile, codex)
+
+            setting = ChatFamiliarProfile.synchronize(
+                ChatFamiliarProfile.active(
+                    backend: .companionClaude,
+                    codexProfileID: "profile-a",
+                    companionAvailability: .blocked(
+                        reason: "Daemon unavailable",
+                        hint: "Retry."
+                    ),
+                    companionPairing: pairing,
+                    previous: model.activeProfile
+                ),
+                model: model,
+                currentFamiliarID: setting
+            )
+
+            XCTAssertEqual(setting, "raven")
+            XCTAssertEqual(model.activeProfile, companion)
+            XCTAssertEqual(try store.load(for: companion)?.id, "raven")
+            XCTAssertEqual(try store.load(for: codex)?.id, "forge")
+        }
+    }
+
+    func testStoredCompanionEndpointNormalizesHostAndKeepsPort() {
+        let pairing = daemonPairing(
+            host: " MAC.Local ",
+            port: 7443,
+            pid: 99,
+            startedAt: "new-instance"
+        )
+
+        XCTAssertEqual(
+            ChatFamiliarProfile.active(
+                backend: .companionClaude,
+                codexProfileID: nil,
+                companionAvailability: .idle,
+                companionPairing: pairing,
+                previous: nil
+            ),
+            .companion(host: "mac.local", port: 7443)
         )
     }
 
@@ -323,7 +601,7 @@ final class FamiliarSelectionTests: XCTestCase {
         }
     }
 
-    func testSameProfileSyncPreservesPinnedLiveSessionSetting() throws {
+    func testProfileSyncPreservesCurrentOnlyForSameNormalizedProfile() throws {
         try withDefaults { defaults in
             let profile = FamiliarProfileKey.codex(profileID: "profile-a")
             let store = FamiliarSelectionStore(defaults: defaults)
@@ -359,9 +637,10 @@ final class FamiliarSelectionTests: XCTestCase {
                     currentFamiliarID: "sage",
                     preserveCurrent: true
                 ),
-                "sage"
+                "owl"
             )
             XCTAssertEqual(model.activeProfile, other)
+            XCTAssertEqual(model.selectedFamiliar?.id, "owl")
         }
     }
 

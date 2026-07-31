@@ -129,6 +129,14 @@ final class CompanionChatModel: ObservableObject {
         pinnedSessionFamiliar
     }
 
+    var configuredPairing: DaemonPairing? {
+        companion.pairing
+    }
+
+    var configuredFamiliarProfile: FamiliarProfileKey? {
+        configuredPairing.map(FamiliarProfileKey.companion(pairing:))
+    }
+
     var hasActiveSession: Bool {
         session != nil
     }

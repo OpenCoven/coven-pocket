@@ -15,6 +15,26 @@ private final class NoopFamiliarRosterClient: FamiliarRosterClient {
     }
 }
 
+private final class ChatSurfacePairingStore: PairingStore {
+    var stored: DaemonPairing?
+
+    init(stored: DaemonPairing?) {
+        self.stored = stored
+    }
+
+    func load() -> DaemonPairing? {
+        stored
+    }
+
+    func save(_ pairing: DaemonPairing) {
+        stored = pairing
+    }
+
+    func clear() {
+        stored = nil
+    }
+}
+
 // swiftlint:disable:next type_body_length
 final class ChatSurfaceTests: XCTestCase {
     private struct SpotlightResumePreparation {
@@ -363,6 +383,59 @@ final class ChatSurfaceTests: XCTestCase {
         XCTAssertTrue(
             ChatBackend.available(companionAvailable: false, codexAvailable: false).isEmpty
         )
+    }
+
+    @MainActor
+    func testCompanionChatModelExposesConfiguredPairingProfile() throws {
+        let suiteName = "chat-surface-pairing-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let pairing = DaemonPairing(
+            host: " Mac.Local ",
+            port: 7443,
+            apiVersion: "coven.daemon.v1",
+            covenVersion: "0.7.0",
+            pid: 42,
+            startedAt: "now",
+            pairedAt: Date()
+        )
+        let companion = CompanionModel(
+            defaults: defaults,
+            store: ChatSurfacePairingStore(stored: pairing)
+        )
+        let model = CompanionChatModel(companion: companion)
+
+        XCTAssertEqual(model.configuredPairing, pairing)
+        XCTAssertEqual(
+            model.configuredFamiliarProfile,
+            .companion(host: "mac.local", port: 7443)
+        )
+
+        companion.unpair()
+
+        XCTAssertNil(model.configuredPairing)
+        XCTAssertNil(model.configuredFamiliarProfile)
+    }
+
+    func testChatSurfacesUseConfiguredPairingForFamiliarProfile() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        for path in [
+            "Sources/Views/ChatView.swift",
+            "Sources/Views/ChatSettingsView.swift"
+        ] {
+            let source = try String(
+                contentsOf: root.appendingPathComponent(path),
+                encoding: .utf8
+            )
+            XCTAssertTrue(
+                source.contains(
+                    "companionPairing: companionModel.configuredPairing"
+                ),
+                path
+            )
+        }
     }
 
     func testCompanionChatHasNoPTYApprovalControls() throws {
