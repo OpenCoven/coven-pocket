@@ -2287,18 +2287,30 @@ fn write_session_model_record(
 ) -> Result<(), PocketError> {
     validate_session_id(session_id)?;
     let directory = storage.session_models_dir()?;
-    ensure_lifecycle_record_directory(
-        storage,
-        &directory,
-        "cannot create session models directory",
-        "cannot sync session models directory creation",
-    )?;
     let destination = storage.session_model_record(session_id)?;
     let record = SessionModelRecord {
         version: INDEX_RECORD_VERSION,
         session_id: session_id.to_string(),
         model: model.to_string(),
     };
+    validate_session_model_record(&record, &destination, session_id)?;
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|err| engine_err("cannot serialize session model record", err))?;
+    if bytes.len() as u64 > MAX_SESSION_MODEL_RECORD_BYTES {
+        return Err(PocketError::Engine {
+            message: format!(
+                "cannot write session model record: session model record exceeds the \
+                 {MAX_SESSION_MODEL_RECORD_BYTES}-byte limit (found {} bytes)",
+                bytes.len()
+            ),
+        });
+    }
+    ensure_lifecycle_record_directory(
+        storage,
+        &directory,
+        "cannot create session models directory",
+        "cannot sync session models directory creation",
+    )?;
     if let Some(existing) = read_session_model_record(storage, session_id)? {
         if existing == record {
             sync_record_file(
@@ -2313,9 +2325,6 @@ fn write_session_model_record(
             );
         }
     }
-    validate_session_model_record(&record, &destination, session_id)?;
-    let bytes = serde_json::to_vec(&record)
-        .map_err(|err| engine_err("cannot serialize session model record", err))?;
     let temporary = storage.session_model_temporary(session_id)?;
     write_json_record_atomically(
         storage,
@@ -3824,6 +3833,7 @@ struct StorageRecoveryPlan {
 
 fn preflight_pending_index_recovery(
     storage: &CheckedStorage,
+    skip_session_id: Option<&str>,
 ) -> Result<PendingIndexRecoveryPlan, PocketError> {
     let directory = storage.pending_index_dir()?;
     if !storage.validate_directory(&directory, true)? {
@@ -3860,6 +3870,9 @@ fn preflight_pending_index_recovery(
                     format!("invalid temporary pending index record name: {err}"),
                 )
             })?;
+            if skip_session_id == Some(session_id) {
+                continue;
+            }
             temporary_files.push(path);
             continue;
         }
@@ -3875,6 +3888,9 @@ fn preflight_pending_index_recovery(
                 format!("invalid pending index record name {file_name:?}: {err}"),
             )
         })?;
+        if skip_session_id == Some(session_id) {
+            continue;
+        }
         // Records above the historical read cap may be remnants of the wedge.
         // Recover them from the transcript without parsing their contents,
         // including newly valid records in the widened metadata allowance.
@@ -3991,12 +4007,12 @@ async fn preflight_legacy_zero_count_migration(
 async fn preflight_storage_recovery(
     storage: &CheckedStorage,
     lifecycle: &SessionLifecycle,
-    skip_legacy_session_id: Option<&str>,
+    skip_session_id: Option<&str>,
 ) -> Result<StorageRecoveryPlan, PocketError> {
     let lifecycle_plan = preflight_pending_lifecycle_recovery(storage, lifecycle)?;
-    let pending_index = preflight_pending_index_recovery(storage)?;
+    let pending_index = preflight_pending_index_recovery(storage, skip_session_id)?;
     let legacy_zero_count =
-        preflight_legacy_zero_count_migration(storage, lifecycle, skip_legacy_session_id).await?;
+        preflight_legacy_zero_count_migration(storage, lifecycle, skip_session_id).await?;
     Ok(StorageRecoveryPlan {
         lifecycle: lifecycle_plan,
         pending_index,
@@ -4960,6 +4976,7 @@ pub async fn delete_session(storage_dir: &str, session_id: &str) -> Result<(), P
     let storage = CheckedStorage::open(storage_dir)?;
     let mut lifecycle = SESSION_LIFECYCLE_LOCK.write().await;
     let recovery = preflight_storage_recovery(&storage, &lifecycle, Some(session_id)).await?;
+    preflight_session_artifacts(&storage, session_id)?;
     recover_pending_lifecycle_plan(&storage, &mut lifecycle, recovery.lifecycle)?;
     let target_temporary = storage.pending_index_temporary(session_id)?;
     let remaining_pending_index = PendingIndexRecoveryPlan {
@@ -6606,6 +6623,24 @@ mod tests {
         assert!(!pending_index_dir(&storage).exists());
         assert!(!pending_index_marker(&storage, &session_id).exists());
         assert!(!pending_index_temporary(&storage, &session_id).exists());
+
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn session_model_writer_rejects_oversized_serialization_before_write() {
+        let storage = test_storage("persist-session-model-writer-size-limit");
+        let checked = CheckedStorage::from_root(&storage).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let model = "x".repeat(MAX_SESSION_MODEL_RECORD_BYTES as usize);
+
+        let err = write_session_model_record(&checked, &session_id, &model).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("session model record"), "got: {message}");
+        assert!(message.contains("65536-byte limit"), "got: {message}");
+        assert!(!session_model_marker(&storage, &session_id).exists());
+        assert!(!storage.join(".session-lifecycle").exists());
 
         std::fs::remove_dir_all(storage).unwrap();
     }
@@ -8975,6 +9010,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_delete_skips_corrupt_target_metadata_but_preflights_unrelated_records() {
+        let storage = test_storage("persist-delete-corrupt-target-metadata");
+        let storage_str = storage.display().to_string();
+        let session_id = create_persisted_test_session(&storage).await;
+        let unrelated_id = create_persisted_test_session(&storage).await;
+        std::fs::create_dir_all(pending_index_dir(&storage)).unwrap();
+        std::fs::write(
+            pending_index_marker(&storage, &session_id),
+            b"{corrupt target pending index",
+        )
+        .unwrap();
+        std::fs::write(
+            session_model_marker(&storage, &session_id),
+            b"{corrupt target model",
+        )
+        .unwrap();
+        std::fs::write(
+            index_baseline_marker(&storage, &session_id),
+            b"{corrupt target baseline",
+        )
+        .unwrap();
+        let unrelated_pending = pending_index_marker(&storage, &unrelated_id);
+        std::fs::write(&unrelated_pending, b"{corrupt unrelated pending index").unwrap();
+
+        let err = delete_session(&storage_str, &session_id).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot parse pending index record"),
+            "got: {err}"
+        );
+        assert!(index_contains(&storage, &session_id));
+        assert!(transcript_file(&storage, &session_id).exists());
+        assert!(pending_index_marker(&storage, &session_id).exists());
+
+        std::fs::remove_file(unrelated_pending).unwrap();
+        delete_session(&storage_str, &session_id).await.unwrap();
+
+        assert!(!index_contains(&storage, &session_id));
+        assert!(!transcript_file(&storage, &session_id).exists());
+        assert!(!pending_index_marker(&storage, &session_id).exists());
+        assert!(!session_model_marker(&storage, &session_id).exists());
+        assert!(!index_baseline_marker(&storage, &session_id).exists());
+        assert!(index_contains(&storage, &unrelated_id));
+
+        clear_module_state_for_root(&storage).await;
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[tokio::test]
     async fn legacy_recovery_reconciles_once_then_uses_durable_baseline() {
         let storage = test_storage("persist-legacy-resume-baseline");
         let storage_str = storage.display().to_string();
@@ -10330,6 +10415,23 @@ mod tests {
         let storage = test_storage("unsafe-delete-preflight");
         let storage_str = storage.display().to_string();
         let session_id = create_persisted_test_session(&storage).await;
+        let unrelated_id = uuid::Uuid::new_v4().to_string();
+        let unrelated = SessionPersistence::create(
+            &storage_str,
+            unrelated_id.clone(),
+            "model".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        fail_message_index_attempts(&storage, [true]);
+        unrelated
+            .persist_new(&[Message::user("must not recover before target preflight")])
+            .await
+            .unwrap_err();
+        assert!(pending_index_marker(&storage, &unrelated_id).is_file());
+        assert_eq!(indexed_message_count(&storage, &unrelated_id), 0);
+        clear_message_index_attempts(&storage);
         let transcript = transcript_file(&storage, &session_id);
         let external = test_storage("unsafe-delete-preflight-target");
         let sentinel = external.join("sentinel.jsonl");
@@ -10349,8 +10451,12 @@ mod tests {
                 .any(|row| row.id == session_id),
             "delete mutated the index before storage-path preflight completed"
         );
+        assert!(pending_index_marker(&storage, &unrelated_id).is_file());
+        assert_eq!(indexed_message_count(&storage, &unrelated_id), 0);
+        assert!(message_index_attempts_for(&storage).is_empty());
         assert_unsafe_storage_path(result, &transcript, "symlink");
 
+        drop(unrelated);
         remove_symlink_if_present(&transcript);
         clear_module_state_for_root(&storage).await;
         std::fs::remove_dir_all(storage).unwrap();
