@@ -3,6 +3,20 @@ import XCTest
 
 @MainActor
 final class AppIntentsTests: XCTestCase {
+    // MARK: - App configuration
+
+    func testHostAppDisablesMultipleScenes() throws {
+        let sceneManifest = try XCTUnwrap(
+            Bundle.main.object(forInfoDictionaryKey: "UIApplicationSceneManifest")
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(
+            sceneManifest["UIApplicationSupportsMultipleScenes"] as? Bool,
+            false
+        )
+    }
+
     // MARK: - Router
 
     func testRouterRequestsAreConsumedOnce() {
