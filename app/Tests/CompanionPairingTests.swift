@@ -10,6 +10,31 @@ private final class InMemoryPairingStore: PairingStore {
     func clear() { stored = nil }
 }
 
+@MainActor
+private final class ControllableCompanionHandshake {
+    private(set) var callCount = 0
+    private var continuations: [
+        CheckedContinuation<DaemonHandshake, Never>
+    ] = []
+
+    func call(
+        host: String,
+        port: UInt16,
+        timeoutMs: UInt32
+    ) async -> DaemonHandshake {
+        callCount += 1
+        return await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func resumeAll(with result: DaemonHandshake) {
+        let pending = continuations
+        continuations = []
+        pending.forEach { $0.resume(returning: result) }
+    }
+}
+
 private func makeIdentity(pid: UInt32 = 31415) -> DaemonIdentity {
     DaemonIdentity(
         apiVersion: "coven.daemon.v1",
@@ -49,9 +74,16 @@ final class CompanionPairingTests: XCTestCase {
         XCTAssertEqual(model.pairing, store.stored)
     }
 
-    private func makeModel(store: PairingStore) -> CompanionModel {
+    private func makeModel(
+        store: PairingStore,
+        handshake: CompanionHandshake? = nil
+    ) -> CompanionModel {
         let defaults = UserDefaults(suiteName: "pairing-tests-\(UUID().uuidString)")!
-        return CompanionModel(defaults: defaults, store: store)
+        return CompanionModel(
+            defaults: defaults,
+            store: store,
+            handshake: handshake
+        )
     }
 
     func testConfirmPairingPersistsTheStagedIdentity() throws {
@@ -190,5 +222,101 @@ final class CompanionPairingTests: XCTestCase {
         guard case .blocked = gate else {
             return XCTFail("expected blocked gate, got \(gate)")
         }
+    }
+
+    func testConcurrentSessionGatesDoNotSupersedeTheSamePairing() async {
+        let store = InMemoryPairingStore()
+        store.stored = DaemonPairing(
+            host: "127.0.0.1", port: 1,
+            apiVersion: "coven.daemon.v1", covenVersion: "0.3.0",
+            pid: 1, startedAt: "x", pairedAt: Date()
+        )
+        let model = makeModel(store: store)
+
+        let first = Task { await model.gateForSessionTraffic() }
+        await Task.yield()
+        let second = Task { await model.gateForSessionTraffic() }
+        let results = await [first.value, second.value]
+
+        for result in results {
+            guard case let .blocked(reason, _) = result else {
+                return XCTFail("expected blocked gate, got \(result)")
+            }
+            XCTAssertNotEqual(reason, "Pairing check superseded")
+        }
+    }
+
+    func testUnchangedReloadJoinsConcurrentSessionGate() async {
+        let pairing = DaemonPairing(
+            host: "mac", port: 7777,
+            apiVersion: "coven.daemon.v1", covenVersion: "0.3.0",
+            pid: 1, startedAt: "x", pairedAt: Date()
+        )
+        let store = InMemoryPairingStore()
+        store.stored = pairing
+        let handshake = ControllableCompanionHandshake()
+        let model = makeModel(
+            store: store,
+            handshake: handshake.call
+        )
+
+        let first = Task { await model.gateForSessionTraffic() }
+        while handshake.callCount < 1 {
+            await Task.yield()
+        }
+        model.reloadPairing()
+        let second = Task { await model.gateForSessionTraffic() }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(handshake.callCount, 1)
+        handshake.resumeAll(with: .refused)
+        let results = await [first.value, second.value]
+        for result in results {
+            guard case let .blocked(reason, _) = result else {
+                return XCTFail("expected blocked gate, got \(result)")
+            }
+            XCTAssertNotEqual(reason, "Pairing check superseded")
+        }
+    }
+
+    func testInvalidatedWaiterCannotReturnCompletedGateAuthority() async {
+        let pairing = DaemonPairing(
+            host: "mac", port: 7777,
+            apiVersion: "coven.daemon.v1", covenVersion: "0.3.0",
+            pid: 1, startedAt: "x", pairedAt: Date()
+        )
+        let store = InMemoryPairingStore()
+        store.stored = pairing
+        let handshake = ControllableCompanionHandshake()
+        let model = makeModel(
+            store: store,
+            handshake: handshake.call
+        )
+
+        let staleWaiter = Task {
+            await model.gateForSessionTraffic()
+        }
+        while handshake.callCount < 1 {
+            await Task.yield()
+        }
+        let invalidatingWaiter = Task {
+            let result = await model.gateForSessionTraffic()
+            model.unpair()
+            return result
+        }
+        handshake.resumeAll(
+            with: .compatible(identity: makeIdentity(), latencyMs: 1)
+        )
+
+        guard case .ready = await invalidatingWaiter.value else {
+            return XCTFail("the first waiter should receive ready authority")
+        }
+        let staleResult = await staleWaiter.value
+        guard case let .blocked(reason, _) = staleResult else {
+            return XCTFail("expected invalidated gate, got \(staleResult)")
+        }
+        XCTAssertEqual(reason, "Pairing check superseded")
     }
 }

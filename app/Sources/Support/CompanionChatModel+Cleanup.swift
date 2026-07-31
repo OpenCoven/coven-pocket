@@ -223,7 +223,8 @@ extension CompanionChatModel {
                 prompt: $0,
                 projectRoot: retryProjectRoot,
                 familiarID: retryFamiliarID,
-                familiarPresentation: retryFamiliarPresentation
+                familiarPresentation: retryFamiliarPresentation,
+                targetProfile: retryTargetProfile
             )
         }
         defer {
@@ -232,6 +233,7 @@ extension CompanionChatModel {
                 retryProjectRoot = retainedRetryContext.projectRoot
                 retryFamiliarID = retainedRetryContext.familiarID
                 retryFamiliarPresentation = retainedRetryContext.familiarPresentation
+                retryTargetProfile = retainedRetryContext.targetProfile
             }
         }
 

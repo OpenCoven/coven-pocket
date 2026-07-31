@@ -361,6 +361,7 @@ extension CompanionChatModel {
         retryProjectRoot = context.projectRoot
         retryFamiliarID = context.familiarID
         retryFamiliarPresentation = context.familiarPresentation
+        retryTargetProfile = context.targetProfile
         canRetry = true
     }
 
@@ -369,6 +370,7 @@ extension CompanionChatModel {
         retryPrompt = nil
         retryFamiliarID = nil
         retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
         retriesPolling = false
         guard pendingCleanup == nil else { return }
         isBusy = false

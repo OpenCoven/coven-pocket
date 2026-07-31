@@ -1,5 +1,13 @@
 import Foundation
 
+// swiftlint:disable file_length
+
+typealias CompanionHandshake = @MainActor (
+    _ host: String,
+    _ port: UInt16,
+    _ timeoutMs: UInt32
+) async -> DaemonHandshake
+
 /// A confirmed pairing with one daemon, persisted in the Keychain.
 ///
 /// `pid`/`startedAt` describe the daemon instance seen at pairing time and
@@ -67,6 +75,7 @@ extension DaemonPairing {
 /// tunnel. Pairing requires the `coven.daemon.v1` handshake to succeed and
 /// gates all future session traffic through `gateForSessionTraffic()`.
 @MainActor
+// swiftlint:disable:next type_body_length
 final class CompanionModel: ObservableObject {
     enum ProbeStatus: Equatable {
         case idle
@@ -84,6 +93,13 @@ final class CompanionModel: ObservableObject {
         case blocked(reason: String, hint: String)
     }
 
+    private struct SessionGateOperation {
+        let token: UInt64
+        let generation: UInt64
+        let pairing: DaemonPairing
+        let task: Task<SessionGate, Never>
+    }
+
     @Published var host: String {
         didSet { defaults.set(host, forKey: Self.hostKey) }
     }
@@ -95,20 +111,36 @@ final class CompanionModel: ObservableObject {
     /// Set when a handshake succeeded and the user must confirm identity.
     @Published private(set) var pendingIdentity: DaemonIdentity?
 
-    let engine = PocketEngine()
+    let engine: PocketEngine
 
     private let defaults: UserDefaults
     private let store: PairingStore
+    private let handshake: CompanionHandshake
     private var sessionGateGeneration: UInt64 = 0
+    private var nextSessionGateOperationToken: UInt64 = 0
+    private var sessionGateOperation: SessionGateOperation?
 
     static let hostKey = "daemon-host"
     static let portKey = "daemon-port"
     static let defaultPort: UInt16 = 7777
     static let probeTimeoutMs: UInt32 = 4000
 
-    init(defaults: UserDefaults = .standard, store: PairingStore = KeychainPairingStore()) {
+    init(
+        defaults: UserDefaults = .standard,
+        store: PairingStore = KeychainPairingStore(),
+        handshake: CompanionHandshake? = nil
+    ) {
+        let engine = PocketEngine()
+        self.engine = engine
         self.defaults = defaults
         self.store = store
+        self.handshake = handshake ?? { host, port, timeoutMs in
+            await engine.handshakeDaemon(
+                host: host,
+                port: port,
+                timeoutMs: timeoutMs
+            )
+        }
         host = defaults.string(forKey: Self.hostKey) ?? ""
         portText = defaults.string(forKey: Self.portKey) ?? String(Self.defaultPort)
         pairing = store.load()
@@ -157,11 +189,7 @@ final class CompanionModel: ObservableObject {
             return
         }
         status = .probing
-        let result = await engine.handshakeDaemon(
-            host: trimmedHost,
-            port: port,
-            timeoutMs: Self.probeTimeoutMs
-        )
+        let result = await handshake(trimmedHost, port, Self.probeTimeoutMs)
         if case let .compatible(identity, _) = result {
             status = .idle
             stage(identity: identity)
@@ -178,7 +206,7 @@ final class CompanionModel: ObservableObject {
 
     func confirmPairing() {
         guard let identity = pendingIdentity, let port else { return }
-        sessionGateGeneration &+= 1
+        invalidateSessionGate()
         let confirmed = DaemonPairing(
             host: trimmedHost,
             port: port,
@@ -207,7 +235,7 @@ final class CompanionModel: ObservableObject {
     }
 
     func unpair() {
-        sessionGateGeneration &+= 1
+        invalidateSessionGate()
         store.clear()
         pairing = nil
         status = .idle
@@ -216,8 +244,10 @@ final class CompanionModel: ObservableObject {
     /// Refresh the in-memory snapshot after another model changes the shared
     /// Keychain pairing.
     func reloadPairing() {
-        sessionGateGeneration &+= 1
-        pairing = store.load()
+        let storedPairing = store.load()
+        guard storedPairing != pairing else { return }
+        invalidateSessionGate()
+        pairing = storedPairing
     }
 
     /// Re-run the handshake against the stored pairing and surface the result.
@@ -237,13 +267,58 @@ final class CompanionModel: ObservableObject {
     /// pairing so a swapped or downgraded daemon cannot slip past it. The
     /// stored identity refreshes on success (daemon restarts are normal).
     func gateForSessionTraffic() async -> SessionGate {
+        guard let current = pairing else { return .notPaired }
+        if let operation = sessionGateOperation,
+           Self.isSamePairingConfirmation(operation.pairing, current) {
+            let result = await operation.task.value
+            return validatedSessionGateResult(
+                result,
+                operation: operation
+            )
+        }
+
         sessionGateGeneration &+= 1
         let generation = sessionGateGeneration
-        guard var current = pairing else { return .notPaired }
-        let result = await engine.handshakeDaemon(
-            host: current.host,
-            port: current.port,
-            timeoutMs: Self.probeTimeoutMs
+        nextSessionGateOperationToken &+= 1
+        let token = nextSessionGateOperationToken
+        let task = Task { @MainActor [weak self] in
+            guard let self else {
+                return SessionGate.blocked(
+                    reason: "Pairing unavailable",
+                    hint: "Retry with the currently paired daemon."
+                )
+            }
+            return await self.performSessionGate(
+                current: current,
+                generation: generation
+            )
+        }
+        let operation = SessionGateOperation(
+            token: token,
+            generation: generation,
+            pairing: current,
+            task: task
+        )
+        sessionGateOperation = operation
+        let result = await task.value
+        if sessionGateOperation?.token == token {
+            sessionGateOperation = nil
+        }
+        return validatedSessionGateResult(
+            result,
+            operation: operation
+        )
+    }
+
+    private func performSessionGate(
+        current initialPairing: DaemonPairing,
+        generation: UInt64
+    ) async -> SessionGate {
+        var current = initialPairing
+        let result = await handshake(
+            current.host,
+            current.port,
+            Self.probeTimeoutMs
         )
         let stored = store.load()
         guard generation == sessionGateGeneration,
@@ -274,6 +349,51 @@ final class CompanionModel: ObservableObject {
             }
             return .blocked(reason: reason, hint: hint)
         }
+    }
+
+    private func invalidateSessionGate() {
+        sessionGateGeneration &+= 1
+        sessionGateOperation?.task.cancel()
+        sessionGateOperation = nil
+    }
+
+    private func validatedSessionGateResult(
+        _ result: SessionGate,
+        operation: SessionGateOperation
+    ) -> SessionGate {
+        guard operation.generation == sessionGateGeneration else {
+            return supersededSessionGate()
+        }
+        let expectedPairing: DaemonPairing?
+        switch result {
+        case let .ready(pairing):
+            expectedPairing = pairing
+        case .blocked:
+            expectedPairing = operation.pairing
+        case .notPaired:
+            expectedPairing = nil
+        }
+        guard pairing == expectedPairing,
+              store.load() == expectedPairing else {
+            return supersededSessionGate()
+        }
+        return result
+    }
+
+    private func supersededSessionGate() -> SessionGate {
+        .blocked(
+            reason: "Pairing check superseded",
+            hint: "Retry with the currently paired daemon."
+        )
+    }
+
+    private static func isSamePairingConfirmation(
+        _ lhs: DaemonPairing,
+        _ rhs: DaemonPairing
+    ) -> Bool {
+        lhs.host == rhs.host
+            && lhs.port == rhs.port
+            && lhs.pairedAt == rhs.pairedAt
     }
 
     // MARK: - Copy mapping

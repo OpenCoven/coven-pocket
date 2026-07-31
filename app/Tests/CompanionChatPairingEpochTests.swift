@@ -4,7 +4,37 @@ import XCTest
 @MainActor
 // swiftlint:disable:next type_body_length
 final class CompanionChatPairingEpochTests: XCTestCase {
-    func testReadyEndpointSupersedesSuspendedLaunchAndRetryUsesNewDaemon() async {
+    func testCleanupRetryRetainsPromptForItsVerifiedDaemon() async {
+        let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
+        let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
+        let client = FakeCompanionSessionClient(gate: .ready(pairingA))
+        let model = CompanionChatModel(client: client)
+        await model.send(prompt: "first", projectRoot: "/srv/a")
+        completeTurn(on: model)
+
+        client.gate = .ready(pairingB)
+        await model.send(prompt: "second", projectRoot: "/srv/b")
+
+        XCTAssertTrue(model.hasPendingCleanup)
+        XCTAssertEqual(model.retryPrompt, "second")
+
+        client.gate = .ready(pairingA)
+        await model.retry()
+
+        XCTAssertFalse(model.hasPendingCleanup)
+        XCTAssertEqual(client.killedSessionIDs, ["session-1"])
+        XCTAssertEqual(client.launchedPrompts, ["first"])
+        XCTAssertEqual(model.retryPrompt, "second")
+        XCTAssertTrue(model.canRetry)
+
+        client.gate = .ready(pairingB)
+        await model.retry()
+
+        XCTAssertEqual(client.launchedPrompts, ["first", "second"])
+        XCTAssertEqual(client.launchedPairings, [pairingA, pairingB])
+    }
+
+    func testReadyEndpointSupersedesSuspendedLaunchAndRetryRequiresOriginalDaemon() async {
         let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
         let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
         let client = FakeCompanionSessionClient(gate: .ready(pairingA))
@@ -35,8 +65,15 @@ final class CompanionChatPairingEpochTests: XCTestCase {
 
         await model.retry()
 
-        XCTAssertEqual(client.launchedPairings, [pairingA, pairingB])
-        XCTAssertEqual(model.pairing, pairingB)
+        XCTAssertEqual(client.launchedPairings, [pairingA])
+        XCTAssertEqual(model.retryPrompt, "first")
+        XCTAssertTrue(model.canRetry)
+
+        client.gate = .ready(pairingA)
+        await model.retry()
+
+        XCTAssertEqual(client.launchedPairings, [pairingA, pairingA])
+        XCTAssertEqual(model.pairing, pairingA)
         XCTAssertNotNil(model.session)
         XCTAssertTrue(model.hasActivePollTask)
         await model.reset()
@@ -244,7 +281,7 @@ final class CompanionChatPairingEpochTests: XCTestCase {
         await model.reset()
     }
 
-    func testSendInputResponseFromSupersededPairingCleansAndRetriesOnNewDaemon() async {
+    func testSendInputResponseFromSupersededPairingRetriesOnOriginalDaemon() async {
         let pairingA = pairedDaemon(host: "a.tailnet.ts.net")
         let pairingB = pairedDaemon(host: "b.tailnet.ts.net")
         let client = FakeCompanionSessionClient(gate: .ready(pairingA))
@@ -279,8 +316,15 @@ final class CompanionChatPairingEpochTests: XCTestCase {
 
         await model.retry()
 
-        XCTAssertEqual(client.launchedPairings, [pairingA, pairingB])
-        XCTAssertEqual(model.pairing, pairingB)
+        XCTAssertEqual(client.launchedPairings, [pairingA])
+        XCTAssertEqual(model.retryPrompt, "second")
+        XCTAssertTrue(model.canRetry)
+
+        client.gate = .ready(pairingA)
+        await model.retry()
+
+        XCTAssertEqual(client.launchedPairings, [pairingA, pairingA])
+        XCTAssertEqual(model.pairing, pairingA)
         XCTAssertNotNil(model.session)
         XCTAssertTrue(model.hasActivePollTask)
         await model.reset()

@@ -230,7 +230,8 @@ final class CompanionChatCleanupOwnershipTests: XCTestCase {
                 prompt: "newer",
                 projectRoot: "/srv/repo",
                 familiarID: nil,
-                familiarPresentation: .empty
+                familiarPresentation: .empty,
+                targetProfile: .companion(pairing: pairingB)
             ),
             pairing: verifiedPairingToken(pairingB, on: model)
         )

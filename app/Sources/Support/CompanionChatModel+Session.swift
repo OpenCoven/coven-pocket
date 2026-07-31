@@ -158,6 +158,7 @@ extension CompanionChatModel {
             retryPrompt = nil
             retryFamiliarID = nil
             retryFamiliarPresentation = .empty
+            retryTargetProfile = nil
         }
         return true
     }
@@ -260,6 +261,7 @@ extension CompanionChatModel {
         retryPrompt = nil
         retryFamiliarID = nil
         retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
         isBusy = false
         await send(
             prompt: context.prompt,
@@ -267,6 +269,7 @@ extension CompanionChatModel {
             familiarID: context.familiarID,
             familiar: context.familiarPresentation.familiar,
             familiarProfile: context.familiarPresentation.profile,
+            targetProfile: context.targetProfile,
             verificationMode: .trafficEpoch,
             expectedTrafficEpoch: verifiedPairing.trafficEpoch
         )

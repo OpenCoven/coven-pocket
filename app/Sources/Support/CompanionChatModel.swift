@@ -49,21 +49,33 @@ struct CompanionSendContext: Equatable {
     let projectRoot: String
     let familiarID: String?
     let familiarPresentation: CompanionFamiliarPresentationContext
+    let targetProfile: FamiliarProfileKey?
 
-    func bindingMissingFamiliarProfile(
+    func bindingMissingProfiles(
         to pairing: DaemonPairing
     ) -> CompanionSendContext {
-        guard familiarID != nil,
-              familiarPresentation.profile == nil else { return self }
+        let endpointProfile = FamiliarProfileKey.companion(pairing: pairing)
+        let presentation: CompanionFamiliarPresentationContext
+        if familiarID != nil, familiarPresentation.profile == nil {
+            presentation = CompanionFamiliarPresentationContext(
+                familiar: familiarPresentation.familiar,
+                profile: endpointProfile
+            )
+        } else {
+            presentation = familiarPresentation
+        }
         return CompanionSendContext(
             prompt: prompt,
             projectRoot: projectRoot,
             familiarID: familiarID,
-            familiarPresentation: CompanionFamiliarPresentationContext(
-                familiar: familiarPresentation.familiar,
-                profile: .companion(pairing: pairing)
-            )
+            familiarPresentation: presentation,
+            targetProfile: targetProfile ?? endpointProfile
         )
+    }
+
+    func targets(_ pairing: DaemonPairing) -> Bool {
+        targetProfile?.normalized
+            == FamiliarProfileKey.companion(pairing: pairing)
     }
 }
 
@@ -133,6 +145,7 @@ final class CompanionChatModel: ObservableObject {
     var retryProjectRoot = ""
     var retryFamiliarID: String?
     var retryFamiliarPresentation = CompanionFamiliarPresentationContext.empty
+    var retryTargetProfile: FamiliarProfileKey?
     var pollTask: Task<Void, Never>?
     var lastCompletedResultSeq: Int64 = 0
     var initialPrompt: String?
@@ -299,6 +312,7 @@ final class CompanionChatModel: ObservableObject {
         familiarID: String? = nil,
         familiar: FamiliarIdentity? = nil,
         familiarProfile: FamiliarProfileKey? = nil,
+        targetProfile: FamiliarProfileKey? = nil,
         verificationMode: CompanionPairingVerificationMode = .request,
         expectedTrafficEpoch: UInt64? = nil,
         promptRetrySelection: (
@@ -316,7 +330,9 @@ final class CompanionChatModel: ObservableObject {
             prompt: trimmedPrompt,
             projectRoot: trimmedRoot,
             familiarID: normalizedFamiliarID,
-            familiarPresentation: presentation
+            familiarPresentation: presentation,
+            targetProfile: targetProfile?.normalized
+                ?? configuredFamiliarProfile?.normalized
         )
         guard !Task.isCancelled,
               !trimmedPrompt.isEmpty,
@@ -325,6 +341,7 @@ final class CompanionChatModel: ObservableObject {
         guard Self.isAbsoluteHostPath(trimmedRoot) else {
             retryFamiliarID = nil
             retryFamiliarPresentation = .empty
+            retryTargetProfile = nil
             fail(
                 "Enter an absolute project path on the daemon host.",
                 retryPrompt: nil
@@ -358,7 +375,7 @@ final class CompanionChatModel: ObservableObject {
             )
             return
         }
-        var verifiedContext = context.bindingMissingFamiliarProfile(
+        var verifiedContext = context.bindingMissingProfiles(
             to: verified.pairing
         )
         let pairingIsCurrent = generation == operationGeneration
@@ -373,6 +390,16 @@ final class CompanionChatModel: ObservableObject {
             } else {
                 finishCancelledSend(generation: generation)
             }
+            return
+        }
+        let canExplicitlyRebindFamiliar = verifiedContext.familiarID != nil
+            && promptRetrySelection != nil
+        guard verifiedContext.targets(verified.pairing)
+                || canExplicitlyRebindFamiliar else {
+            rejectPromptRetryDestination(
+                context: verifiedContext,
+                generation: generation
+            )
             return
         }
         guard let preparedRetry = preparePromptRetry(
@@ -392,6 +419,7 @@ final class CompanionChatModel: ObservableObject {
         retryPrompt = nil
         retryFamiliarID = nil
         retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
         retriesPolling = false
         do {
             try await performSend(
@@ -429,6 +457,7 @@ private extension CompanionChatModel.Availability {
 }
 
 extension CompanionChatModel {
+    // swiftlint:disable:next function_body_length
     func retry(
         currentFamiliarSelection: @escaping @MainActor () ->
             CompanionPromptRetrySelection = { .empty }
@@ -439,6 +468,7 @@ extension CompanionChatModel {
             let projectRoot = retryProjectRoot
             let familiarID = retryFamiliarID
             let familiarPresentation = retryFamiliarPresentation
+            let targetProfile = retryTargetProfile
             operationGeneration &+= 1
             let generation = operationGeneration
             pollTask?.cancel()
@@ -450,12 +480,14 @@ extension CompanionChatModel {
             retryPrompt = nil
             retryFamiliarID = nil
             retryFamiliarPresentation = .empty
+            retryTargetProfile = nil
             await send(
                 prompt: prompt,
                 projectRoot: projectRoot,
                 familiarID: familiarID,
                 familiar: familiarPresentation.familiar,
                 familiarProfile: familiarPresentation.profile,
+                targetProfile: targetProfile,
                 promptRetrySelection: currentFamiliarSelection
             )
             return
@@ -467,15 +499,18 @@ extension CompanionChatModel {
         guard let prompt = retryPrompt else { return }
         let familiarID = retryFamiliarID
         let familiarPresentation = retryFamiliarPresentation
+        let targetProfile = retryTargetProfile
         retryPrompt = nil
         retryFamiliarID = nil
         retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
         await send(
             prompt: prompt,
             projectRoot: retryProjectRoot,
             familiarID: familiarID,
             familiar: familiarPresentation.familiar,
             familiarProfile: familiarPresentation.profile,
+            targetProfile: targetProfile,
             promptRetrySelection: currentFamiliarSelection
         )
     }
@@ -516,7 +551,8 @@ extension CompanionChatModel {
                 familiarPresentation: CompanionFamiliarPresentationContext(
                     familiar: familiar,
                     profile: endpointProfile
-                )
+                ),
+                targetProfile: original.targetProfile
             ),
             requiresSelectionFence: true
         )
@@ -584,6 +620,25 @@ extension CompanionChatModel {
         )
     }
 
+    func rejectPromptRetryDestination(
+        context: CompanionSendContext,
+        generation: UInt64
+    ) {
+        guard generation == operationGeneration,
+              !Task.isCancelled else {
+            finishCancelledSend(generation: generation)
+            return
+        }
+        isBusy = false
+        setRetryContext(context)
+        items.append(
+            ChatItem(
+                kind: .error,
+                text: "Re-pair with the daemon this prompt was prepared for before retrying."
+            )
+        )
+    }
+
     func finishInvalidatedPollingRetryIfNeeded(
         generation: UInt64
     ) -> Bool {
@@ -630,6 +685,7 @@ extension CompanionChatModel {
             retryPrompt = nil
             retryFamiliarID = nil
             retryFamiliarPresentation = .empty
+            retryTargetProfile = nil
             retriesPolling = false
             if pendingCleanup == nil {
                 canRetry = false
@@ -653,6 +709,7 @@ extension CompanionChatModel {
         retryPrompt = nil
         retryFamiliarID = nil
         retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
 
         if let sessionToKill {
             await beginCleanup(
@@ -688,6 +745,7 @@ extension CompanionChatModel {
         retryProjectRoot = ""
         retryFamiliarID = nil
         retryFamiliarPresentation = .empty
+        retryTargetProfile = nil
         items = []
         canRetry = false
         pendingCleanupCompletionText = nil
