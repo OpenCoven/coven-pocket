@@ -8,7 +8,7 @@ struct GoalLiveActivityWidget: Widget {
             HStack {
                 Image(systemName: "target")
                 VStack(alignment: .leading) {
-                    Text(context.attributes.objective).lineLimit(1)
+                    Text("Goal in progress")
                     Text("\(context.state.status.capitalized) · turn \(context.state.turnsUsed)/\(context.state.maxTurns)")
                         .font(.caption)
                 }
@@ -22,7 +22,7 @@ struct GoalLiveActivityWidget: Widget {
                     Text("\(context.state.turnsUsed)/\(context.state.maxTurns)")
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    Text(context.attributes.objective).lineLimit(1)
+                    Text("Goal in progress")
                 }
             } compactLeading: {
                 Image(systemName: "target")

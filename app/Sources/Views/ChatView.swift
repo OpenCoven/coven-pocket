@@ -232,7 +232,10 @@ private extension ChatView {
         .padding(.horizontal)
         .padding(.vertical, 10)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Goal status")
+        .accessibilityLabel(
+            "Goal \(goalStatusLabel(goal.status)), turn \(goal.turnsUsed) of \(goal.maxTurns), "
+                + "\(goal.tokensUsed) tokens"
+        )
     }
 
     func goalStatusLabel(_ status: PocketGoalStatus) -> String {

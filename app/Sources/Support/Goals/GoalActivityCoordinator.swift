@@ -6,7 +6,7 @@ final class GoalActivityCoordinator {
     private var activity: Activity<GoalActivityAttributes>?
 
     func update(_ snapshot: GoalSnapshot) async {
-        let attributes = GoalActivityAttributes(objective: snapshot.objective)
+        let attributes = GoalActivityAttributes()
         let content = ActivityContent(state: state(for: snapshot), staleDate: nil)
         do {
             if let activity {

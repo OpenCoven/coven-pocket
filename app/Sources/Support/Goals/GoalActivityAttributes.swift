@@ -10,5 +10,4 @@ struct GoalActivityAttributes: ActivityAttributes {
         let tokenBudget: UInt64?
     }
 
-    let objective: String
 }
