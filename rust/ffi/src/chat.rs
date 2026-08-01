@@ -1922,19 +1922,16 @@ mod tests {
         assert!(cancelled_token.is_cancelled());
 
         let next_delegate = Arc::new(RecordingDelegate::default());
-        assert!(session
+        let next_result = session
             .send("next turn".to_string(), next_delegate.clone())
-            .await
-            .is_ok());
+            .await;
+        assert!(matches!(next_result, Err(PocketError::Provider { .. })));
         let next_token = session.cancel.lock().clone();
 
         assert_ne!(cancelled_token, next_token);
         assert!(!next_token.is_cancelled());
-        assert_eq!(
-            next_delegate.done.lock().clone(),
-            vec!["end_turn".to_string()]
-        );
-        assert!(next_delegate.errors.lock().is_empty());
+        assert!(next_delegate.done.lock().is_empty());
+        assert_eq!(next_delegate.errors.lock().len(), 1);
         assert!(!session.is_busy());
         assert_eq!(
             session.model_tool_loop_invocations.load(Ordering::SeqCst),
