@@ -62,7 +62,9 @@ full-capability remote sessions.
 - [x] Memory: AGENTS.md injection, memdir browser
 - [x] Familiar companion: daemon-owned roster selection, profile-scoped
       persistence, and identity pinned to each session
-- [ ] On-device `/goal` with Live Activity progress
+- [x] On-device `/goal`: durable pause/resume/clear, budget and runaway stops,
+      finite iOS background continuation, and privacy-safe Live Activity
+      progress. Companion goals remain daemon-owned and out of scope.
 - [ ] Remote MCP servers (streamable HTTP/SSE + OAuth)
 - [x] Session sharing via unlisted Gists
 
