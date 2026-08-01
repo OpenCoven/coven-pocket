@@ -344,6 +344,14 @@ final class ChatModel: ObservableObject {
         } catch { appendError(error.localizedDescription) }
     }
 
+    /// Goals are intentionally finite foreground work. Persisting the pause
+    /// before iOS suspends the process makes a later resume explicit and
+    /// prevents an interrupted loop from being treated as still active.
+    func pauseGoalForBackground() async {
+        guard goal?.status == .active else { return }
+        await pauseGoal()
+    }
+
     func clearGoal() async {
         guard let session else { return }
         do {
