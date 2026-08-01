@@ -61,6 +61,10 @@ struct ChatView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if settings.backend == .codex, let goal = model.goal {
+                    goalCard(goal)
+                    Divider()
+                }
                 transcript
                 Divider()
                 inputBar
@@ -205,6 +209,41 @@ extension ChatView {
 }
 
 private extension ChatView {
+    @ViewBuilder
+    func goalCard(_ goal: GoalSnapshot) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: goal.status == .active ? "target" : "pause.circle")
+                .foregroundStyle(goal.status == .active ? Color.accentColor : Color.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(goal.status == .active ? "Goal in progress" : "Goal \(goalStatusLabel(goal.status))")
+                    .font(.subheadline.weight(.semibold))
+                Text("Turn \(goal.turnsUsed)/\(goal.maxTurns) · \(goal.tokensUsed) tokens")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if goal.status == .active {
+                Button("Pause") { Task { await model.pauseGoal() } }
+            } else if goal.status == .paused {
+                Button("Resume") { Task { await model.resumeGoal() } }
+            }
+            Button("Clear", role: .destructive) { Task { await model.clearGoal() } }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Goal status")
+    }
+
+    func goalStatusLabel(_ status: PocketGoalStatus) -> String {
+        switch status {
+        case .active: "in progress"
+        case .paused: "paused"
+        case .budgetLimited: "budget limited"
+        case .complete: "complete"
+        }
+    }
+
     var activeFamiliarProfile: FamiliarProfileKey? {
         chatState.activeFamiliarProfile(
             codexProfileID: client.codexAccount?.profileId
@@ -423,11 +462,31 @@ private extension ChatView {
                 familiarProfile: familiarModel.activeProfile
             )
         case .codex:
-            await model.send(
-                prompt: text,
-                settings: settings,
-                selectedFamiliar: familiarModel.selectedFamiliar
-            )
+            switch GoalCommandParser.parse(text) {
+            case .notGoal:
+                await model.send(
+                    prompt: text,
+                    settings: settings,
+                    selectedFamiliar: familiarModel.selectedFamiliar
+                )
+            case let .command(.start(objective, tokenBudget)):
+                await model.startGoal(
+                    objective: objective,
+                    tokenBudget: tokenBudget,
+                    settings: settings,
+                    selectedFamiliar: familiarModel.selectedFamiliar
+                )
+            case .command(.status):
+                if model.goal == nil { await model.loadGoalStatus() }
+            case .command(.pause):
+                await model.pauseGoal()
+            case .command(.resume):
+                await model.resumeGoal()
+            case .command(.clear):
+                await model.clearGoal()
+            case let .error(message):
+                model.appendError(message)
+            }
         }
     }
 

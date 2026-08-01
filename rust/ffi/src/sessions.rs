@@ -893,12 +893,19 @@ impl CheckedStorage {
         self.child_path(&self.root, &format!("index.sqlite{suffix}"))
     }
 
-    fn validate_sqlite_files(&self) -> Result<(), PocketError> {
+    fn sqlite_file(&self, stem: &str, suffix: &str) -> Result<PathBuf, PocketError> {
+        self.child_path(&self.root, &format!("{stem}.sqlite{suffix}"))
+    }
+
+    fn validate_sqlite_family(&self, stem: &str) -> Result<(), PocketError> {
         for suffix in ["", "-wal", "-shm", "-journal"] {
-            let path = self.index_file(suffix)?;
-            self.validate_regular_file(&path, true)?;
+            self.validate_regular_file(&self.sqlite_file(stem, suffix)?, true)?;
         }
         Ok(())
+    }
+
+    fn validate_sqlite_files(&self) -> Result<(), PocketError> {
+        self.validate_sqlite_family("index")
     }
 
     fn validate_fixed_layout(&self) -> Result<(), PocketError> {
@@ -923,6 +930,49 @@ impl CheckedStorage {
             }
         }
         self.validate_sqlite_files()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GoalStorage {
+    storage: CheckedStorage,
+}
+
+impl GoalStorage {
+    pub(crate) fn open(storage_dir: &str) -> Result<Self, PocketError> {
+        let storage = CheckedStorage::open(storage_dir)?;
+        storage.validate_sqlite_family("goals")?;
+        Ok(Self { storage })
+    }
+
+    pub(crate) fn path(&self) -> Result<PathBuf, PocketError> {
+        self.storage.sqlite_file("goals", "")
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), PocketError> {
+        self.storage.validate_sqlite_family("goals")
+    }
+
+    pub(crate) fn with_path<T>(
+        &self,
+        operation: impl FnOnce(&Path) -> Result<T, claurst_core::GoalError>,
+    ) -> Result<T, PocketError> {
+        self.validate()?;
+        let path = self.path()?;
+        let result =
+            operation(&path).map_err(|error| engine_err("goal store operation failed", error));
+        self.validate()?;
+        result
+    }
+
+    pub(crate) fn with_store<T>(
+        &self,
+        operation: impl FnOnce(&mut claurst_core::GoalStore) -> Result<T, claurst_core::GoalError>,
+    ) -> Result<T, PocketError> {
+        self.with_path(|path| {
+            let mut store = claurst_core::GoalStore::open(path)?;
+            operation(&mut store)
+        })
     }
 }
 
@@ -3087,6 +3137,12 @@ struct PendingIndexWork {
 }
 
 impl SessionPersistence {
+    pub(crate) fn goal_storage(&self) -> GoalStorage {
+        GoalStorage {
+            storage: self.storage.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn lock_state_for_test(&self) -> PersistStateGuardForTest<'_> {
         PersistStateGuardForTest {
@@ -4740,6 +4796,15 @@ fn verify_session_artifacts_absent(
             message: format!("cleanup marker for session {session_id} is missing"),
         });
     }
+    let goal_storage = GoalStorage {
+        storage: storage.clone(),
+    };
+    let goal = goal_storage.with_store(|store| store.try_get_goal(session_id))?;
+    if goal.is_some() {
+        return Err(PocketError::Engine {
+            message: format!("goal for session {session_id} remains after cleanup"),
+        });
+    }
     let rows = checked_index_store(storage)?
         .list_sessions()
         .map_err(|err| engine_err("cannot verify deleted session index", err))?;
@@ -4839,6 +4904,10 @@ fn cleanup_session_artifacts(
     marker: SessionCleanupMarker,
 ) -> Result<(), PocketError> {
     ensure_cleanup_marker(storage, session_id, marker)?;
+    let goal_storage = GoalStorage {
+        storage: storage.clone(),
+    };
+    goal_storage.validate()?;
     let preflight = preflight_session_artifacts(storage, session_id)?;
     if marker == SessionCleanupMarker::PendingFork && preflight.pending_deletion_marker_exists {
         return Err(PocketError::Engine {
@@ -4859,6 +4928,14 @@ fn cleanup_session_artifacts(
     }
     if !marker_errors.is_empty() {
         return Err(cleanup_error(storage, session_id, marker, marker_errors));
+    }
+    if let Err(error) = goal_storage.with_store(|store| store.clear_goal(session_id)) {
+        return Err(cleanup_error(
+            storage,
+            session_id,
+            marker,
+            vec![format!("cannot clear session goal: {error}")],
+        ));
     }
     if let Err(err) = delete_index_session(storage, session_id, "cannot delete session index") {
         return Err(cleanup_error(
@@ -5717,6 +5794,93 @@ mod tests {
             .join(format!("{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn checked_goal_storage_uses_one_fixed_database() {
+        let storage = test_storage("goal-storage-path");
+        let checked = GoalStorage::open(&storage.to_string_lossy()).unwrap();
+        assert_eq!(checked.path().unwrap(), storage.join("goals.sqlite"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_database_symlink_is_rejected_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let storage = test_storage("goal-db-symlink");
+        let outside = test_storage("goal-db-symlink-outside").join("outside.sqlite");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, storage.join("goals.sqlite")).unwrap();
+
+        assert!(CheckedStorage::from_root(&storage).is_ok());
+        assert!(GoalStorage::open(&storage.to_string_lossy()).is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_sqlite_sidecar_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let storage = test_storage(&format!("goal-sidecar{suffix}"));
+            let outside = storage.parent().unwrap().join(format!("outside{suffix}"));
+            std::fs::write(&outside, b"outside").unwrap();
+            symlink(&outside, storage.join(format!("goals.sqlite{suffix}"))).unwrap();
+
+            assert!(GoalStorage::open(&storage.to_string_lossy()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_clears_its_goal_only() {
+        let storage = test_storage("delete-goal");
+        let target_id = create_persisted_test_session(&storage).await;
+        let other_id = create_persisted_test_session(&storage).await;
+        let goals = GoalStorage::open(&storage.to_string_lossy()).unwrap();
+        goals
+            .with_store(|store| {
+                store.set_goal(&target_id, "target", None)?;
+                store.set_goal(&other_id, "other", None)?;
+                Ok(())
+            })
+            .unwrap();
+
+        delete_session(&storage.to_string_lossy(), &target_id)
+            .await
+            .unwrap();
+        goals
+            .with_store(|store| {
+                assert!(store.try_get_goal(&target_id)?.is_none());
+                assert!(store.try_get_goal(&other_id)?.is_some());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_does_not_inherit_the_source_goal() {
+        let storage = test_storage("fork-goal");
+        let source_id = create_persisted_test_session(&storage).await;
+        let goals = GoalStorage::open(&storage.to_string_lossy()).unwrap();
+        goals
+            .with_store(|store| {
+                store.set_goal(&source_id, "source only", None)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let fork_id = fork_session(&storage.to_string_lossy(), &source_id)
+            .await
+            .unwrap();
+        goals
+            .with_store(|store| {
+                assert!(store.try_get_goal(&source_id)?.is_some());
+                assert!(store.try_get_goal(&fork_id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
     }
 
     struct RemoveTestStorage(PathBuf);
