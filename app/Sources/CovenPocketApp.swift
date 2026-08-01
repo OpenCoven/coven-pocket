@@ -12,6 +12,7 @@ struct CovenPocketAppDependencies {
 
 @main
 struct CovenPocketApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var router = AppRouter.shared
     @StateObject private var rootWindowState: RootWindowState
     let rootWindowFactory: RootWindowFactory
@@ -43,6 +44,10 @@ struct CovenPocketApp: App {
                         )
                     else { return }
                     router.openSession(id: sessionID)
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    guard phase == .background else { return }
+                    Task { await rootWindowState.chatState.model.pauseGoalForBackground() }
                 }
         }
         .commands {
