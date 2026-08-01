@@ -78,6 +78,7 @@ final class ChatModel: ObservableObject {
     @Published var items: [ChatItem] = []
     @Published var isBusy = false
     @Published var canRetry = false
+    @Published private(set) var goal: GoalSnapshot?
     @Published private(set) var activeFamiliar: FamiliarIdentity?
     @Published private(set) var activeSessionID: String?
     /// The approval sheet currently on screen, if any.
@@ -92,6 +93,7 @@ final class ChatModel: ObservableObject {
     }
 
     let engine: PocketEngine
+    private let goalActivity = GoalActivityCoordinator()
 
     private var session: ChatSession?
     private var sessionSettings: ChatSettings?
@@ -228,6 +230,8 @@ final class ChatModel: ObservableObject {
         defer { finishOperation(generation: generation) }
 
         canRetry = false
+        goal = nil
+        Task { await goalActivity.end() }
         do {
             guard let session = try await activeSession(
                 for: settings,
@@ -284,6 +288,91 @@ final class ChatModel: ObservableObject {
         }
     }
 
+    func startGoal(
+        objective: String,
+        tokenBudget: UInt64?,
+        settings: ChatSettings,
+        selectedFamiliar: FamiliarIdentity? = nil
+    ) async {
+        guard let generation = claimOperation() else { return }
+        defer { finishOperation(generation: generation) }
+        do {
+            guard let session = try await activeSession(
+                for: settings,
+                selectedFamiliar: selectedFamiliar,
+                generation: generation
+            ), setOperationSession(session, generation: generation) else { return }
+            let command = tokenBudget.map { "/goal --tokens \($0) \(objective)" }
+                ?? "/goal \(objective)"
+            items.append(ChatItem(kind: .user, text: command))
+            let result = try await session.startGoal(
+                objective: objective,
+                tokenBudget: tokenBudget,
+                chatDelegate: GenerationChatBridge(model: self, generation: transcriptGeneration),
+                goalDelegate: GenerationGoalBridge(model: self, generation: transcriptGeneration)
+            )
+            receiveGoalResult(result, generation: transcriptGeneration)
+        } catch {
+            guard isCurrentOperation(generation: generation) else { return }
+            appendError(error.localizedDescription)
+        }
+    }
+
+    func resumeGoal() async {
+        guard let session, let current = goal,
+              current.status == .paused,
+              current.turnsUsed < current.maxTurns,
+              let generation = claimOperation(session: session)
+        else { return }
+        defer { finishOperation(generation: generation) }
+        do {
+            let result = try await session.resumeGoal(
+                chatDelegate: GenerationChatBridge(model: self, generation: transcriptGeneration),
+                goalDelegate: GenerationGoalBridge(model: self, generation: transcriptGeneration)
+            )
+            receiveGoalResult(result, generation: transcriptGeneration)
+        } catch {
+            guard isCurrentOperation(generation: generation) else { return }
+            appendError(error.localizedDescription)
+        }
+    }
+
+    func pauseGoal() async {
+        guard let session else { return }
+        do {
+            receiveGoalSnapshot(try await session.pauseGoal())
+        } catch { appendError(error.localizedDescription) }
+    }
+
+    func clearGoal() async {
+        guard let session else { return }
+        do {
+            try await session.clearGoal()
+            goal = nil
+            await goalActivity.end()
+        } catch { appendError(error.localizedDescription) }
+    }
+
+    func loadGoalStatus() async {
+        guard let session else { return }
+        do {
+            goal = try await session.goalStatus()
+        } catch { appendError(error.localizedDescription) }
+    }
+
+    func receiveGoalSnapshot(_ snapshot: GoalSnapshot, generation: UInt64? = nil) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
+        goal = snapshot
+        Task { await goalActivity.update(snapshot) }
+    }
+
+    private func receiveGoalResult(_ result: GoalRunResult, generation: UInt64) {
+        guard acceptsTranscriptCallback(generation: generation) else { return }
+        goal = result.snapshot
+        Task { await goalActivity.apply(result) }
+        if let message = result.errorMessage { appendError(message, generation: generation) }
+    }
+
     /// Discard the session and transcript (e.g. after changing settings).
     func reset() {
         let runningSession = invalidateOperation()
@@ -301,6 +390,8 @@ final class ChatModel: ObservableObject {
         activeSessionID = nil
         items = []
         canRetry = false
+        goal = nil
+        Task { await goalActivity.end() }
         // Dropping unanswered responders denies their tool calls.
         pendingApproval = nil
         approvalQueue = []
@@ -700,6 +791,22 @@ final class ChatModel: ObservableObject {
         func onError(message: String) {
             publish { model, generation in
                 model.appendError(message, generation: generation)
+            }
+        }
+    }
+
+    private final class GenerationGoalBridge: GoalProgressDelegate, @unchecked Sendable {
+        weak var model: ChatModel?
+        private let generation: UInt64
+
+        init(model: ChatModel, generation: UInt64) {
+            self.model = model
+            self.generation = generation
+        }
+
+        func onGoalSnapshot(snapshot: GoalSnapshot) {
+            Task { @MainActor [model, generation] in
+                model?.receiveGoalSnapshot(snapshot, generation: generation)
             }
         }
     }

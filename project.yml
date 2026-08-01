@@ -7,6 +7,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: 1
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
     # Rust core ships arm64 slices only (device + Apple Silicon simulator).
@@ -28,12 +30,15 @@ targets:
     dependencies:
       - framework: build/CovenPocketCore.xcframework
         embed: false
+      - target: CovenPocketGoalWidgets
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.opencoven.pocket
         GENERATE_INFOPLIST_FILE: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         SWIFT_STRICT_CONCURRENCY: minimal
@@ -47,6 +52,22 @@ targets:
             exit 1
           fi
         basedOnDependencyAnalysis: false
+  CovenPocketGoalWidgets:
+    type: app-extension
+    platform: iOS
+    info:
+      path: app/GoalWidgets/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    sources:
+      - path: app/GoalWidgets
+      - path: app/Sources/Support/Goals/GoalActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.opencoven.pocket.goal-widgets
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
+        SKIP_INSTALL: YES
   CovenPocketTests:
     type: bundle.unit-test
     platform: iOS

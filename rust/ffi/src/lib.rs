@@ -19,6 +19,7 @@ mod chat;
 mod codex_auth;
 mod daemon;
 mod git;
+mod goals;
 mod memory;
 mod remote;
 mod sessions;
@@ -31,6 +32,9 @@ pub use chat::{
 pub use codex_auth::{CodexAccount, CodexAuthDelegate};
 pub use daemon::{DaemonHandshake, DaemonIdentity, DaemonProbeState};
 pub use git::{GitCredentials, GitWorkspaceSummary};
+pub use goals::{
+    GoalProgressDelegate, GoalRunResult, GoalRunStopReason, GoalSnapshot, PocketGoalStatus,
+};
 pub use memory::{MemoryNote, ProjectContext};
 pub use remote::{FamiliarIdentity, RemoteEvent, RemoteEventBatch, RemoteFamiliar, RemoteSession};
 pub use sessions::ChatSessionSummary;
@@ -175,6 +179,14 @@ impl PocketEngine {
     /// Version of the linked coven-code engine crates.
     pub fn engine_version(&self) -> String {
         claurst_core::constants::APP_VERSION.to_string()
+    }
+
+    /// Pause active persisted goals after a process interruption.
+    pub async fn reconcile_goals(
+        &self,
+        storage_dir: String,
+    ) -> Result<Vec<GoalSnapshot>, PocketError> {
+        goals::reconcile(sessions::GoalStorage::open(&storage_dir)?).await
     }
 
     /// The engine's default model id.

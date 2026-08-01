@@ -269,6 +269,94 @@ impl ChatSession {
         self.perms.set_mode(mode);
     }
 
+    /// The durable goal state for this persisted session, if any.
+    pub async fn goal_status(&self) -> Result<Option<crate::GoalSnapshot>, PocketError> {
+        let storage = self.goal_storage()?;
+        crate::goals::load(storage, self.session_id.clone()).await
+    }
+
+    /// Persist a pause before cancelling an in-flight goal turn.
+    pub async fn pause_goal(&self) -> Result<crate::GoalSnapshot, PocketError> {
+        let snapshot = crate::goals::pause(self.goal_storage()?, self.session_id.clone()).await?;
+        self.stop();
+        Ok(snapshot)
+    }
+
+    /// Remove a goal before cancelling an in-flight goal turn.
+    pub async fn clear_goal(&self) -> Result<(), PocketError> {
+        crate::goals::clear(self.goal_storage()?, self.session_id.clone()).await?;
+        self.stop();
+        Ok(())
+    }
+
+    /// Create and run a durable autonomous goal. Internal continuation prompts
+    /// are never added to the visible user transcript.
+    pub async fn start_goal(
+        &self,
+        objective: String,
+        token_budget: Option<u64>,
+        chat_delegate: Arc<dyn ChatDelegate>,
+        goal_delegate: Arc<dyn crate::GoalProgressDelegate>,
+    ) -> Result<crate::GoalRunResult, PocketError> {
+        let storage = self.goal_storage()?;
+        let cancel_token = self.claim_goal_run()?;
+        let snapshot = match crate::goals::create(
+            storage.clone(),
+            self.session_id.clone(),
+            objective.clone(),
+            token_budget,
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.busy.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let initiating_prompt = match token_budget {
+            Some(budget) => format!("/goal --tokens {budget} {objective}"),
+            None => format!("/goal {objective}"),
+        };
+        goal_delegate.on_goal_snapshot(snapshot.clone());
+        self.run_goal(
+            snapshot,
+            Some(initiating_prompt),
+            storage,
+            cancel_token,
+            chat_delegate,
+            goal_delegate,
+        )
+        .await
+    }
+
+    /// Resume a previously paused goal without adding another user command.
+    pub async fn resume_goal(
+        &self,
+        chat_delegate: Arc<dyn ChatDelegate>,
+        goal_delegate: Arc<dyn crate::GoalProgressDelegate>,
+    ) -> Result<crate::GoalRunResult, PocketError> {
+        let storage = self.goal_storage()?;
+        let cancel_token = self.claim_goal_run()?;
+        let snapshot = match crate::goals::resume(storage.clone(), self.session_id.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.busy.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        goal_delegate.on_goal_snapshot(snapshot.clone());
+        self.run_goal(
+            snapshot,
+            None,
+            storage,
+            cancel_token,
+            chat_delegate,
+            goal_delegate,
+        )
+        .await
+    }
+
     /// The persisted transcript (text content only).
     pub async fn transcript(&self) -> Vec<ChatMessage> {
         let messages = self.messages.lock().await;
@@ -290,6 +378,246 @@ impl ChatSession {
 }
 
 impl ChatSession {
+    fn goal_storage(&self) -> Result<crate::sessions::GoalStorage, PocketError> {
+        self.persistence
+            .as_ref()
+            .map(crate::sessions::SessionPersistence::goal_storage)
+            .ok_or_else(|| PocketError::Engine {
+                message: "goals require a persisted on-device session".to_string(),
+            })
+    }
+
+    fn claim_goal_run(&self) -> Result<tokio_util::sync::CancellationToken, PocketError> {
+        let mut guard = self.cancel.lock();
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err(PocketError::Engine {
+                message: "a turn is already running — stop it or wait".to_string(),
+            });
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        *guard = token.clone();
+        Ok(token)
+    }
+
+    async fn run_goal(
+        &self,
+        initial_snapshot: crate::GoalSnapshot,
+        initiating_prompt: Option<String>,
+        goal_storage: crate::sessions::GoalStorage,
+        cancel_token: tokio_util::sync::CancellationToken,
+        chat_delegate: Arc<dyn ChatDelegate>,
+        goal_delegate: Arc<dyn crate::GoalProgressDelegate>,
+    ) -> Result<crate::GoalRunResult, PocketError> {
+        let result = async {
+            let mut durable_messages = self.messages.lock().await;
+            if let Some(prompt) = initiating_prompt {
+                durable_messages.push(Message::user(prompt));
+                self.persist_goal_messages(&durable_messages).await?;
+            }
+            let mut working_messages = durable_messages.clone();
+            let cost_tracker = Arc::new(CostTracker::default());
+            let starting_tokens = initial_snapshot.tokens_used;
+            let mut goal = claurst_core::Goal {
+                id: initial_snapshot.goal_id,
+                session_id: initial_snapshot.session_id,
+                objective: initial_snapshot.objective,
+                status: claurst_core::GoalStatus::Active,
+                token_budget: initial_snapshot.token_budget,
+                tokens_used: initial_snapshot.tokens_used,
+                time_used_secs: initial_snapshot.elapsed_seconds,
+                turns_used: initial_snapshot.turns_used,
+                created_at_ms: 0,
+                updated_at_ms: initial_snapshot.updated_at_ms,
+            };
+
+            loop {
+                if cancel_token.is_cancelled() {
+                    return self
+                        .pause_goal_result(goal_storage.clone(), &goal.id, true)
+                        .await;
+                }
+                let turn_started = std::time::Instant::now();
+                let (client, query_config, tool_ctx) =
+                    self.build_loop_inputs(cost_tracker.clone(), Some(&goal))?;
+                let tools = sandbox_goal_tools(
+                    &self.config.workspace_dir,
+                    self.perms.clone(),
+                    Some(chat_delegate.clone()),
+                    goal_storage.clone(),
+                )?;
+                let (event_tx, event_rx) = mpsc::unbounded_channel();
+                let forwarder = spawn_event_forwarder(event_rx, chat_delegate.clone(), true);
+                let outcome = run_query_loop(
+                    &client,
+                    &mut working_messages,
+                    &tools,
+                    &tool_ctx,
+                    &query_config,
+                    cost_tracker.clone(),
+                    Some(event_tx),
+                    cancel_token.clone(),
+                    None,
+                )
+                .await;
+                let journal = forwarder.await.map_err(PocketError::engine)?;
+                durable_messages.extend(journal);
+                self.persist_goal_messages(&durable_messages).await?;
+
+                match outcome {
+                    QueryOutcome::Cancelled => {
+                        return self
+                            .pause_goal_result(goal_storage.clone(), &goal.id, true)
+                            .await;
+                    }
+                    QueryOutcome::EndTurn { .. } => {}
+                    QueryOutcome::MaxTokens { .. } => {
+                        return self
+                            .goal_runtime_result(
+                                goal_storage.clone(),
+                                &goal.id,
+                                "model reached its output-token limit".to_string(),
+                            )
+                            .await;
+                    }
+                    QueryOutcome::BudgetExceeded {
+                        cost_usd,
+                        limit_usd,
+                    } => {
+                        return self
+                            .goal_runtime_result(
+                                goal_storage.clone(),
+                                &goal.id,
+                                format!(
+                                    "provider budget exceeded: ${cost_usd:.2} of ${limit_usd:.2}"
+                                ),
+                            )
+                            .await;
+                    }
+                    QueryOutcome::Error(error) => {
+                        return self
+                            .goal_runtime_result(goal_storage.clone(), &goal.id, error.to_string())
+                            .await;
+                    }
+                }
+
+                let total_tokens = starting_tokens.saturating_add(cost_tracker.total_tokens());
+                match crate::goals::continue_after_turn(
+                    goal_storage.clone(),
+                    self.session_id.clone(),
+                    goal.id.clone(),
+                    total_tokens,
+                    turn_started.elapsed().as_secs(),
+                )
+                .await?
+                {
+                    claurst_query::GoalContinuation::Continue { message } => {
+                        let snapshot = crate::goals::required_snapshot(
+                            goal_storage.clone(),
+                            self.session_id.clone(),
+                        )
+                        .await?;
+                        goal_delegate.on_goal_snapshot(snapshot.clone());
+                        goal = claurst_core::Goal {
+                            id: snapshot.goal_id,
+                            session_id: snapshot.session_id,
+                            objective: snapshot.objective,
+                            status: claurst_core::GoalStatus::Active,
+                            token_budget: snapshot.token_budget,
+                            tokens_used: snapshot.tokens_used,
+                            time_used_secs: snapshot.elapsed_seconds,
+                            turns_used: snapshot.turns_used,
+                            created_at_ms: 0,
+                            updated_at_ms: snapshot.updated_at_ms,
+                        };
+                        working_messages.push(Message::user(message));
+                    }
+                    claurst_query::GoalContinuation::Stop { reason } => {
+                        let snapshot =
+                            crate::goals::required_snapshot(goal_storage, self.session_id.clone())
+                                .await?;
+                        return Ok(crate::goals::run_result(reason, Some(snapshot)));
+                    }
+                    claurst_query::GoalContinuation::NoGoal => {
+                        return Ok(crate::GoalRunResult {
+                            reason: crate::GoalRunStopReason::Cleared,
+                            snapshot: None,
+                            error_message: None,
+                        });
+                    }
+                }
+            }
+        }
+        .await;
+        self.busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn persist_goal_messages(&self, messages: &[Message]) -> Result<(), PocketError> {
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| PocketError::Engine {
+                message: "goals require a persisted on-device session".to_string(),
+            })?;
+        persistence.persist_new(messages).await
+    }
+
+    async fn pause_goal_result(
+        &self,
+        storage: crate::sessions::GoalStorage,
+        expected_goal_id: &str,
+        cancelled: bool,
+    ) -> Result<crate::GoalRunResult, PocketError> {
+        match crate::goals::pause_owned(
+            storage,
+            self.session_id.clone(),
+            expected_goal_id.to_string(),
+        )
+        .await?
+        {
+            Some(snapshot) => Ok(crate::GoalRunResult {
+                reason: if cancelled {
+                    crate::GoalRunStopReason::Cancelled
+                } else {
+                    crate::GoalRunStopReason::Paused
+                },
+                snapshot: Some(snapshot),
+                error_message: None,
+            }),
+            None => Ok(crate::GoalRunResult {
+                reason: crate::GoalRunStopReason::Cleared,
+                snapshot: None,
+                error_message: None,
+            }),
+        }
+    }
+
+    async fn goal_runtime_result(
+        &self,
+        storage: crate::sessions::GoalStorage,
+        expected_goal_id: &str,
+        message: String,
+    ) -> Result<crate::GoalRunResult, PocketError> {
+        match crate::goals::pause_owned(
+            storage,
+            self.session_id.clone(),
+            expected_goal_id.to_string(),
+        )
+        .await?
+        {
+            Some(snapshot) => Ok(crate::GoalRunResult {
+                reason: crate::GoalRunStopReason::RuntimeError,
+                snapshot: Some(snapshot),
+                error_message: Some(message),
+            }),
+            None => Ok(crate::GoalRunResult {
+                reason: crate::GoalRunStopReason::Cleared,
+                snapshot: None,
+                error_message: None,
+            }),
+        }
+    }
+
     async fn run_turn(
         &self,
         prompt: Option<String>,
@@ -348,7 +676,9 @@ impl ChatSession {
             self.model_tool_loop_invocations
                 .fetch_add(1, Ordering::SeqCst);
 
-            let (client, query_config, tool_ctx) = self.build_loop_inputs()?;
+            let cost_tracker = Arc::new(CostTracker::default());
+            let (client, query_config, tool_ctx) =
+                self.build_loop_inputs(cost_tracker.clone(), None)?;
             let tools = sandbox_tools(
                 &self.config.workspace_dir,
                 self.perms.clone(),
@@ -356,7 +686,7 @@ impl ChatSession {
             );
 
             let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let forwarder = spawn_event_forwarder(event_rx, delegate.clone());
+            let forwarder = spawn_event_forwarder(event_rx, delegate.clone(), false);
 
             let outcome = run_query_loop(
                 &client,
@@ -364,7 +694,7 @@ impl ChatSession {
                 &tools,
                 &tool_ctx,
                 &query_config,
-                Arc::new(CostTracker::default()),
+                cost_tracker,
                 Some(event_tx),
                 cancel_token,
                 None,
@@ -454,6 +784,8 @@ impl ChatSession {
 
     fn build_loop_inputs(
         &self,
+        cost_tracker: Arc<CostTracker>,
+        goal: Option<&claurst_core::Goal>,
     ) -> Result<(AnthropicClient, QueryConfig, ToolContext), PocketError> {
         let workspace = &self.config.workspace_dir;
 
@@ -491,7 +823,7 @@ impl ChatSession {
             model: self.config.model.clone(),
             working_directory: Some(workspace.display().to_string()),
             effort_level: self.config.effort.as_deref().and_then(EffortLevel::parse),
-            append_system_prompt: Some(self.append_system_prompt()),
+            append_system_prompt: Some(self.append_system_prompt_with_goal(goal)),
             provider_registry: Some(Arc::new(registry)),
             ..QueryConfig::default()
         };
@@ -511,8 +843,8 @@ impl ChatSession {
             permission_handler: Arc::new(WorkspacePermissionHandler {
                 root: workspace.clone(),
             }),
-            cost_tracker: Arc::new(CostTracker::default()),
-            session_id: format!("pocket-{}", uuid_like_suffix()),
+            cost_tracker,
+            session_id: self.session_id.clone(),
             file_history: Arc::new(parking_lot::Mutex::new(FileHistory::new())),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
@@ -527,6 +859,18 @@ impl ChatSession {
 
         Ok((client, query_config, tool_ctx))
     }
+
+    fn append_system_prompt_with_goal(&self, goal: Option<&claurst_core::Goal>) -> String {
+        let mut prompt = self.append_system_prompt();
+        if let Some(goal) = goal {
+            prompt.push_str("\n\nYou are executing a durable on-device goal. Continue working toward this objective: ");
+            prompt.push_str(&goal.objective);
+            prompt.push_str(
+                ". Use GoalComplete only after a concrete completion audit with evidence.",
+            );
+        }
+        prompt
+    }
 }
 
 /// Forward query-loop events to the delegate on a dedicated task so slow
@@ -534,10 +878,15 @@ impl ChatSession {
 fn spawn_event_forwarder(
     mut rx: mpsc::UnboundedReceiver<QueryEvent>,
     delegate: Arc<dyn ChatDelegate>,
-) -> tokio::task::JoinHandle<()> {
+    collect_durable_messages: bool,
+) -> tokio::task::JoinHandle<Vec<Message>> {
     use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
     tokio::spawn(async move {
+        let mut journal = Vec::new();
         while let Some(event) = rx.recv().await {
+            let Some(event) = record_goal_journal_event(&mut journal, event) else {
+                continue;
+            };
             match event {
                 QueryEvent::Stream(AnthropicStreamEvent::ContentBlockDelta {
                     delta: ContentDelta::TextDelta { text },
@@ -561,24 +910,28 @@ fn spawn_event_forwarder(
                 } => delegate.on_tool_end(tool_id, tool_name, result, is_error),
                 QueryEvent::Status(message) => delegate.on_status(message),
                 QueryEvent::Error(message) => delegate.on_status(message),
+                // `record_goal_journal_event` consumes this first. Keep the
+                // arm explicit because Rust cannot infer that refinement.
+                QueryEvent::DurableMessage { .. } => {}
                 QueryEvent::TurnComplete { .. } | QueryEvent::TokenWarning { .. } => {}
             }
+        }
+        if collect_durable_messages {
+            journal
+        } else {
+            Vec::new()
         }
     })
 }
 
-/// Cheap unique-enough suffix without pulling in a uuid dependency.
-fn uuid_like_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs:x}{nanos:x}")
+fn record_goal_journal_event(journal: &mut Vec<Message>, event: QueryEvent) -> Option<QueryEvent> {
+    match event {
+        QueryEvent::DurableMessage { message } => {
+            journal.push(message);
+            None
+        }
+        other => Some(other),
+    }
 }
 
 /// Create a new chat session. Exposed as a free function so `PocketEngine`
@@ -726,6 +1079,56 @@ pub(crate) fn sandbox_tools(
             }) as Box<dyn Tool>
         })
         .collect()
+}
+
+fn sandbox_goal_tools(
+    workspace: &Path,
+    perms: Arc<PermissionState>,
+    delegate: Option<Arc<dyn ChatDelegate>>,
+    goal_storage: crate::sessions::GoalStorage,
+) -> Result<Vec<Box<dyn Tool>>, PocketError> {
+    let mut tools = sandbox_tools(workspace, perms, delegate);
+    let inner = claurst_tools::GoalCompleteTool::at_path(goal_storage.path()?);
+    tools.push(Box::new(CheckedGoalCompleteTool {
+        inner,
+        goal_storage,
+    }));
+    Ok(tools)
+}
+
+struct CheckedGoalCompleteTool {
+    inner: claurst_tools::PathScopedGoalCompleteTool,
+    goal_storage: crate::sessions::GoalStorage,
+}
+
+#[async_trait::async_trait]
+impl Tool for CheckedGoalCompleteTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
+
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        if let Err(error) = self.goal_storage.validate() {
+            return ToolResult::error(error.to_string());
+        }
+        let result = self.inner.execute(input, ctx).await;
+        if let Err(error) = self.goal_storage.validate() {
+            return ToolResult::error(error.to_string());
+        }
+        result
+    }
 }
 
 /// Wraps an engine tool and rejects inputs whose paths escape the workspace.
@@ -1519,19 +1922,16 @@ mod tests {
         assert!(cancelled_token.is_cancelled());
 
         let next_delegate = Arc::new(RecordingDelegate::default());
-        assert!(session
+        let next_result = session
             .send("next turn".to_string(), next_delegate.clone())
-            .await
-            .is_ok());
+            .await;
+        assert!(matches!(next_result, Err(PocketError::Provider { .. })));
         let next_token = session.cancel.lock().clone();
 
         assert_ne!(cancelled_token, next_token);
         assert!(!next_token.is_cancelled());
-        assert_eq!(
-            next_delegate.done.lock().clone(),
-            vec!["end_turn".to_string()]
-        );
-        assert!(next_delegate.errors.lock().is_empty());
+        assert!(next_delegate.done.lock().is_empty());
+        assert_eq!(next_delegate.errors.lock().len(), 1);
         assert!(!session.is_busy());
         assert_eq!(
             session.model_tool_loop_invocations.load(Ordering::SeqCst),
@@ -1815,7 +2215,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_client, _config, ctx) = session.build_loop_inputs().unwrap();
+        let (_client, _config, ctx) = session
+            .build_loop_inputs(Arc::new(CostTracker::default()), None)
+            .unwrap();
         ctx
     }
 
@@ -1829,6 +2231,27 @@ mod tests {
         assert!(result.is_error);
         assert!(!ran.load(Ordering::SeqCst), "plan mode must not execute");
         assert!(delegate.prompts.lock().is_empty(), "plan mode never asks");
+    }
+
+    #[test]
+    fn goal_journal_records_only_durable_query_messages() {
+        let mut journal = Vec::new();
+        record_goal_journal_event(
+            &mut journal,
+            QueryEvent::DurableMessage {
+                message: Message::assistant("working"),
+            },
+        );
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].get_all_text(), "working");
+    }
+
+    #[test]
+    fn goal_journal_is_independent_of_compacted_working_history() {
+        let mut journal = vec![Message::assistant("durable output")];
+        let working = [Message::user("compacted summary")];
+        assert_eq!(journal.remove(0).get_all_text(), "durable output");
+        assert_eq!(working[0].get_all_text(), "compacted summary");
     }
 
     #[tokio::test(flavor = "multi_thread")]

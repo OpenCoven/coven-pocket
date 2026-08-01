@@ -1277,14 +1277,34 @@ public func FfiConverterTypeChatPermissionResponder_lower(_ value: ChatPermissio
 public protocol ChatSessionProtocol: AnyObject, Sendable {
     
     /**
+     * Remove a goal before cancelling an in-flight goal turn.
+     */
+    func clearGoal() async throws 
+    
+    /**
+     * The durable goal state for this persisted session, if any.
+     */
+    func goalStatus() async throws  -> GoalSnapshot?
+    
+    /**
      * Whether a turn is currently running.
      */
     func isBusy()  -> Bool
     
     /**
+     * Persist a pause before cancelling an in-flight goal turn.
+     */
+    func pauseGoal() async throws  -> GoalSnapshot
+    
+    /**
      * The active permission mode.
      */
     func permissionMode()  -> ChatPermissionMode
+    
+    /**
+     * Resume a previously paused goal without adding another user command.
+     */
+    func resumeGoal(chatDelegate: ChatDelegate, goalDelegate: GoalProgressDelegate) async throws  -> GoalRunResult
     
     /**
      * Re-run the loop after a failed turn without appending a new user
@@ -1309,6 +1329,12 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * across mode changes.
      */
     func setPermissionMode(mode: ChatPermissionMode) 
+    
+    /**
+     * Create and run a durable autonomous goal. Internal continuation prompts
+     * are never added to the visible user transcript.
+     */
+    func startGoal(objective: String, tokenBudget: UInt64?, chatDelegate: ChatDelegate, goalDelegate: GoalProgressDelegate) async throws  -> GoalRunResult
     
     /**
      * Cancel the in-flight turn, if any. The loop notices at the next
@@ -1379,6 +1405,44 @@ open class ChatSession: ChatSessionProtocol, @unchecked Sendable {
 
     
     /**
+     * Remove a goal before cancelling an in-flight goal turn.
+     */
+open func clearGoal()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_coven_pocket_ffi_fn_method_chatsession_clear_goal(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_coven_pocket_ffi_rust_future_poll_void,
+            completeFunc: ffi_coven_pocket_ffi_rust_future_complete_void,
+            freeFunc: ffi_coven_pocket_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypePocketError_lift
+        )
+}
+    
+    /**
+     * The durable goal state for this persisted session, if any.
+     */
+open func goalStatus()async throws  -> GoalSnapshot?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_coven_pocket_ffi_fn_method_chatsession_goal_status(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_coven_pocket_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_coven_pocket_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_coven_pocket_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeGoalSnapshot.lift,
+            errorHandler: FfiConverterTypePocketError_lift
+        )
+}
+    
+    /**
      * Whether a turn is currently running.
      */
 open func isBusy() -> Bool  {
@@ -1391,6 +1455,25 @@ open func isBusy() -> Bool  {
 }
     
     /**
+     * Persist a pause before cancelling an in-flight goal turn.
+     */
+open func pauseGoal()async throws  -> GoalSnapshot  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_coven_pocket_ffi_fn_method_chatsession_pause_goal(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_coven_pocket_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_coven_pocket_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_coven_pocket_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGoalSnapshot_lift,
+            errorHandler: FfiConverterTypePocketError_lift
+        )
+}
+    
+    /**
      * The active permission mode.
      */
 open func permissionMode() -> ChatPermissionMode  {
@@ -1400,6 +1483,25 @@ open func permissionMode() -> ChatPermissionMode  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Resume a previously paused goal without adding another user command.
+     */
+open func resumeGoal(chatDelegate: ChatDelegate, goalDelegate: GoalProgressDelegate)async throws  -> GoalRunResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_coven_pocket_ffi_fn_method_chatsession_resume_goal(
+                        self.uniffiCloneHandle(),FfiConverterTypeChatDelegate_lower(chatDelegate),FfiConverterTypeGoalProgressDelegate_lower(goalDelegate)
+                )
+            },
+            pollFunc: ffi_coven_pocket_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_coven_pocket_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_coven_pocket_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGoalRunResult_lift,
+            errorHandler: FfiConverterTypePocketError_lift
+        )
 }
     
     /**
@@ -1466,6 +1568,26 @@ open func setPermissionMode(mode: ChatPermissionMode)  {try! rustCall() {
         FfiConverterTypeChatPermissionMode_lower(mode),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Create and run a durable autonomous goal. Internal continuation prompts
+     * are never added to the visible user transcript.
+     */
+open func startGoal(objective: String, tokenBudget: UInt64?, chatDelegate: ChatDelegate, goalDelegate: GoalProgressDelegate)async throws  -> GoalRunResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_coven_pocket_ffi_fn_method_chatsession_start_goal(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(objective),FfiConverterOptionUInt64.lower(tokenBudget),FfiConverterTypeChatDelegate_lower(chatDelegate),FfiConverterTypeGoalProgressDelegate_lower(goalDelegate)
+                )
+            },
+            pollFunc: ffi_coven_pocket_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_coven_pocket_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_coven_pocket_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGoalRunResult_lift,
+            errorHandler: FfiConverterTypePocketError_lift
+        )
 }
     
     /**
@@ -1766,6 +1888,204 @@ public func FfiConverterTypeCodexAuthDelegate_lower(_ value: CodexAuthDelegate) 
 
 
 
+public protocol GoalProgressDelegate: AnyObject, Sendable {
+    
+    func onGoalSnapshot(snapshot: GoalSnapshot) 
+    
+}
+open class GoalProgressDelegateImpl: GoalProgressDelegate, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_coven_pocket_ffi_fn_clone_goalprogressdelegate(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_coven_pocket_ffi_fn_free_goalprogressdelegate(handle, $0) }
+    }
+
+    
+
+    
+open func onGoalSnapshot(snapshot: GoalSnapshot)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_coven_pocket_ffi_fn_method_goalprogressdelegate_on_goal_snapshot(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGoalSnapshot_lower(snapshot),uniffiCallStatus
+    )
+}
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceGoalProgressDelegate {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceGoalProgressDelegate = UniffiVTableCallbackInterfaceGoalProgressDelegate(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeGoalProgressDelegate.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface GoalProgressDelegate: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeGoalProgressDelegate.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface GoalProgressDelegate: handle missing in uniffiClone")
+            }
+        },
+        onGoalSnapshot: { (
+            uniffiHandle: UInt64,
+            snapshot: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeGoalProgressDelegate.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onGoalSnapshot(
+                     snapshot: try FfiConverterTypeGoalSnapshot_lift(snapshot)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceGoalProgressDelegate> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceGoalProgressDelegate>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitGoalProgressDelegate() {
+    uniffi_coven_pocket_ffi_fn_init_callback_vtable_goalprogressdelegate(UniffiCallbackInterfaceGoalProgressDelegate.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGoalProgressDelegate: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<GoalProgressDelegate>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = GoalProgressDelegate
+
+    public static func lift(_ handle: UInt64) throws -> GoalProgressDelegate {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return GoalProgressDelegateImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: GoalProgressDelegate) -> UInt64 {
+         if let rustImpl = value as? GoalProgressDelegateImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GoalProgressDelegate {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: GoalProgressDelegate, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalProgressDelegate_lift(_ handle: UInt64) throws -> GoalProgressDelegate {
+    return try FfiConverterTypeGoalProgressDelegate.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalProgressDelegate_lower(_ value: GoalProgressDelegate) -> UInt64 {
+    return FfiConverterTypeGoalProgressDelegate.lower(value)
+}
+
+
+
+
+
+
 /**
  * The engine handle held by the app for its whole lifetime.
  */
@@ -1912,6 +2232,11 @@ public protocol PocketEngineProtocol: AnyObject, Sendable {
      * Full contents of one memory note.
      */
     func readMemoryNote(workspaceDir: String, filename: String) async throws  -> String
+    
+    /**
+     * Pause active persisted goals after a process interruption.
+     */
+    func reconcileGoals(storageDir: String) async throws  -> [GoalSnapshot]
     
     /**
      * Scrub credential-shaped content from a transcript before sharing.
@@ -2517,6 +2842,25 @@ open func readMemoryNote(workspaceDir: String, filename: String)async throws  ->
             completeFunc: ffi_coven_pocket_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_coven_pocket_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypePocketError_lift
+        )
+}
+    
+    /**
+     * Pause active persisted goals after a process interruption.
+     */
+open func reconcileGoals(storageDir: String)async throws  -> [GoalSnapshot]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_coven_pocket_ffi_fn_method_pocketengine_reconcile_goals(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(storageDir)
+                )
+            },
+            pollFunc: ffi_coven_pocket_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_coven_pocket_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_coven_pocket_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeGoalSnapshot.lift,
             errorHandler: FfiConverterTypePocketError_lift
         )
 }
@@ -3782,6 +4126,150 @@ public func FfiConverterTypeGitWorkspaceSummary_lower(_ value: GitWorkspaceSumma
 }
 
 
+public struct GoalRunResult: Equatable, Hashable {
+    public var reason: GoalRunStopReason
+    public var snapshot: GoalSnapshot?
+    public var errorMessage: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(reason: GoalRunStopReason, snapshot: GoalSnapshot?, errorMessage: String?) {
+        self.reason = reason
+        self.snapshot = snapshot
+        self.errorMessage = errorMessage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GoalRunResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGoalRunResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GoalRunResult {
+        return
+            try GoalRunResult(
+                reason: FfiConverterTypeGoalRunStopReason.read(from: &buf), 
+                snapshot: FfiConverterOptionTypeGoalSnapshot.read(from: &buf), 
+                errorMessage: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GoalRunResult, into buf: inout [UInt8]) {
+        FfiConverterTypeGoalRunStopReason.write(value.reason, into: &buf)
+        FfiConverterOptionTypeGoalSnapshot.write(value.snapshot, into: &buf)
+        FfiConverterOptionString.write(value.errorMessage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalRunResult_lift(_ buf: RustBuffer) throws -> GoalRunResult {
+    return try FfiConverterTypeGoalRunResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalRunResult_lower(_ value: GoalRunResult) -> RustBuffer {
+    return FfiConverterTypeGoalRunResult.lower(value)
+}
+
+
+public struct GoalSnapshot: Equatable, Hashable {
+    public var goalId: String
+    public var sessionId: String
+    public var objective: String
+    public var status: PocketGoalStatus
+    public var tokenBudget: UInt64?
+    public var tokensUsed: UInt64
+    public var elapsedSeconds: UInt64
+    public var turnsUsed: UInt32
+    public var maxTurns: UInt32
+    public var updatedAtMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(goalId: String, sessionId: String, objective: String, status: PocketGoalStatus, tokenBudget: UInt64?, tokensUsed: UInt64, elapsedSeconds: UInt64, turnsUsed: UInt32, maxTurns: UInt32, updatedAtMs: UInt64) {
+        self.goalId = goalId
+        self.sessionId = sessionId
+        self.objective = objective
+        self.status = status
+        self.tokenBudget = tokenBudget
+        self.tokensUsed = tokensUsed
+        self.elapsedSeconds = elapsedSeconds
+        self.turnsUsed = turnsUsed
+        self.maxTurns = maxTurns
+        self.updatedAtMs = updatedAtMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GoalSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGoalSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GoalSnapshot {
+        return
+            try GoalSnapshot(
+                goalId: FfiConverterString.read(from: &buf), 
+                sessionId: FfiConverterString.read(from: &buf), 
+                objective: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypePocketGoalStatus.read(from: &buf), 
+                tokenBudget: FfiConverterOptionUInt64.read(from: &buf), 
+                tokensUsed: FfiConverterUInt64.read(from: &buf), 
+                elapsedSeconds: FfiConverterUInt64.read(from: &buf), 
+                turnsUsed: FfiConverterUInt32.read(from: &buf), 
+                maxTurns: FfiConverterUInt32.read(from: &buf), 
+                updatedAtMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GoalSnapshot, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.goalId, into: &buf)
+        FfiConverterString.write(value.sessionId, into: &buf)
+        FfiConverterString.write(value.objective, into: &buf)
+        FfiConverterTypePocketGoalStatus.write(value.status, into: &buf)
+        FfiConverterOptionUInt64.write(value.tokenBudget, into: &buf)
+        FfiConverterUInt64.write(value.tokensUsed, into: &buf)
+        FfiConverterUInt64.write(value.elapsedSeconds, into: &buf)
+        FfiConverterUInt32.write(value.turnsUsed, into: &buf)
+        FfiConverterUInt32.write(value.maxTurns, into: &buf)
+        FfiConverterUInt64.write(value.updatedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalSnapshot_lift(_ buf: RustBuffer) throws -> GoalSnapshot {
+    return try FfiConverterTypeGoalSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalSnapshot_lower(_ value: GoalSnapshot) -> RustBuffer {
+    return FfiConverterTypeGoalSnapshot.lower(value)
+}
+
+
 /**
  * One note in the workspace memdir (metadata only; content loads on read).
  */
@@ -4869,6 +5357,114 @@ public func FfiConverterTypeDaemonProbeState_lower(_ value: DaemonProbeState) ->
 
 
 
+
+public enum GoalRunStopReason: Equatable, Hashable {
+    
+    case complete
+    case paused
+    case budgetLimited
+    case runawayGuard
+    case cleared
+    case cancelled
+    case runtimeError
+    case storageError
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension GoalRunStopReason: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGoalRunStopReason: FfiConverterRustBuffer {
+    typealias SwiftType = GoalRunStopReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GoalRunStopReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .complete
+        
+        case 2: return .paused
+        
+        case 3: return .budgetLimited
+        
+        case 4: return .runawayGuard
+        
+        case 5: return .cleared
+        
+        case 6: return .cancelled
+        
+        case 7: return .runtimeError
+        
+        case 8: return .storageError
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: GoalRunStopReason, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .complete:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .paused:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .budgetLimited:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .runawayGuard:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .cleared:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .runtimeError:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .storageError:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalRunStopReason_lift(_ buf: RustBuffer) throws -> GoalRunStopReason {
+    return try FfiConverterTypeGoalRunStopReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGoalRunStopReason_lower(_ value: GoalRunStopReason) -> RustBuffer {
+    return FfiConverterTypeGoalRunStopReason.lower(value)
+}
+
+
+
 /**
  * Errors surfaced to Swift.
  */
@@ -4957,6 +5553,86 @@ public func FfiConverterTypePocketError_lower(_ value: PocketError) -> RustBuffe
 }
 
 
+
+public enum PocketGoalStatus: Equatable, Hashable {
+    
+    case active
+    case paused
+    case budgetLimited
+    case complete
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PocketGoalStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePocketGoalStatus: FfiConverterRustBuffer {
+    typealias SwiftType = PocketGoalStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PocketGoalStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .active
+        
+        case 2: return .paused
+        
+        case 3: return .budgetLimited
+        
+        case 4: return .complete
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PocketGoalStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .active:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .paused:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .budgetLimited:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .complete:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePocketGoalStatus_lift(_ buf: RustBuffer) throws -> PocketGoalStatus {
+    return try FfiConverterTypePocketGoalStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePocketGoalStatus_lower(_ value: PocketGoalStatus) -> RustBuffer {
+    return FfiConverterTypePocketGoalStatus.lower(value)
+}
+
+
+
 /**
  * Inference providers Coven Pocket can talk to.
  */
@@ -5034,6 +5710,30 @@ public func FfiConverterTypePocketProvider_lower(_ value: PocketProvider) -> Rus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -5098,6 +5798,30 @@ fileprivate struct FfiConverterOptionTypeFamiliarIdentity: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFamiliarIdentity.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeGoalSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = GoalSnapshot?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGoalSnapshot.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGoalSnapshot.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5198,6 +5922,31 @@ fileprivate struct FfiConverterSequenceTypeGitWorkspaceSummary: FfiConverterRust
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeGitWorkspaceSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeGoalSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = [GoalSnapshot]
+
+    public static func write(_ value: [GoalSnapshot], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGoalSnapshot.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GoalSnapshot] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GoalSnapshot]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGoalSnapshot.read(from: &buf))
         }
         return seq
     }
@@ -5491,6 +6240,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_coven_pocket_ffi_checksum_method_pocketengine_read_memory_note() != 7307) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_coven_pocket_ffi_checksum_method_pocketengine_reconcile_goals() != 42297) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_coven_pocket_ffi_checksum_method_pocketengine_redact_secrets() != 59151) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5563,10 +6315,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_coven_pocket_ffi_checksum_method_chatpermissionresponder_respond() != 48390) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_coven_pocket_ffi_checksum_method_chatsession_clear_goal() != 36359) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_coven_pocket_ffi_checksum_method_chatsession_goal_status() != 18280) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_coven_pocket_ffi_checksum_method_chatsession_is_busy() != 54408) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_coven_pocket_ffi_checksum_method_chatsession_pause_goal() != 54061) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_coven_pocket_ffi_checksum_method_chatsession_permission_mode() != 53155) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_coven_pocket_ffi_checksum_method_chatsession_resume_goal() != 18281) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_coven_pocket_ffi_checksum_method_chatsession_retry() != 45540) {
@@ -5581,6 +6345,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_coven_pocket_ffi_checksum_method_chatsession_set_permission_mode() != 5829) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_coven_pocket_ffi_checksum_method_chatsession_start_goal() != 2290) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_coven_pocket_ffi_checksum_method_chatsession_stop() != 28384) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5590,12 +6357,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_coven_pocket_ffi_checksum_method_codexauthdelegate_on_auth_url() != 11163) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_coven_pocket_ffi_checksum_method_goalprogressdelegate_on_goal_snapshot() != 8316) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_coven_pocket_ffi_checksum_constructor_pocketengine_new() != 56590) {
         return InitializationResult.apiChecksumMismatch
     }
 
     uniffiCallbackInitChatDelegate()
     uniffiCallbackInitCodexAuthDelegate()
+    uniffiCallbackInitGoalProgressDelegate()
     uniffiCallbackInitStreamDelegate()
     return InitializationResult.ok
 }()
