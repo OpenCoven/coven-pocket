@@ -44,7 +44,6 @@ struct ChatView: View {
 
     private var activeCanRetry: Bool { settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry }
 
-
     private var canSend: Bool {
         guard !activeIsBusy,
               !(settings.backend == .companionClaude && companionModel.hasPendingCleanup),
