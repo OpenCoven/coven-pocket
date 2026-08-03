@@ -44,6 +44,7 @@ struct ChatView: View {
 
     private var activeCanRetry: Bool { settings.backend == .companionClaude ? companionModel.canRetry : model.canRetry }
 
+
     private var canSend: Bool {
         guard !activeIsBusy,
               !(settings.backend == .companionClaude && companionModel.hasPendingCleanup),
@@ -145,6 +146,9 @@ struct ChatView: View {
             }
             .sheet(isPresented: $showShare) {
                 ShareSessionSheet(items: activeItems)
+            }
+            .sheet(isPresented: $showShare) {
+                ShareSessionSheet(items: model.items)
             }
             .sheet(item: $model.pendingApproval, onDismiss: model.approvalDismissed) { approval in
                 ApprovalSheet(approval: approval, model: model)
