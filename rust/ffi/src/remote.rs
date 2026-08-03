@@ -56,6 +56,7 @@ pub struct RemoteFamiliar {
     pub icon: Option<String>,
 }
 
+
 /// One session row from `GET /api/v1/sessions`.
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct RemoteSession {
@@ -159,6 +160,7 @@ pub(crate) async fn familiars(
     let body = request(host, port, "GET", "/api/v1/familiars", None, timeout).await?;
     decode_familiar_roster(&body)
 }
+
 
 /// List sessions on the daemon, newest first as the daemon returns them.
 pub(crate) async fn sessions(
@@ -613,6 +615,7 @@ fn trimmed_nonblank(value: &str) -> Option<String> {
     }
 }
 
+
 /// Percent-encode a session id for use as one path segment. Daemon ids are
 /// UUID-like, but the id came over the wire — never let it splice a path.
 fn encode_path_segment(segment: &str) -> String {
@@ -798,6 +801,7 @@ mod tests {
         }
         familiar
     }
+
 
     #[tokio::test]
     async fn lists_sessions_from_snake_case_rows() {

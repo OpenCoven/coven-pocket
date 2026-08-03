@@ -11,6 +11,7 @@ struct RemoteTranscriptItem: Identifiable, Equatable {
         }
     }
 
+
     enum Role: Equatable {
         case user
         case assistant
@@ -105,6 +106,7 @@ enum RemoteTranscript {
             attachmentMode: mode
         )
     }
+    }
 
     /// Detect a pending approval prompt in the tail of terminal output.
     /// Harness prompts vary; this looks for the common ask-shapes so the
@@ -146,5 +148,7 @@ enum RemoteTranscript {
         }
         return lines.joined(separator: "\n")
     }
+
+
 
 }

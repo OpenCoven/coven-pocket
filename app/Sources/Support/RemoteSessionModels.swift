@@ -78,6 +78,7 @@ final class RemoteAttachModel: ObservableObject {
         !finished && attachmentMode != .unknown
     }
 
+
     static let pollInterval: Duration = .seconds(2)
     static let pageLimit: UInt32 = 200
     static let requestTimeoutMs: UInt32 = 6000

@@ -91,6 +91,7 @@ final class RemoteAttachTests: XCTestCase {
         XCTAssertEqual(items.map(\.text), ["follow up"])
     }
 
+
     func testConsecutiveOutputFramesMergeIntoOneTerminalBlock() {
         let events = [
             event(seq: 1, kind: "output", payload: #"{"type":"output","text":"$ cargo te"}"#),
@@ -117,6 +118,7 @@ final class RemoteAttachTests: XCTestCase {
 
         XCTAssertEqual(items.map(\.text), ["line 1\nline 2\n"])
     }
+
 
     func testUnknownKindsAndMalformedPayloadsAreSkipped() {
         let events = [

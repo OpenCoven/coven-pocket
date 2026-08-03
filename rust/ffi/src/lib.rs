@@ -499,6 +499,7 @@ impl PocketEngine {
         remote::familiars(&host, port, millis(timeout_ms)).await
     }
 
+
     /// List sessions on the paired daemon. Callers gate on a verified
     /// pairing first; this is plain transport.
     pub async fn remote_sessions(
@@ -608,6 +609,7 @@ impl PocketEngine {
     ) -> Result<ProjectContext, PocketError> {
         run_blocking(move || Ok(memory::project_context(&workspace_dir))).await
     }
+
 
     /// Stream a single-turn completion, forwarding deltas to `delegate`.
     ///
