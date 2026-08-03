@@ -298,5 +298,3 @@ extension ChatSessionSummary {
         return model.isEmpty ? messages : "\(model) · \(messages)"
     }
 }
-
-
