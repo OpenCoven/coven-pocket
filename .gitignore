@@ -20,3 +20,4 @@ xcuserdata/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.psyche*
